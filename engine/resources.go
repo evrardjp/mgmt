@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,22 +13,49 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package engine
 
 import (
+	"context"
 	"encoding/gob"
 	"fmt"
+	"reflect"
+	"runtime"
+	"strings"
 
+	"github.com/purpleidea/mgmt/converger"
+	docsUtil "github.com/purpleidea/mgmt/docs/util"
+	"github.com/purpleidea/mgmt/engine/local"
 	"github.com/purpleidea/mgmt/pgraph"
 	"github.com/purpleidea/mgmt/util/errwrap"
 
 	"gopkg.in/yaml.v2"
 )
 
+const (
+	// ResourcesRelDir is the path where the resources are kept, relative to
+	// the main source code root.
+	ResourcesRelDir = "engine/resources/"
+)
+
 // TODO: should each resource be a sub-package?
 var registeredResources = map[string]func() Res{}
+
+var registeredBackgroundFuncs = make(map[string]func(*BackgroundHandle) BackgroundFunc)
 
 // RegisterResource registers a new resource by providing a constructor function
 // that returns a resource object ready to be unmarshalled from YAML.
@@ -42,6 +69,28 @@ func RegisterResource(kind string, fn func() Res) {
 	}
 	gob.Register(f)
 	registeredResources[kind] = fn
+
+	if backgroundRes, ok := f.(BackgroundRes); ok {
+		// We overwrite subsequent ones, but it's okay. Any one will do.
+		registeredBackgroundFuncs[kind] = backgroundRes.Background // fn handle
+	}
+
+	// Additional metadata for documentation generation!
+	_, filename, _, ok := runtime.Caller(1)
+	if !ok {
+		panic(fmt.Sprintf("could not locate resource filename for %s", kind))
+	}
+	sp := strings.Split(reflect.TypeOf(f).String(), ".")
+	if len(sp) != 2 {
+		panic(fmt.Sprintf("could not parse resource struct name for %s", kind))
+	}
+
+	if err := docsUtil.RegisterResource(kind, &docsUtil.Metadata{
+		Filename: trimPath(filename),
+		Typename: sp[1],
+	}); err != nil {
+		panic(fmt.Sprintf("could not register resource metadata for %s", kind))
+	}
 }
 
 // RegisteredResourcesNames returns the kind of the registered resources.
@@ -51,6 +100,12 @@ func RegisteredResourcesNames() []string {
 		kinds = append(kinds, k)
 	}
 	return kinds
+}
+
+// IsKind returns true if this is a valid resource kind.
+func IsKind(kind string) bool {
+	_, ok := registeredResources[kind]
+	return ok
 }
 
 // NewResource returns an empty resource object from a registered kind. It
@@ -93,17 +148,15 @@ type Init struct {
 	// Hostname is the uuid for the host.
 	Hostname string
 
+	// Converger is the process-wide convergence coordinator. This is the
+	// live, mutable handle, not a read-only view.
+	Converger *converger.Coordinator
+
 	// Called from within Watch:
 
-	// Running must be called after your watches are all started and ready.
-	Running func()
-
 	// Event sends an event notifying the engine of a possible state change.
-	Event func()
-
-	// Done returns a channel that will close to signal to us that it's time
-	// for us to shutdown.
-	Done chan struct{}
+	// It must first be called after your watches are all started and ready.
+	Event func(context.Context) error
 
 	// Called from within CheckApply:
 
@@ -131,12 +184,21 @@ type Init struct {
 	//Graph func() *pgraph.Graph // TODO: not implemented, use FilteredGraph
 
 	// FilteredGraph is a function that returns a filtered variant of the
-	// current graph. Only resource that have allowed themselves to be added
-	// into this graph will appear. If they did not consent, then those
-	// vertices and any associated edges, will not be present.
+	// current graph. Only resources that have allowed themselves to be
+	// added into this (filtered) graph lookup will appear. If they did not
+	// consent, then those vertices and any associated edges, will not be
+	// present. This must only be run during CheckApply because during Watch
+	// we can't guarantee that the graph is paused and that a commit/swap
+	// isn't happening. If you use it outside of a synchronous CheckApply,
+	// then this breaks the API contract that we have here. Don't do that!
 	FilteredGraph func() (*pgraph.Graph, error)
 
 	// TODO: GraphQuery offers an interface to query the resource graph.
+
+	// Local has a bunch of methods and properties which are useful for
+	// operations on the local machine and for communication between
+	// functions and resources.
+	Local *local.API
 
 	// World provides a connection to the outside world. This is most often
 	// used for communicating with the distributed database.
@@ -157,6 +219,27 @@ type Init struct {
 	// messages which you wish to pass on. You should use this instead of
 	// the log package directly for production quality resources.
 	Logf func(format string, v ...interface{})
+}
+
+// Copy makes a copy of this Init struct, with all of the same elements inside.
+func (obj *Init) Copy() *Init {
+	return &Init{
+		Program:   obj.Program,
+		Version:   obj.Version,
+		Hostname:  obj.Hostname,
+		Converger: obj.Converger,
+		Event:     obj.Event,
+		Refresh:   obj.Refresh,
+		Send:      obj.Send,
+		Recv:      obj.Recv,
+		//Graph: obj.Graph, // TODO: not implemented, use FilteredGraph
+		FilteredGraph: obj.FilteredGraph,
+		Local:         obj.Local,
+		World:         obj.World,
+		VarDir:        obj.VarDir,
+		Debug:         obj.Debug,
+		Logf:          obj.Logf,
+	}
 }
 
 // KindedRes is an interface that is required for a resource to have a kind.
@@ -187,23 +270,38 @@ type Res interface {
 	Default() Res
 
 	// Validate determines if the struct has been defined in a valid state.
+	// Don't interact with the system, since it may not be in a ready state.
 	Validate() error
 
 	// Init initializes the resource and passes in some external information
-	// and data from the engine.
+	// and data from the engine. Don't expect other resource dependencies in
+	// the world to exist yet.
 	Init(*Init) error
 
-	// Close is run by the engine to clean up after the resource is done.
-	Close() error
+	// Cleanup is run by the engine to clean up after the resource is done.
+	Cleanup() error
 
 	// Watch is run by the engine to monitor for state changes. If it
 	// detects any, it notifies the engine which will usually run CheckApply
-	// in response.
-	Watch() error
+	// in response. If the input context cancels, we must shutdown. This
+	// runs for all resources before *any* CheckApply, so it must not depend
+	// on something that will only exist after a particular CheckApply
+	// already ran. You may detect that scenario and watch for the change to
+	// happen before then adding the desired watch.
+	Watch(context.Context) error
 
 	// CheckApply determines if the state of the resource is correct and if
-	// asked to with the `apply` variable, applies the requested state.
-	CheckApply(apply bool) (checkOK bool, err error)
+	// asked to with the `apply` variable, applies the requested state. If
+	// the input context cancels, we must return as quickly as possible. We
+	// should never exit immediately if this would cause permanent
+	// corruption of some sort. However it doesn't mean that a resource was
+	// taken to the desired state. The input context is not guaranteed to
+	// cancel when you return from this function. If that's required for
+	// your code to free memory, make sure to wrap it, cancel it on return
+	// with a defer, and wait for any workers to exit with a waitgroup. This
+	// method may error if a dependency is not met since it runs while
+	// respecting the "edge" ordering.
+	CheckApply(ctx context.Context, apply bool) (checkOK bool, err error)
 
 	// Cmp compares itself to another resource and returns an error if they
 	// are not equivalent. This is more strict than the Adapts method of the
@@ -223,6 +321,22 @@ func Stringer(res Res) string {
 	return Repr(res.Kind(), res.Name())
 }
 
+// ResPtrUID is a unique identifier that is consistent for the kind and name of
+// the resource only. This was formerly a string, but a struct is more precise.
+// The result is suitable as a unique map key.
+type ResPtrUID struct {
+	Kind string
+	Name string
+}
+
+// PtrUID generates a ResPtrUID from a resource. The result is suitable as a
+// unique map key.
+func PtrUID(res Res) ResPtrUID {
+	// the use of "repr" is kind of arbitrary as long as it's unique
+	//return ResPtrUID(Repr(res.Kind(), res.Name()))
+	return ResPtrUID{Kind: res.Kind(), Name: res.Name()}
+}
+
 // Validate validates a resource by checking multiple aspects. This is the main
 // entry point for running all the validation steps on a resource.
 func Validate(res Res) error {
@@ -237,10 +351,22 @@ func Validate(res Res) error {
 		return errwrap.Wrapf(err, "the Res has an invalid meta param")
 	}
 
+	// TODO: pull dollar prefix from a constant
+	// This catches typos where the user meant to use ${var} interpolation.
+	if !res.MetaParams().Dollar && strings.HasPrefix(res.Name(), "$") {
+		return fmt.Errorf("the Res name starts with a $")
+	}
+
+	// Don't need to validate normally if hidden.
+	// XXX: Check if it's also Exported too? len(res.MetaParams.Export) > 0
+	if res.MetaParams().Hidden {
+		return nil
+	}
+
 	return res.Validate()
 }
 
-// InterruptableRes is an interface that adds interrupt functionality to
+// InterruptibleRes is an interface that adds interrupt functionality to
 // resources. If the resource implements this interface, the engine will call
 // the Interrupt method to shutdown the resource quickly. Running this method
 // may leave the resource in a partial state, however this may be desired if you
@@ -248,7 +374,7 @@ func Validate(res Res) error {
 // resource complete in a situation where you made an error and you wish to exit
 // quickly to avoid data loss. It is usually triggered after multiple ^C
 // signals.
-type InterruptableRes interface {
+type InterruptibleRes interface {
 	Res
 
 	// Ask the resource to shutdown quickly. This can be called at any point
@@ -261,8 +387,8 @@ type InterruptableRes interface {
 	// able to read from a channel to satisfy your request.) It is best to
 	// probably have this close a channel to multicast that signal around to
 	// anyone who can detect it in a select. If you are in a situation which
-	// cannot interrupt, then you can return an error.
-	// FIXME: implement, and check the above description is what we expect!
+	// cannot interrupt, then you can return an error. This will only get
+	// called a maximum of one time per resource.
 	Interrupt() error
 }
 
@@ -301,12 +427,82 @@ type CompatibleRes interface {
 	Merge(CompatibleRes) (CompatibleRes, error)
 }
 
-// CollectableRes is an interface for resources that support collection. It is
-// currently temporary until a proper API for all resources is invented.
-type CollectableRes interface {
+// ExportableRes allows the resource to have its own implementation of resource
+// encoding, so that it can send data over the wire differently. It's unlikely
+// that you will want to implement this interface for most scenarios. It may be
+// useful to limit private data exposure, large data sizes, and to add more info
+// to what would normally be shared.
+type ExportableRes interface {
 	Res
 
-	CollectPattern(string) // XXX: temporary until Res collection is more advanced
+	// ToB64 lets the resource provide an alternative implementation of the
+	// usual ResToB64 method. This lets the resource omit, add, or modify
+	// the parameter data before it goes out over the wire. The output gets
+	// decoded with B64ToRes when the resource is collected, so it must use
+	// the same encoding, eg: by calling ResToB64 on a modified copy of the
+	// resource.
+	ToB64() (string, error)
+
+	// TODO: Do we want to add a FromB64 method for decoding the Resource?
+}
+
+// BackgroundRes allows a resource to start a background worker common to all of
+// that kind, and which persists between resource graph transitions. It is
+// permitted to continue running as long as at least one resource of that kind
+// is present in the resource graph.
+type BackgroundRes interface {
+	Res
+
+	// Background is the worker function to run. It is invoked once per
+	// resource kind via one arbitrary instance of that kind. As a result,
+	// it's important not to meddle with resource-specific state. It must
+	// shutdown when the context is cancelled. It should error if something
+	// ever goes wrong whether during startup or after startup. It must
+	// close the ready channel when it has finished starting up. When it
+	// shuts down, it must not leave any persisting goroutines. If it
+	// decides to shutdown early, then this is allowed if appropriate, but
+	// there's no guarantee that it will get started again for a subsequent
+	// resource in a future resource graph, therefore it is unlikely that
+	// this scenario would need to be used. The actual background func is
+	// generated by calling this constructor.
+	Background(*BackgroundHandle) BackgroundFunc
+}
+
+// AsyncableRes is an interface that lets a resource specify an async default
+// for engine-managed async CheckApply execution.
+type AsyncableRes interface {
+	Res
+
+	// AsyncCheckApply tells the engine this resource will run async by
+	// default if it returns true. You may choose a different return value
+	// by statically examining the resource params. You must not change this
+	// value after it has been initially determined and after first call of
+	// this function. By specifying `traits.Async` it effectively adds an
+	// implementation of this function for you which always returns true.
+	AsyncCheckApply() bool
+}
+
+// AsyncCheckApply returns the resolved async setting for a resource. The
+// `Meta:async` metaparam wins if it is set, otherwise we fall back to the
+// resource's own default via the AsyncableRes interface (which the traits.Async
+// struct supplies as always true) otherwise we default to false. This is the
+// single source of truth for whether the engine runs a resource's CheckApply in
+// the async, non-blocking manner. It must be resolved once and not change. If
+// the `Meta:realize` param is set, then this returns false.
+func AsyncCheckApply(res Res) bool {
+	if res.MetaParams().Realize {
+		// A realize resource makes the graph swap wait for its
+		// CheckApply, which is the opposite of async. Validate rejects
+		// the explicit combination, so this only overrides the default.
+		return false
+	}
+	if b := res.MetaParams().Async; b != nil {
+		return *b // the user override wins
+	}
+	if r, ok := res.(AsyncableRes); ok {
+		return r.AsyncCheckApply() // the resource default
+	}
+	return false
 }
 
 // YAMLRes is a resource that supports creation by unmarshalling.
@@ -314,4 +510,36 @@ type YAMLRes interface {
 	Res
 
 	yaml.Unmarshaler // UnmarshalYAML(unmarshal func(interface{}) error) error
+}
+
+// BackgroundFunc is the type signature of the background function for some Res.
+type BackgroundFunc = func(context.Context, chan<- struct{}) error
+
+// LookupBackgroundFunc looks for any registered background funcs.
+func LookupBackgroundFunc(kind string) (func(*BackgroundHandle) BackgroundFunc, error) {
+	fn, ok := registeredBackgroundFuncs[kind]
+	if !ok {
+		return nil, fmt.Errorf("no background func for kind %s was found", kind)
+	}
+	return fn, nil
+}
+
+// BackgroundHandle is a collection of handles the background function may wish
+// to use during its time running in the background!
+type BackgroundHandle struct {
+	Local *local.API
+	World World
+
+	//Prefix string
+	Debug bool
+	Logf  func(format string, v ...interface{})
+}
+
+// trimPath is a helper used to find the path for documentation generation.
+func trimPath(s string) string {
+	const marker = "mgmt/engine/resources/" // dir base for mgmt resources
+	if idx := strings.LastIndex(s, marker); idx != -1 {
+		return s[idx+len(marker):]
+	}
+	return s
 }

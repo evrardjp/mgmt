@@ -1,0 +1,14 @@
+-- main.mcl --
+import "golang"
+import "sys"
+
+$tmplvalues = struct{num => 42, load => $theload}
+
+$theload bool = sys.load()->x1 # wrong type, make sure the compiler catches it!
+
+file "/tmp/datetime" {
+	state => $const.res.file.state.exists,
+	content => golang.template("num: {{ .num }} seconds\nload average: {{ .load }}\n", $tmplvalues),
+}
+-- OUTPUT --
+# err: errUnify: type error: bool != float: /main.mcl @ 6:17-6:31

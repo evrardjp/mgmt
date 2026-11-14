@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,22 +13,35 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
-// +build !root !darwin
+//go:build !root || !darwin
 
 package resources
 
 import (
-	"io/ioutil"
 	"os"
+	"path/filepath"
 	"testing"
 
 	fstab "github.com/deniswernert/go-fstab"
 )
 
 func TestMountExists(t *testing.T) {
-	const procMock1 = `/tmp/mount0 /mnt/proctest ext4 rw,seclabel,relatime,data=ordered 0 0` + "\n"
+	mountPath := filepath.Join(t.TempDir(), "mount0")
+	procMock1 := mountPath + " /mnt/proctest ext4 rw,seclabel,relatime,data=ordered 0 0\n"
 
 	var mountExistsTests = []struct {
 		procMock []byte
@@ -38,7 +51,7 @@ func TestMountExists(t *testing.T) {
 		{
 			[]byte(procMock1),
 			&fstab.Mount{
-				Spec:    "/tmp/mount0",
+				Spec:    mountPath,
 				File:    "/mnt/proctest",
 				VfsType: "ext4",
 				MntOps:  map[string]string{"defaults": ""},
@@ -49,18 +62,18 @@ func TestMountExists(t *testing.T) {
 		},
 	}
 
-	file, err := ioutil.TempFile("", "proc")
+	file, err := os.CreateTemp("", "proc")
 	if err != nil {
 		t.Errorf("error creating temp file: %v", err)
 		return
 	}
 	defer os.Remove(file.Name())
 	for _, test := range mountExistsTests {
-		if err := ioutil.WriteFile(file.Name(), test.procMock, 0664); err != nil {
+		if err := os.WriteFile(file.Name(), test.procMock, 0600); err != nil {
 			t.Errorf("error writing proc file: %s: %v", file.Name(), err)
 			return
 		}
-		if err := ioutil.WriteFile(test.in.Spec, []byte{}, 0664); err != nil {
+		if err := os.WriteFile(test.in.Spec, []byte{}, 0600); err != nil {
 			t.Errorf("error writing fstab file: %s: %v", file.Name(), err)
 			return
 		}

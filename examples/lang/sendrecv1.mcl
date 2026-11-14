@@ -3,7 +3,7 @@ import "world"
 
 $ns = "estate"
 $exchanged = world.kvlookup($ns)
-$state = maplookup($exchanged, $hostname, "default")
+$state = $exchanged[$hostname] <|> "default"
 
 exec "exec0" {
 	cmd => "echo hello world && echo goodbye world 1>&2", # to stdout && stderr
@@ -13,6 +13,7 @@ exec "exec0" {
 kv "kv0" {
 	key => $ns,
 	#value => "two",
+	#mapped => true,
 }
 
 Exec["exec0"].output -> Kv["kv0"].value

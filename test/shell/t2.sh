@@ -1,15 +1,15 @@
-#!/bin/bash -e
+#!/usr/bin/env -S bash -e
 
 . "$(dirname "$0")/../util.sh"
 
-if in_ci github; then
+if in_env github; then
 	# TODO: consider debugging this
 	echo "This is failing in github, skipping test!"
 	exit
 fi
 
 # run till completion
-$TIMEOUT "$MGMT" run --converged-timeout=5 --no-watch --tmp-prefix yaml t2.yaml &
+$TIMEOUT "$MGMT" run --converger-timeout=5 --converged-exit --no-watch --tmp-prefix yaml t2.yaml &
 pid=$!
 wait $pid	# get exit status
 e=$?

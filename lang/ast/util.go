@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,20 +13,36 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package ast
 
 import (
 	"fmt"
+	"sort"
 	"strings"
+	"sync"
 
+	"github.com/purpleidea/mgmt/engine"
 	"github.com/purpleidea/mgmt/lang/funcs"
 	"github.com/purpleidea/mgmt/lang/funcs/simple"
-	"github.com/purpleidea/mgmt/lang/funcs/simplepoly"
+	"github.com/purpleidea/mgmt/lang/funcs/structs"
 	"github.com/purpleidea/mgmt/lang/funcs/vars"
 	"github.com/purpleidea/mgmt/lang/interfaces"
 	"github.com/purpleidea/mgmt/lang/types"
+	"github.com/purpleidea/mgmt/pgraph"
 	"github.com/purpleidea/mgmt/util/errwrap"
 )
 
@@ -51,15 +67,17 @@ func FuncPrefixToFunctionsScope(prefix string) map[string]interfaces.Expr {
 			// XXX: should we run fn.SetType(st.Fn.Type()) ?
 			exprs[name] = fn
 			continue
-		} else if st, ok := x.(*simplepoly.WrappedFunc); simplepoly.DirectInterface && ok {
-			fn := &ExprFunc{
-				Title: name,
-
-				Values: st.Fns,
-			}
-			exprs[name] = fn
-			continue
 		}
+
+		//if st, ok := x.(*simplepoly.WrappedFunc); simplepoly.DirectInterface && ok {
+		//	fn := &ExprFunc{
+		//		Title: name,
+
+		//		Values: st.Fns,
+		//	}
+		//	exprs[name] = fn
+		//	continue
+		//}
 
 		fn := &ExprFunc{
 			Title: name,
@@ -70,12 +88,27 @@ func FuncPrefixToFunctionsScope(prefix string) map[string]interfaces.Expr {
 		}
 		exprs[name] = fn
 	}
-	return exprs
+
+	// Wrap every Expr in ExprPoly, so that the function can be used with
+	// different types. Those functions are all builtins, so they don't need
+	// to access the surrounding scope.
+	exprPolys := make(map[string]interfaces.Expr)
+	for name, expr := range exprs {
+		exprPolys[name] = &ExprPoly{
+			Definition: &ExprTopLevel{
+				Definition:    expr,
+				CapturedScope: interfaces.EmptyScope(),
+			},
+		}
+	}
+
+	return exprPolys
 }
 
 // VarPrefixToVariablesScope is a helper function to return the variables
 // portion of the scope from a variable prefix lookup. Basically this is useful
 // to pull out a portion of the variables we've defined by API.
+// TODO: pass `data` into here so we can plumb it into Init for Expr's ?
 func VarPrefixToVariablesScope(prefix string) map[string]interfaces.Expr {
 	fns := vars.LookupPrefix(prefix) // map[string]func() interfaces.Var
 	exprs := make(map[string]interfaces.Expr)
@@ -85,7 +118,14 @@ func VarPrefixToVariablesScope(prefix string) map[string]interfaces.Expr {
 		if err != nil {
 			panic(fmt.Sprintf("could not build expr: %+v", err))
 		}
-		exprs[name] = expr
+		exprs[name] = &ExprTopLevel{
+			Definition: &ExprSingleton{
+				Definition: expr,
+
+				mutex: &sync.Mutex{}, // TODO: call Init instead
+			},
+			CapturedScope: interfaces.EmptyScope(),
+		}
 	}
 	return exprs
 }
@@ -179,8 +219,16 @@ func ValueToExpr(val types.Value) (interfaces.Expr, error) {
 
 	case *types.StructValue:
 		fields := []*ExprStructField{}
-
-		for k, v := range x.Struct() {
+		typ := x.Type()
+		if typ == nil {
+			return nil, fmt.Errorf("struct contains a nil type")
+		}
+		st := x.Struct()
+		for _, k := range typ.Ord {
+			v, exists := st[k]
+			if !exists {
+				return nil, fmt.Errorf("struct field %s is missing", k)
+			}
 			fx, err := ValueToExpr(v)
 			if err != nil {
 				return nil, err
@@ -196,15 +244,15 @@ func ValueToExpr(val types.Value) (interfaces.Expr, error) {
 			Fields: fields,
 		}
 
-	case *types.FuncValue:
-		// TODO: this particular case is particularly untested!
-		expr = &ExprFunc{
-			Title: "<func from ValueToExpr>", // TODO: change this?
-			// TODO: symmetrically, it would have used x.Func() here
-			Values: []*types.FuncValue{
-				x, // just one!
-			},
-		}
+	//case *types.FuncValue:
+	//	// TODO: this particular case is particularly untested!
+	//	expr = &ExprFunc{
+	//		Title: "<func from ValueToExpr>", // TODO: change this?
+	//		// TODO: symmetrically, it would have used x.Func() here
+	//		Values: []*types.FuncValue{
+	//			x, // just one!
+	//		},
+	//	}
 
 	case *types.VariantValue:
 		// TODO: should this be allowed, or should we unwrap them?
@@ -241,4 +289,534 @@ func CollectFiles(ast interfaces.Stmt) ([]string, error) {
 		return nil, errwrap.Wrapf(err, "can't retrieve paths")
 	}
 	return fileList, nil
+}
+
+// Program is a source file program in the AST.
+type Program struct {
+	// File is the source file that this program was parsed from.
+	File *interfaces.SourceFile
+
+	// AST is the root of this program.
+	AST interfaces.Stmt
+}
+
+// CollectPrograms collects all the source file programs used in the AST.
+func CollectPrograms(stmt interfaces.Stmt) ([]*Program, error) {
+	prog, ok := stmt.(*StmtProg)
+	if !ok {
+		return nil, fmt.Errorf("the AST did not return a program")
+	}
+
+	seen := make(map[string]struct{})
+	programs := []*Program{}
+	var collect func(*StmtProg)
+	collect = func(prog *StmtProg) {
+		file := prog.data.SourceFile()
+		// We can't tell two files apart by path alone, because each
+		// import can come from a different filesystem, and two of those
+		// can each contain their own /main.mcl file. Use the full URI so
+		// that we don't drop one of them here.
+		uri := file.URI()
+		if _, exists := seen[uri]; file.Path != "" && !exists {
+			seen[uri] = struct{}{}
+			programs = append(programs, &Program{
+				File: file,
+				AST:  prog,
+			})
+		}
+		for _, importProg := range prog.importProgs {
+			collect(importProg)
+		}
+	}
+	collect(prog)
+	return programs, nil
+}
+
+// CopyNodeMapping copies the map of string to node and is used in Ordering.
+func CopyNodeMapping(in map[string]interfaces.Node) map[string]interfaces.Node {
+	out := make(map[string]interfaces.Node)
+	for k, v := range in {
+		out[k] = v // copy the map, not the Node's
+	}
+	return out
+}
+
+// getScope pulls the local stored scope out of an Expr, without needing to add
+// a similarly named method to the Expr interface. This is private and not part
+// of the interface, because it is only used internally.
+// TODO: we could extend this to include Stmt's if it was ever useful
+func getScope(node interfaces.Expr) (*interfaces.Scope, error) {
+	//if _, ok := node.(interfaces.Expr); !ok {
+	//	return nil, fmt.Errorf("unexpected: %+v", node)
+	//}
+
+	switch expr := node.(type) {
+	case *ExprBool:
+		return expr.scope, nil
+	case *ExprStr:
+		return expr.scope, nil
+	case *ExprInt:
+		return expr.scope, nil
+	case *ExprFloat:
+		return expr.scope, nil
+	case *ExprList:
+		return expr.scope, nil
+	case *ExprMap:
+		return expr.scope, nil
+	case *ExprStruct:
+		return expr.scope, nil
+	case *ExprFunc:
+		return expr.scope, nil
+	case *ExprCall:
+		return expr.scope, nil
+	case *ExprVar:
+		return expr.scope, nil
+	//case *ExprParam:
+	//case *ExprIterated:
+	//case *ExprPoly:
+	//case *ExprTopLevel:
+	//case *ExprSingleton:
+	case *ExprIf:
+		return expr.scope, nil
+	case *ExprExcept:
+		return expr.scope, nil
+
+	// These shouldn't be seen here, because they're removed during the
+	// Interpolate step, but delegate to the inner expression if one is.
+	case *ExprParen:
+		return getScope(expr.Inner)
+	case *ExprBlock:
+		return getScope(expr.Inner)
+
+	default:
+		return nil, fmt.Errorf("unexpected: %+v", node)
+	}
+}
+
+// CheckParamScope ensures that only the specified ExprParams are free in the
+// expression. It is used for graph shape function speculation. This could have
+// been an addition to the interfaces.Expr interface, but since it's mostly
+// iteration, it felt cleaner like this.
+// TODO: Can we replace this with a call to Apply instead.
+func checkParamScope(node interfaces.Expr, freeVars map[interfaces.Expr]struct{}) error {
+	switch obj := node.(type) {
+
+	case *ExprBool:
+		return nil
+
+	case *ExprStr:
+		return nil
+
+	case *ExprInt:
+		return nil
+
+	case *ExprFloat:
+		return nil
+
+	case *ExprList:
+		for _, x := range obj.Elements {
+			if err := checkParamScope(x, freeVars); err != nil {
+				return err
+			}
+		}
+		return nil
+
+	case *ExprMap:
+		for _, x := range obj.KVs {
+			if err := checkParamScope(x.Key, freeVars); err != nil {
+				return err
+			}
+			if err := checkParamScope(x.Val, freeVars); err != nil {
+				return err
+			}
+		}
+		return nil
+
+	case *ExprStruct:
+		for _, x := range obj.Fields {
+			if err := checkParamScope(x.Value, freeVars); err != nil {
+				return err
+			}
+		}
+		return nil
+
+	case *ExprFunc:
+		if obj.Body != nil {
+			newFreeVars := make(map[interfaces.Expr]struct{})
+			for k, v := range freeVars {
+				newFreeVars[k] = v
+			}
+			for _, param := range obj.params {
+				newFreeVars[param] = struct{}{}
+			}
+
+			if err := checkParamScope(obj.Body, newFreeVars); err != nil {
+				return err
+			}
+		}
+		// XXX: Do we need to do anything for obj.Function ?
+		// XXX: Do we need to do anything for obj.Values ?
+		return nil
+
+	case *ExprCall:
+		if obj.expr != nil {
+			if err := checkParamScope(obj.expr, freeVars); err != nil {
+				return err
+			}
+		}
+		for _, x := range obj.Args {
+			if err := checkParamScope(x, freeVars); err != nil {
+				return err
+			}
+		}
+		return nil
+
+	case *ExprVar:
+		// XXX: is this still correct?
+		target := obj.scope.Variables[obj.Name]
+		return checkParamScope(target, freeVars)
+
+	case *ExprParam:
+		if _, exists := freeVars[obj]; !exists {
+			return fmt.Errorf("the body uses parameter $%s", obj.Name)
+		}
+		return nil
+
+	case *ExprIterated:
+		return checkParamScope(obj.Definition, freeVars) // XXX: is this what we want?
+
+	case *ExprPoly:
+		panic("checkParamScope(ExprPoly): should not happen, ExprVar should replace ExprPoly with a copy of its definition before calling checkParamScope")
+
+	case *ExprTopLevel:
+		return checkParamScope(obj.Definition, freeVars)
+
+	case *ExprSingleton:
+		return checkParamScope(obj.Definition, freeVars)
+
+	case *ExprIf:
+		if err := checkParamScope(obj.Condition, freeVars); err != nil {
+			return err
+		}
+		if err := checkParamScope(obj.ThenBranch, freeVars); err != nil {
+			return err
+		}
+		if err := checkParamScope(obj.ElseBranch, freeVars); err != nil {
+			return err
+		}
+		return nil
+
+	case *ExprExcept:
+		if err := checkParamScope(obj.Expr, freeVars); err != nil {
+			return err
+		}
+		if err := checkParamScope(obj.Except, freeVars); err != nil {
+			return err
+		}
+		return nil
+
+	// These shouldn't be seen here, because they're removed during the
+	// Interpolate step, but delegate to the inner expression if one is.
+	case *ExprParen:
+		return checkParamScope(obj.Inner, freeVars)
+
+	case *ExprBlock:
+		return checkParamScope(obj.Inner, freeVars)
+
+	default:
+		return fmt.Errorf("unexpected: %+v", node)
+	}
+}
+
+// trueCallee is a helper function because ExprTopLevel and ExprSingleton are
+// sometimes added around builtins. This makes it difficult for the type checker
+// to check if a particular builtin is the callee or not. This function removes
+// the ExprTopLevel and ExprSingleton wrappers, if they exist.
+func trueCallee(apparentCallee interfaces.Expr) interfaces.Expr {
+	switch x := apparentCallee.(type) {
+	case *ExprTopLevel:
+		return trueCallee(x.Definition)
+	case *ExprSingleton:
+		return trueCallee(x.Definition)
+	case *ExprIterated:
+		return trueCallee(x.Definition)
+	case *ExprPoly: // XXX: Did we want this one added too?
+		return trueCallee(x.Definition)
+	case *ExprParen: // usually removed by Interpolate before this runs
+		return trueCallee(x.Inner)
+	case *ExprBlock: // usually removed by Interpolate before this runs
+		return trueCallee(x.Inner)
+
+	default:
+		return apparentCallee
+	}
+}
+
+// findExprPoly is a helper used in SetScope.
+func findExprPoly(apparentCallee interfaces.Expr) *ExprPoly {
+	switch x := apparentCallee.(type) {
+	case *ExprTopLevel:
+		return findExprPoly(x.Definition)
+	case *ExprSingleton:
+		return findExprPoly(x.Definition)
+	case *ExprIterated:
+		return findExprPoly(x.Definition)
+	case *ExprPoly:
+		return x // found it!
+	case *ExprParen: // usually removed by Interpolate before this runs
+		return findExprPoly(x.Inner)
+	case *ExprBlock: // usually removed by Interpolate before this runs
+		return findExprPoly(x.Inner)
+	default:
+		return nil // not found!
+	}
+}
+
+// unwrapSynthetic returns the first "real" node by unwrapping any synthetic
+// nodes that the compiler introduces but which don't exist in the user's
+// original source code (eg: ExprTopLevel, ExprSingleton, ExprPoly, and
+// ExprIterated). Since these have no source position of their own, we unwrap
+// them to reach the inner node whose position we can show to the user in error
+// messages. If node is not synthetic, it is returned unchanged.
+func unwrapSynthetic(node interfaces.Node) interfaces.Node {
+	switch x := node.(type) {
+	case *ExprTopLevel:
+		return unwrapSynthetic(x.Definition)
+	case *ExprSingleton:
+		return unwrapSynthetic(x.Definition)
+	case *ExprIterated:
+		return unwrapSynthetic(x.Definition)
+	case *ExprPoly:
+		return unwrapSynthetic(x.Definition)
+
+	default:
+		return node
+	}
+}
+
+// newExprParam is a helper function to create an ExprParam with the internal
+// key set to the pointer of the thing we're creating.
+func newExprParam(name string, typ *types.Type) *ExprParam {
+	expr := &ExprParam{
+		Name: name,
+		typ:  typ,
+	}
+	expr.envKey = expr
+	return expr
+}
+
+// newExprIterated is a helper function to create an ExprIterated with the
+// internal key set to the pointer of the thing we're creating.
+func newExprIterated(name string, definition interfaces.Expr) *ExprIterated {
+	expr := &ExprIterated{
+		Name:       name,
+		Definition: definition,
+	}
+	expr.envKey = expr
+	return expr
+}
+
+// variableScopeFeedback logs some messages about what is actually in scope so
+// that the user gets a hint about what's going on. This is useful for catching
+// bugs in our programming or in user code!
+func variableScopeFeedback(scope *interfaces.Scope, logf func(format string, v ...interface{})) {
+	logf("variables in scope:")
+	names := []string{}
+	for name := range scope.Variables {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		logf("$%s", name)
+	}
+}
+
+// functionScopeFeedback logs some messages about what is actually in scope so
+// that the user gets a hint about what's going on. This is useful for catching
+// bugs in our programming or in user code!
+func functionScopeFeedback(scope *interfaces.Scope, logf func(format string, v ...interface{})) {
+	logf("functions in scope:")
+	names := []string{}
+	for name := range scope.Functions {
+		if strings.HasPrefix(name, "_") { // hidden function
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		logf("%s(...)", name)
+	}
+}
+
+// lambdaScopeFeedback logs some messages about what is actually in scope so
+// that the user gets a hint about what's going on. This is useful for catching
+// bugs in our programming or in user code!
+func lambdaScopeFeedback(scope *interfaces.Scope, logf func(format string, v ...interface{})) {
+	logf("lambdas in scope:")
+	names := []string{}
+	for name, val := range scope.Variables {
+		// XXX: Is this a valid way to filter?
+		if _, ok := trueCallee(val).(*ExprFunc); !ok {
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		logf("$%s(...)", name)
+	}
+}
+
+// classScopeFeedback logs some messages about what is actually in scope so that
+// the user gets a hint about what's going on. This is useful for catching bugs
+// in our programming or in user code!
+func classScopeFeedback(scope *interfaces.Scope, logf func(format string, v ...interface{})) {
+	logf("classes in scope:")
+	names := []string{}
+	for name := range scope.Classes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		logf("class %s", name)
+	}
+}
+
+// cycleReferenceNodes returns the nodes in a pgraph cycle error that reference
+// a name defined elsewhere in the cycle. These are the actual recursion points,
+// such as the `$foo(...)` call in a recursive function, or the `include`s in a
+// mutually recursive pair of classes. The ordering graph links each producer of
+// a variable/class/func to the node that consumes it with a dedicated edge, so
+// a cycle node is a recursion point when such an edge reaches it from another
+// node in the cycle. The result is deduplicated by span and sorted by source
+// position. It returns nil if none are found.
+func cycleReferenceNodes(graph *pgraph.Graph, err error) []interfaces.PositionableNode {
+	e, ok := err.(*pgraph.ErrNotAcyclic)
+	if !ok {
+		return nil
+	}
+	inCycle := make(map[pgraph.Vertex]struct{}, len(e.Cycle))
+	for _, v := range e.Cycle {
+		inCycle[v] = struct{}{}
+	}
+
+	kept := []interfaces.PositionableNode{}
+	seen := make(map[[4]int]struct{})
+	for _, v := range e.Cycle {
+		pn, ok := v.(interfaces.PositionableNode)
+		if !ok || !pn.IsSet() {
+			continue
+		}
+		// Is v the consumer end of a producer->consumer edge whose
+		// producer is also in the cycle? If so, it's a recursion point.
+		isRef := false
+		for n := range inCycle {
+			if n == v {
+				continue
+			}
+			edge := graph.FindEdge(n, v)
+			if edge == nil {
+				continue
+			}
+			if s := edge.String(); s == orderingProdConsEdge1 || s == orderingProdConsEdge2 {
+				isRef = true
+				break
+			}
+		}
+		if !isRef {
+			continue
+		}
+		sl, sc := pn.Pos()
+		el, ec := pn.End()
+		key := [4]int{sl, sc, el, ec}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		kept = append(kept, pn)
+	}
+
+	sort.Slice(kept, func(i, j int) bool {
+		li, ci := kept[i].Pos()
+		lj, cj := kept[j].Pos()
+		if li != lj {
+			return li < lj
+		}
+		return ci < cj
+	})
+	return kept
+}
+
+// addFuncEdge adds a function edge from f1 to f2 in the graph, wiring the
+// single named arg. Since pgraph stores at most one edge between any given
+// vertex pair, if such an edge already exists (which happens when the same
+// producer feeds more than one argument of the same consumer, such as the list
+// `[$foo, $foo]`, or a map or struct with a repeated value) then the arg name
+// is merged into the existing edge instead of replacing it. A single FuncEdge
+// may name more than one logical input; the txn layer and the dage function
+// engine already collapse shared edges this way. Without this, the second
+// AddEdge would clobber the first and the consumer would receive a nil value
+// for the lost argument.
+func addFuncEdge(graph *pgraph.Graph, f1, f2 interfaces.Func, arg string) {
+	if edge := graph.FindEdge(f1, f2); edge != nil {
+		fe := edge.(*interfaces.FuncEdge)
+		for _, a := range fe.Args {
+			if a == arg {
+				return // already present, nothing to do
+			}
+		}
+		fe.Args = append(fe.Args, arg) // merge into the existing edge
+		return
+	}
+	graph.AddEdge(f1, f2, &interfaces.FuncEdge{Args: []string{arg}})
+}
+
+// outputBuilt returns the combined output of the statements which a func built
+// at runtime (eg: the active branch of an if statement, or the body of each
+// iteration of a for loop) and which it passed to us along with the table.
+// Since each table carries the very statements that were built for it, we never
+// see any of them change underneath us, even if the function engine has already
+// moved on and built new ones. The node is only used for the error messages.
+func outputBuilt(table interfaces.Table, ptr interfaces.Func, node interfaces.Node) (*interfaces.Output, error) {
+	if ptr == nil {
+		return nil, fmt.Errorf("%w: %T", ErrFuncPointerNil, node)
+	}
+	v, err := table.Value(ptr)
+	if err == interfaces.ErrTableNoValue {
+		return nil, fmt.Errorf("%w: %T", interfaces.ErrTableNoValue, node)
+	}
+	if err != nil {
+		return nil, err
+	}
+	stmts, err := structs.ValueToStmts(v)
+	if err != nil {
+		// programming error
+		return nil, errwrap.Wrapf(err, "%T got bad statements", node)
+	}
+
+	resources := []engine.Res{}
+	edges := []*interfaces.Edge{}
+	nodes := map[engine.Res]interfaces.Node{} // source node per resource
+
+	for _, stmt := range stmts {
+		output, err := stmt.Output(table)
+		if err != nil {
+			return nil, err
+		}
+		if output == nil {
+			continue
+		}
+		resources = append(resources, output.Resources...)
+		edges = append(edges, output.Edges...)
+		for r, n := range output.Nodes {
+			nodes[r] = n
+		}
+	}
+
+	return &interfaces.Output{
+		Resources: resources,
+		Edges:     edges,
+		Nodes:     nodes,
+	}, nil
 }

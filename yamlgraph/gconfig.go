@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,14 +13,25 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 // Package yamlgraph provides the facilities for loading a graph from a yaml
 // file.
 package yamlgraph
 
 import (
-	"context"
 	"fmt"
 	"strings"
 
@@ -77,32 +88,32 @@ type Resource struct {
 }
 
 // UnmarshalYAML is the first stage for unmarshaling of resources.
-func (r *Resource) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	r.unmarshal = unmarshal
-	return unmarshal(&r.ResourceData)
+func (obj *Resource) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	obj.unmarshal = unmarshal
+	return unmarshal(&obj.ResourceData)
 }
 
 // Decode is the second stage for unmarshaling of resources (knowing their
 // kind).
-func (r *Resource) Decode(kind string) (err error) {
+func (obj *Resource) Decode(kind string) (err error) {
 	if kind == "" {
 		return fmt.Errorf("can't set empty kind") // bug?
 	}
-	r.resource, err = engine.NewResource(kind)
+	obj.resource, err = engine.NewResource(kind)
 	if err != nil {
 		return err
 	}
 
 	// i think this erases the `SetKind` that happens with the NewResource
 	// so as a result, we need to do it again below... this is a hack...
-	err = r.unmarshal(r.resource)
+	err = obj.unmarshal(obj.resource)
 	if err != nil {
 		return err
 	}
 
 	// set resource name and kind
-	r.resource.SetName(r.Name)
-	r.resource.SetKind(kind)
+	obj.resource.SetName(obj.Name)
+	obj.resource.SetKind(kind)
 	// TODO: I don't think meta is getting unmarshalled properly anymore
 	return
 }
@@ -227,12 +238,13 @@ func (obj *GraphConfig) NewGraphFromConfig(hostname string, world engine.World, 
 	}
 
 	// store in backend (usually etcd)
-	if err := world.ResExport(context.TODO(), resourceList); err != nil {
-		return nil, fmt.Errorf("config: could not export resources: %v", err)
-	}
+	// XXX: disabled for now until someone ports to new API.
+	//if err := world.ResExport(context.TODO(), resourceList); err != nil {
+	//	return nil, fmt.Errorf("config: could not export resources: %v", err)
+	//}
 
 	// lookup from backend (usually etcd)
-	var hostnameFilter []string // empty to get from everyone
+	//var hostnameFilter []string // empty to get from everyone
 	kindFilter := []string{}
 	for _, t := range obj.Collector {
 		kind := strings.ToLower(t.Kind)
@@ -241,11 +253,12 @@ func (obj *GraphConfig) NewGraphFromConfig(hostname string, world engine.World, 
 	// do all the graph look ups in one single step, so that if the backend
 	// database changes, we don't have a partial state of affairs...
 	if len(kindFilter) > 0 { // if kindFilter is empty, don't need to do lookups!
-		var err error
-		resourceList, err = world.ResCollect(context.TODO(), hostnameFilter, kindFilter)
-		if err != nil {
-			return nil, fmt.Errorf("config: could not collect resources: %v", err)
-		}
+		// XXX: disabled for now until someone ports to new API.
+		//var err error
+		//resourceList, err = world.ResCollect(context.TODO(), hostnameFilter, kindFilter)
+		//if err != nil {
+		//	return nil, fmt.Errorf("config: could not collect resources: %v", err)
+		//}
 	}
 	for _, res := range resourceList {
 		matched := false
@@ -271,11 +284,12 @@ func (obj *GraphConfig) NewGraphFromConfig(hostname string, world engine.World, 
 			//	res.MetaParams().Noop = noop
 			//}
 
-			if t.Pattern != "" { // XXX: simplistic for now
-				if xres, ok := res.(engine.CollectableRes); ok {
-					xres.CollectPattern(t.Pattern) // res.Dirname = t.Pattern
-				}
-			}
+			// XXX: disabled for now until someone ports to new API.
+			//if t.Pattern != "" { // XXX: simplistic for now
+			//	if xres, ok := res.(engine.CollectableRes); ok {
+			//		xres.CollectPattern(t.Pattern) // res.Dirname = t.Pattern
+			//	}
+			//}
 
 			obj.Logf("collected: %s", res)
 

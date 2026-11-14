@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,18 +13,35 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 // Package funcs provides a framework for functions that change over time.
 package funcs
 
 import (
+	"context"
 	"fmt"
+	"reflect"
+	"runtime"
 	"strings"
-	"sync"
 
+	docsUtil "github.com/purpleidea/mgmt/docs/util"
 	"github.com/purpleidea/mgmt/lang/interfaces"
 	"github.com/purpleidea/mgmt/lang/types"
+	unificationUtil "github.com/purpleidea/mgmt/lang/unification/util"
+	"github.com/purpleidea/mgmt/util"
 	"github.com/purpleidea/mgmt/util/errwrap"
 )
 
@@ -41,21 +58,93 @@ const (
 	// NOTE: the template library will panic if it is one of: .-#
 	ReplaceChar = "_"
 
-	// CoreDir is the directory prefix where core bindata mcl code is added.
+	// CoreDir is the directory prefix where core mcl code is embedded.
 	CoreDir = "core/"
+
+	// FunctionsRelDir is the path where the functions are kept, relative to
+	// the main source code root.
+	FunctionsRelDir = "lang/core/"
+
+	// PanicFuncName is the name of the core panic function in mcl.
+	PanicFuncName = "panic"
+
+	// PanicDebugFuncName is the name of the panic debug function in mcl.
+	PanicDebugFuncName = "panic_debug"
+
+	// ConcatFuncName is the name the concat function is registered as. It
+	// is listed here because it needs a well-known name that can be used by
+	// the string interpolation code.
+	ConcatFuncName = "concat"
+
+	// ContainsFuncName is the name the contains function is registered as.
+	ContainsFuncName = "contains"
+
+	// LookupFuncName is the name this function is registered as. This
+	// starts with an underscore so that it cannot be used from the lexer.
+	LookupFuncName = "_lookup"
+
+	// StructLookupFuncName is the name this function is registered as. This
+	// starts with an underscore so that it cannot be used from the lexer.
+	StructLookupFuncName = "_struct_lookup"
+
+	// StructLookupOptionalFuncName is the name this function is registered
+	// as. This starts with an underscore so that it cannot be used from the
+	// lexer. Of note, this is different from the except operator, since the
+	// optionality of this struct field lookup is determined statically at
+	// compile time (the field is either part of the struct type or not) as
+	// opposed to being a runtime error which can be caught.
+	StructLookupOptionalFuncName = "_struct_lookup_optional"
+
+	// CollectFuncName is the name this function is registered as. This
+	// starts with an underscore so that it cannot be used from the lexer.
+	CollectFuncName = "_collect"
+
+	// CollectFuncInFieldName is the name of the name field in the struct.
+	CollectFuncInFieldName = "name"
+	// CollectFuncInFieldHost is the name of the host field in the struct.
+	CollectFuncInFieldHost = "host"
+
+	// CollectFuncInType is the most complex of the three possible input
+	// types. The other two possible ones are str or []str.
+	CollectFuncInType = "[]struct{" + CollectFuncInFieldName + " str; " + CollectFuncInFieldHost + " str}"
+
+	// CollectFuncOutFieldName is the name of the name field in the struct.
+	CollectFuncOutFieldName = "name"
+	// CollectFuncOutFieldHost is the name of the host field in the struct.
+	CollectFuncOutFieldHost = "host"
+	// CollectFuncOutFieldData is the name of the data field in the struct.
+	CollectFuncOutFieldData = "data"
+
+	// CollectFuncOutStruct is the struct type that we return a list of.
+	CollectFuncOutStruct = "struct{" + CollectFuncOutFieldName + " str; " + CollectFuncOutFieldHost + " str; " + CollectFuncOutFieldData + " str}"
+
+	// CollectFuncOutType is the expected return type, the data field is an
+	// encoded resource blob.
+	CollectFuncOutType = "[]" + CollectFuncOutStruct
+
+	// ErrCantSpeculate is an error that explains that we can't speculate
+	// when trying to Call a function. This often gets called by the Value()
+	// method of the Expr. This can be useful if we want to distinguish
+	// between "something is broken" and "I just can't produce a value at
+	// this time", which can be identified and skipped over. If it's the
+	// former, then it's okay to error early and shut everything down since
+	// we know this function is never going to work the way it's called.
+	ErrCantSpeculate = util.Error("can't speculate")
 )
 
 // registeredFuncs is a global map of all possible funcs which can be used. You
 // should never touch this map directly. Use methods like Register instead. It
-// includes implementations which also satisfy PolyFunc as well.
+// includes implementations which also satisfy BuildableFunc and InferableFunc
+// as well.
 var registeredFuncs = make(map[string]func() interfaces.Func) // must initialize
 
 // Register takes a func and its name and makes it available for use. It is
 // commonly called in the init() method of the func at program startup. There is
 // no matching Unregister function. You may also register functions which
-// satisfy the PolyFunc interface. To register a function which lives in a
-// module, you must join the module name to the function name with the ModuleSep
-// character. It is defined as a const and is probably the period character.
+// satisfy the BuildableFunc and InferableFunc interfaces. To register a
+// function which lives in a module, you must join the module name to the
+// function name with the ModuleSep character. It is defined as a const and is
+// probably the period character.
 func Register(name string, fn func() interfaces.Func) {
 	if _, exists := registeredFuncs[name]; exists {
 		panic(fmt.Sprintf("a func named %s is already registered", name))
@@ -75,15 +164,24 @@ func Register(name string, fn func() interfaces.Func) {
 	//	panic(fmt.Sprintf("a func named %s is invalid", name))
 	//}
 
-	fnx := fn() // check that all functions have migrated to the new API!
-	if _, ok := fnx.(interfaces.OldPolyFunc); ok {
-		if _, ok := fnx.(interfaces.PolyFunc); !ok {
-			panic(fmt.Sprintf("a func named %s implements OldPolyFunc but not PolyFunc", name))
-		}
-	}
-
 	//gob.Register(fn())
 	registeredFuncs[name] = fn
+
+	f := fn() // Remember: If we modify this copy, it gets thrown away!
+
+	if _, ok := f.(interfaces.MetadataFunc); ok { // If it does it itself...
+		return
+	}
+
+	// We have to do it manually...
+	metadata, err := GetFunctionMetadata(f)
+	if err != nil {
+		panic(fmt.Sprintf("could not get function metadata for %s: %v", name, err))
+	}
+
+	if err := docsUtil.RegisterFunction(name, metadata); err != nil {
+		panic(fmt.Sprintf("could not register function metadata for %s", name))
+	}
 }
 
 // ModuleRegister is exactly like Register, except that it registers within a
@@ -93,7 +191,8 @@ func ModuleRegister(module, name string, fn func() interfaces.Func) {
 }
 
 // Lookup returns a pointer to the function's struct. It may be convertible to a
-// PolyFunc if the particular function implements those additional methods.
+// BuildableFunc or InferableFunc if the particular function implements those
+// additional methods.
 func Lookup(name string) (interfaces.Func, error) {
 	f, exists := registeredFuncs[name]
 	if !exists {
@@ -142,172 +241,171 @@ func Map() map[string]func() interfaces.Func {
 	return m
 }
 
-// PureFuncExec is usually used to provisionally speculate about the result of a
-// pure function, by running it once, and returning the result. Pure functions
-// are expected to only produce one value that depends only on the input values.
-// This won't run any slow functions either.
-func PureFuncExec(handle interfaces.Func, args []types.Value) (types.Value, error) {
-	hostname := ""                                   // XXX: add to interface
-	debug := false                                   // XXX: add to interface
-	logf := func(format string, v ...interface{}) {} // XXX: add to interface
+// GetFunctionName reads the handle to find the underlying real function name.
+// The function can be an actual function or a struct which implements one.
+func GetFunctionName(fn interface{}) string {
+	pc := runtime.FuncForPC(reflect.ValueOf(fn).Pointer())
+	if pc == nil {
+		// This part works for structs, the other parts work for funcs.
+		t := reflect.TypeOf(fn)
+		if t.Kind() == reflect.Pointer {
+			t = t.Elem()
+		}
 
-	info := handle.Info()
-	if !info.Pure {
-		return nil, fmt.Errorf("func is not pure")
-	}
-	// if function is expensive to run, we won't run it provisionally
-	if info.Slow {
-		return nil, fmt.Errorf("func is slow")
+		return t.Name()
 	}
 
-	if err := handle.Validate(); err != nil {
-		return nil, errwrap.Wrapf(err, "could not validate func")
+	// if pc.Name() is: github.com/purpleidea/mgmt/lang/core/math.Pow
+	sp := strings.Split(pc.Name(), "/")
+
+	// ...this will be: math.Pow
+	s := sp[len(sp)-1]
+
+	ix := strings.LastIndex(s, ".")
+	if ix == -1 { // standalone
+		return s
 	}
 
-	sig := handle.Info().Sig
-	if sig.Kind != types.KindFunc {
-		return nil, fmt.Errorf("must be kind func")
+	// ... this will be: Pow
+	return s[ix+1:]
+}
+
+// GetFunctionMetadata builds a metadata struct with everything about this func.
+func GetFunctionMetadata(fn interface{}) (*docsUtil.Metadata, error) {
+	nested := 1 // because this is wrapped in a function
+	// Additional metadata for documentation generation!
+	_, self, _, ok := runtime.Caller(0 + nested)
+	if !ok {
+		return nil, fmt.Errorf("could not locate function filename (1)")
+	}
+	depth := 1 + nested
+	// If this is ModuleRegister, we look deeper! Normal Register is depth 1
+	filename := self // initial condition to start the loop
+	for filename == self {
+		_, filename, _, ok = runtime.Caller(depth)
+		if !ok {
+			return nil, fmt.Errorf("could not locate function filename (2)")
+		}
+		depth++
 	}
 
-	ord := handle.Info().Sig.Ord
-	if i, j := len(ord), len(args); i != j {
-		return nil, fmt.Errorf("expected %d args, got %d", i, j)
+	// Get the function implementation path relative to FunctionsRelDir.
+	// FIXME: Technically we should split this by dirs instead of using
+	// string indexing, which is less correct, but we control the dirs.
+	ix := strings.LastIndex(filename, FunctionsRelDir)
+	if ix == -1 {
+		return nil, fmt.Errorf("could not locate function filename (3): %s", filename)
 	}
+	filename = filename[ix+len(FunctionsRelDir):]
 
-	wg := &sync.WaitGroup{}
-	defer wg.Wait()
+	funcname := GetFunctionName(fn)
 
-	errch := make(chan error)
-	input := make(chan types.Value)  // we close this when we're done
-	output := make(chan types.Value) // we create it, func closes it
+	return &docsUtil.Metadata{
+		Filename: filename,
+		Typename: funcname,
+	}, nil
+}
 
-	init := &interfaces.Init{
-		Hostname: hostname,
-		Input:    input,
-		Output:   output,
-		World:    nil, // should not be used for pure functions
-		Debug:    debug,
-		Logf: func(format string, v ...interface{}) {
-			logf("func: "+format, v...)
-		},
+// CheckArgKinds returns an error if the incoming args aren't compatible with
+// the kinds we are expecting. This can be used per-function if we choose to not
+// check for all functions in the ast ExprCall:Value() function.
+func CheckArgKinds(args []types.Value, kinds ...types.Kind) error { // ergonomic
+	if len(args) < len(kinds) {
+		return fmt.Errorf("expected at least %d args, got %d", len(kinds), len(args))
 	}
-
-	if err := handle.Init(init); err != nil {
-		return nil, errwrap.Wrapf(err, "could not init func")
-	}
-
-	close1 := make(chan struct{})
-	close2 := make(chan struct{})
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer close(errch) // last one turns out the lights
-		select {
-		case <-close1:
-		}
-		select {
-		case <-close2:
-		}
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer close(close1)
-		if debug {
-			logf("Running func")
-		}
-		err := handle.Stream() // sends to output chan
-		if debug {
-			logf("Exiting func")
-		}
-		if err == nil {
-			return
-		}
-		// we closed with an error...
-		select {
-		case errch <- errwrap.Wrapf(err, "problem streaming func"):
-		}
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer close(close2)
-		defer close(input) // we only send one value
-		if len(args) == 0 {
-			return
-		}
-		si := &types.Type{
-			// input to functions are structs
-			Kind: types.KindStruct,
-			Map:  handle.Info().Sig.Map,
-			Ord:  handle.Info().Sig.Ord,
-		}
-		st := types.NewStruct(si)
-
-		for i, arg := range args {
-			name := handle.Info().Sig.Ord[i]
-			if err := st.Set(name, arg); err != nil { // populate struct
-				select {
-				case errch <- errwrap.Wrapf(err, "struct set failure"):
-				}
-				return
-			}
-		}
-
-		select {
-		case input <- st: // send to function (must not block)
-		case <-close1: // unblock the input send in case stream closed
-			select {
-			case errch <- fmt.Errorf("stream closed early"):
-			}
-		}
-	}()
-
-	once := false
-	var result types.Value
-	var reterr error
-Loop:
-	for {
-		select {
-		case value, ok := <-output: // read from channel
-			if !ok {
-				output = nil
-				continue Loop // only exit via errch closing!
-			}
-			if once {
-				reterr = fmt.Errorf("got more than one value")
-				continue // only exit via errch closing!
-			}
-			once = true
-			result = value // save value
-
-		case err, ok := <-errch: // handle possible errors
-			if !ok {
-				break Loop
-			}
-			if err == nil {
-				// programming error
-				err = fmt.Errorf("error was missing")
-			}
-			e := errwrap.Wrapf(err, "problem streaming func")
-			reterr = errwrap.Append(reterr, e)
+	for i, kind := range kinds {
+		if args[i] == nil || args[i].Type() == nil || args[i].Type().Kind != kind {
+			return fmt.Errorf("arg #%d is not of kind %s", i, kind)
 		}
 	}
+	return nil
+}
 
-	if err := handle.Close(); err != nil {
-		err = errwrap.Append(err, reterr)
-		return nil, errwrap.Wrapf(err, "problem closing func")
+// Speculate evaluates a pure function using concrete arguments. The caller must
+// supply a fresh function instance with any compile-time data already set. This
+// function infers and builds that instance, but does not initialize runtime
+// services. Call must still return ErrCantSpeculate if those are needed. The
+// optional "out" type constrains the result when it is already known. Only
+// functions which are both Pure and Spec are run, since Spec lets a pure
+// function opt out of running at compile time.
+func Speculate(ctx context.Context, fn interfaces.Func, args []types.Value, out *types.Type) (types.Value, error) {
+	info := fn.Info()
+	if info == nil || !info.Pure || !info.Spec {
+		return nil, ErrCantSpeculate
 	}
 
-	if result == nil && reterr == nil {
-		// programming error
-		// XXX: i think this can happen when we exit without error, but
-		// before we send one output message... not sure how this happens
-		// XXX: iow, we never send on output, and errch closes...
-		// XXX: this could happen if we send zero input args, and Stream exits without error
-		return nil, fmt.Errorf("function exited with nil result and nil error")
+	argGen := func(i int) (string, error) { return util.NumToAlpha(i), nil }
+	if named, ok := fn.(interfaces.NamedArgsFunc); ok {
+		argGen = named.ArgGen
 	}
-	return result, reterr
+	partial := &types.Type{
+		Kind: types.KindFunc,
+		Map:  make(map[string]*types.Type),
+		Ord:  []string{},
+		Out:  out,
+	}
+	for i, arg := range args {
+		if arg == nil || arg.Type() == nil || arg.Type().HasUni() || arg.Type().HasVariant() {
+			return nil, ErrCantSpeculate
+		}
+		name, err := argGen(i)
+		if err != nil {
+			return nil, err
+		}
+		partial.Map[name] = arg.Type()
+		partial.Ord = append(partial.Ord, name)
+	}
+
+	sig := info.Sig
+	if inferable, ok := fn.(interfaces.InferableFunc); ok {
+		var invariants []*interfaces.UnificationInvariant
+		var err error
+		sig, invariants, err = inferable.FuncInfer(partial, args)
+		if err != nil {
+			return nil, err
+		}
+		// Constraints on other AST nodes require the main solver. We
+		// cannot safely evaluate this function without checking them.
+		if len(invariants) != 0 {
+			return nil, ErrCantSpeculate
+		}
+	}
+	if sig == nil || sig.Kind != types.KindFunc || sig.HasVariant() {
+		return nil, ErrCantSpeculate
+	}
+	if partial.Out == nil {
+		partial.Out = &types.Type{Kind: types.KindUnification, Uni: types.NewElem()}
+	}
+	// Resolve the whole signature at once: repeated variables relate the
+	// arguments to each other and to the result. Neither input is mutated.
+	typ, err := unificationUtil.UnifyType(sig, partial)
+	if err != nil {
+		return nil, errwrap.Wrapf(err, "can't speculate a call")
+	}
+	if typ.HasUni() || typ.Out == nil {
+		return nil, ErrCantSpeculate
+	}
+	if buildable, ok := fn.(interfaces.BuildableFunc); ok {
+		built, err := buildable.Build(typ)
+		if err != nil {
+			return nil, err
+		}
+		if err := typ.Cmp(built); err != nil {
+			return nil, errwrap.Wrapf(err, "speculative build changed signature")
+		}
+	}
+	if err := fn.Validate(); err != nil {
+		return nil, err
+	}
+	result, err := fn.Call(ctx, args)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil || result.Type() == nil {
+		return nil, ErrCantSpeculate
+	}
+	if err := typ.Out.Cmp(result.Type()); err != nil {
+		return nil, errwrap.Wrapf(err, "speculative result type differs")
+	}
+	return result, nil
 }

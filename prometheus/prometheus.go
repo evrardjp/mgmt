@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,19 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 // Package prometheus provides functions that are useful to control and manage
 // the built-in prometheus instance.
@@ -24,6 +36,7 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -42,7 +55,8 @@ const (
 	ResStateOK ResState = iota
 	// ResStateSoftFail represents a resource in soft fail (will be retried)
 	ResStateSoftFail
-	// ResStateHardFail represents a resource in hard fail (will NOT be retried)
+	// ResStateHardFail represents a resource in hard fail (will NOT be
+	// retried)
 	ResStateHardFail
 )
 
@@ -137,7 +151,11 @@ func (obj *Prometheus) Init() error {
 // prometheus would expect.
 func (obj *Prometheus) Start() error {
 	http.Handle("/metrics", promhttp.Handler())
-	go http.ListenAndServe(obj.Listen, nil)
+	srv := &http.Server{
+		Addr:              obj.Listen,
+		ReadHeaderTimeout: 60 * time.Second, // safety against slowloris
+	}
+	go srv.ListenAndServe()
 	return nil
 }
 

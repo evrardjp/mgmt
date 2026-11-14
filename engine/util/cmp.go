@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,19 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package util
 
@@ -21,15 +33,83 @@ import (
 	"fmt"
 )
 
+// BoolPtrCmp compares two pointers to booleans. If they aren't both nil or
+// aren't both of the same value, then this errors.
+func BoolPtrCmp(x, y *bool) error {
+	if (x == nil) != (y == nil) { // xor
+		return fmt.Errorf("the ptr differs")
+	}
+	if x != nil && y != nil {
+		if *x != *y { // compare the booleans
+			return fmt.Errorf("the contents of ptr differ")
+		}
+	}
+	return nil
+}
+
+// StrPtrCmp compares two pointers to strings. If they aren't both nil or aren't
+// both of the same value, then this errors.
+func StrPtrCmp(x, y *string) error {
+	if (x == nil) != (y == nil) { // xor
+		return fmt.Errorf("the ptr differs")
+	}
+	if x != nil && y != nil {
+		if *x != *y { // compare the strings
+			return fmt.Errorf("the contents of ptr differ")
+		}
+	}
+	return nil
+}
+
 // StrListCmp compares two lists of strings. If they are not the same length or
 // do not contain identical strings in the same order, then this errors.
 func StrListCmp(x, y []string) error {
 	if len(x) != len(y) {
-		return fmt.Errorf("length differs")
+		return fmt.Errorf("the length differs")
 	}
 	for i := range x {
 		if x[i] != y[i] {
-			return fmt.Errorf("the elements at position %d differed", i)
+			return fmt.Errorf("the elements at position %d differ", i)
+		}
+	}
+
+	return nil
+}
+
+// StrSetCmp compares two lists of strings as multisets: order is ignored, but
+// duplicates count. It does not mutate either input. Errors if the contents
+// differ.
+func StrSetCmp(x, y []string) error {
+	if len(x) != len(y) {
+		return fmt.Errorf("the length differs")
+	}
+	count := make(map[string]int, len(x))
+	for _, s := range x {
+		count[s]++
+	}
+	for _, s := range y {
+		count[s]--
+		if count[s] < 0 {
+			return fmt.Errorf("element %q differs", s)
+		}
+	}
+	return nil
+}
+
+// StrMapCmp compares two maps of string to string. If they are not the same
+// length or do not contain identical keys and values, then this errors.
+func StrMapCmp(x, y map[string]string) error {
+	if len(x) != len(y) {
+		return fmt.Errorf("the length differs")
+	}
+	for k, v1 := range x {
+		v2, exists := y[k]
+		if !exists {
+			return fmt.Errorf("the key %s doesn't exist", k)
+		}
+
+		if v1 != v2 {
+			return fmt.Errorf("the value with key %s differs", k)
 		}
 	}
 

@@ -1,0 +1,38 @@
+#!ipxe
+
+menu iPXE Boot Options
+
+item kickstart Install {{ .Distro }} {{ .Version }} {{ .Arch }} ( kickstart )
+item manual Install {{ .Distro }} {{ .Version }} {{ .Arch }} ( manual )
+item shell iPXE shell
+item exit Exit to BIOS
+
+choose --default kickstart --timeout 10000 option && goto ${option}
+
+:kickstartwip
+imgfree
+set server_root {{ .Server_base }}
+kernel ${server_root}{{ .Distro }}{{ .Version }}-{{ .Arch }}/vmlinuz ip=dhcp initrd=initrd.magic inst.repo={{ .Inst_repo_base }}releases/{{ .Version }}/{{ .Flavour }}/{{ .Arch }}/os/ inst.text inst.ks={{ .Ks }} console=ttyS1,115200n8
+initrd ${server_root}{{ .Distro }}{{ .Version }}-{{ .Arch }}/initrd.img
+boot
+
+# The imgfree command works around some bug, which makes our initrd not be seen
+# properly. We would otherwise get a VFS not syncing error on boot.
+
+:kickstart
+imgfree
+kernel {{ .Server_base }}{{ .Distro }}{{ .Version }}-{{ .Arch }}/vmlinuz ip=dhcp initrd=initrd.img inst.repo={{ .Inst_repo_base }}releases/{{ .Version }}/{{ .Flavour }}/{{ .Arch }}/os/ inst.ks={{ .Ks }}
+initrd {{ .Server_base }}{{ .Distro }}{{ .Version }}-{{ .Arch }}/initrd.img
+boot
+
+:manual
+imgfree
+kernel {{ .Server_base }}{{ .Distro }}{{ .Version }}-{{ .Arch }}/vmlinuz ip=dhcp inst.repo={{ .Inst_repo_base }}releases/{{ .Version }}/{{ .Flavour }}/{{ .Arch }}/os/
+initrd {{ .Server_base }}{{ .Distro }}{{ .Version }}-{{ .Arch }}/initrd.img
+boot
+
+:shell
+shell
+
+:exit
+exit

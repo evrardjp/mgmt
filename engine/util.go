@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,20 +13,34 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package engine
 
 import (
+	"context"
 	"sort"
+	"sync"
 )
 
 // ResourceSlice is a linear list of resources. It can be sorted.
 type ResourceSlice []Res
 
-func (rs ResourceSlice) Len() int           { return len(rs) }
-func (rs ResourceSlice) Swap(i, j int)      { rs[i], rs[j] = rs[j], rs[i] }
-func (rs ResourceSlice) Less(i, j int) bool { return rs[i].String() < rs[j].String() }
+func (obj ResourceSlice) Len() int           { return len(obj) }
+func (obj ResourceSlice) Swap(i, j int)      { obj[i], obj[j] = obj[j], obj[i] }
+func (obj ResourceSlice) Less(i, j int) bool { return obj[i].String() < obj[j].String() }
 
 // Sort the list of resources and return a copy without modifying the input.
 func Sort(rs []Res) []Res {
@@ -38,4 +52,76 @@ func Sort(rs []Res) []Res {
 	return resources
 	// sort.Sort(ResourceSlice(rs)) // this is wrong, it would modify input!
 	//return rs
+}
+
+// NewBackgroundPool creates a new BackgroundPool. This must be used to create
+// the BackgroundPool.
+func NewBackgroundPool(fn BackgroundFunc) *BackgroundPool {
+	return &BackgroundPool{
+		fn: fn,
+
+		wg: &sync.WaitGroup{},
+		mu: &sync.Mutex{},
+	}
+}
+
+// BackgroundPool ties a single refcounted background worker to a collection of
+// input contexts. Each individual caller causes the maximum of one to startup,
+// and when the final ctx closes, the background func shuts down. You must use
+// NewBackgroundPool to create one of these before first use.
+type BackgroundPool struct {
+	fn     BackgroundFunc // the func to run
+	ctx    context.Context
+	cancel context.CancelFunc
+	err    error
+
+	wg      *sync.WaitGroup
+	mu      *sync.Mutex
+	running bool
+	count   int // refcount
+}
+
+// Background is a worker function which is run once per resource kind as long
+// as there is at least one of that kind running in the active resource graph.
+// This function is what is used to singleton wrap the actual function we run.
+func (obj *BackgroundPool) Background(ctx context.Context, ready chan<- struct{}) error {
+	obj.mu.Lock()
+
+	// Start the background worker if not running.
+	if !obj.running {
+		obj.ctx, obj.cancel = context.WithCancel(context.Background())
+		obj.running = true
+
+		obj.wg.Add(1)
+		go func() {
+			defer obj.wg.Done()
+			obj.err = obj.fn(obj.ctx, ready) // first ready gets passed in
+		}()
+	} else {
+		close(ready) // already running
+	}
+
+	obj.count++
+	obj.mu.Unlock()
+
+	// Wait for the main ctx to be cancelled.
+	select {
+	case <-ctx.Done():
+	}
+
+	obj.mu.Lock()
+	defer obj.mu.Unlock()
+
+	obj.count--
+
+	// If refcount is zero, stop the background worker.
+	if obj.count == 0 && obj.running {
+		obj.cancel()
+		obj.cancel = nil
+		obj.running = false
+		obj.wg.Wait()
+		return obj.err
+	}
+
+	return ctx.Err()
 }

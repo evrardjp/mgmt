@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,12 +13,24 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package gapi
 
 import (
-	"io/ioutil"
+	"os"
 
 	"github.com/purpleidea/mgmt/engine"
 	"github.com/purpleidea/mgmt/util"
@@ -30,8 +42,8 @@ import (
 const Umask = 0666
 
 // CopyFileToFs copies a file from src path on the local fs to a dst path on fs.
-func CopyFileToFs(fs engine.Fs, src, dst string) error {
-	data, err := ioutil.ReadFile(src)
+func CopyFileToFs(fs engine.WriteableFS, src, dst string) error {
+	data, err := os.ReadFile(src)
 	if err != nil {
 		return errwrap.Wrapf(err, "can't read from file `%s`", src)
 	}
@@ -42,7 +54,7 @@ func CopyFileToFs(fs engine.Fs, src, dst string) error {
 }
 
 // CopyBytesToFs copies a list of bytes to a dst path on fs.
-func CopyBytesToFs(fs engine.Fs, b []byte, dst string) error {
+func CopyBytesToFs(fs engine.WriteableFS, b []byte, dst string) error {
 	if err := fs.WriteFile(dst, b, Umask); err != nil {
 		return errwrap.Wrapf(err, "can't write to file `%s`", dst)
 	}
@@ -50,7 +62,7 @@ func CopyBytesToFs(fs engine.Fs, b []byte, dst string) error {
 }
 
 // CopyStringToFs copies a string to a dst path on fs.
-func CopyStringToFs(fs engine.Fs, str, dst string) error {
+func CopyStringToFs(fs engine.WriteableFS, str, dst string) error {
 	if err := fs.WriteFile(dst, []byte(str), Umask); err != nil {
 		return errwrap.Wrapf(err, "can't write to file `%s`", dst)
 	}
@@ -76,4 +88,10 @@ func CopyDirToFsForceAll(fs engine.Fs, src, dst string) error {
 // dst path on fs.
 func CopyDirContentsToFs(fs engine.Fs, src, dst string) error {
 	return util.CopyDiskContentsToFs(fs, src, dst, false)
+}
+
+// MkdirAllOnFs writes a dir to a dst path on fs. It makes the parent dirs if
+// they don't exist.
+func MkdirAllOnFs(fs engine.WriteableFS, dst string, perm os.FileMode) error {
+	return fs.MkdirAll(dst, perm)
 }

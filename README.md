@@ -3,20 +3,27 @@
 [![mgmt!](art/mgmt.png)](art/)
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/purpleidea/mgmt?style=flat-square)](https://goreportcard.com/report/github.com/purpleidea/mgmt)
-[![Build Status](https://img.shields.io/travis/purpleidea/mgmt/master.svg?style=flat-square)](http://travis-ci.org/purpleidea/mgmt)
 [![Build Status](https://github.com/purpleidea/mgmt/workflows/.github/workflows/test.yaml/badge.svg)](https://github.com/purpleidea/mgmt/actions/)
 [![GoDoc](https://img.shields.io/badge/godoc-reference-5272B4.svg?style=flat-square)](https://godocs.io/github.com/purpleidea/mgmt)
-[![IRC](https://img.shields.io/badge/irc-%23mgmtconfig-orange.svg?style=flat-square)](https://web.libera.chat/?channels=#mgmtconfig)
-[![Patreon](https://img.shields.io/badge/patreon-donate-yellow.svg?style=flat-square)](https://www.patreon.com/purpleidea)
-[![Liberapay](https://img.shields.io/badge/liberapay-donate-yellow.svg?style=flat-square)](https://liberapay.com/purpleidea/donate)
+[![Matrix](https://img.shields.io/badge/matrix-%23mgmtconfig-orange.svg?style=flat-square)](https://matrix.to/#/#mgmtconfig:matrix.org)
+[![Support](https://img.shields.io/badge/support-m9rx.com-yellow.svg?style=flat-square)](https://m9rx.com/)
+
+> [!TIP]
+> [Introductory guide now available!](https://mgmtconfig.com/docs/guide/)
+
+> [!TIP]
+> [Resource reference now available!](https://mgmtconfig.com/docs/resources/)
+
+> [!TIP]
+> [Function reference now available!](https://mgmtconfig.com/docs/functions/)
 
 ## About:
 
 `Mgmt` is a real-time automation tool. It is familiar to existing configuration
 management software, but is drastically more powerful as it can allow you to
 build real-time, closed-loop feedback systems, in a very safe way, and with a
-surprisingly small amout of our `mcl` code. For example, the following code will
-ensure that your file server is set to read-only when it's friday.
+surprisingly small amount of our `mcl` code. For example, the following code
+will ensure that your file server is set to read-only when it's Friday.
 
 ```mcl
 import "datetime"
@@ -36,26 +43,30 @@ will guarantee that your system is always in the desired state for that instant!
 In this mode it can run as a decentralized cluster of agents across your
 network, each exchanging information with the others in real-time, to respond to
 your changing needs. For example, if you want to ensure that some resource runs
-on a maximum of two hosts in your cluster, you can specify that as well:
+on a maximum of two hosts in your cluster, you can specify that quite easily:
 
 ```mcl
 import "sys"
 import "world"
 
-# we'll set a few scheduling options:
-$opts = struct{strategy => "rr", max => 2, ttl => 10,}
+# we'll set a few scheduling options, and request each node be scheduled:
+schedule "mygroup42" {
+	strategy => "rr",
+	max => 2,
+	ttl => 10,
+}
 
-# schedule in a particular namespace with options:
-$set = world.schedule("xsched", $opts)
+# read the (changing) scheduled result stream:
+$set = world.schedule("mygroup42")
 
 if sys.hostname() in $set {
-	# use your imagination to put something more complex right here...
+	# use your imagination to put something more interesting right here...
 	print "i got scheduled" {} # this will run on the chosen machines
 }
 ```
 
 As you add and remove hosts from the cluster, the real-time `schedule` function
-will dynamically pick up to two hosts from the available pool. These specific
+will dynamically elect up to two hosts from the available pool. These specific
 functions aren't intrinsic to the core design, and new ones can be easily added.
 
 Please read on if you'd like to learn more...
@@ -66,22 +77,35 @@ Come join us in the `mgmt` community!
 
 | Medium | Link |
 |---|---|
-| IRC | [#mgmtconfig](https://web.libera.chat/?channels=#mgmtconfig) on Libera.Chat |
-| Twitter | [@mgmtconfig](https://twitter.com/mgmtconfig) & [#mgmtconfig](https://twitter.com/hashtag/mgmtconfig) |
-| Mailing list | [mgmtconfig-list@redhat.com](https://www.redhat.com/mailman/listinfo/mgmtconfig-list) |
-| Patreon | [purpleidea](https://www.patreon.com/purpleidea) on Patreon |
-| Liberapay | [purpleidea](https://liberapay.com/purpleidea/donate) on Liberapay |
+| Website | [https://mgmtconfig.com/](https://mgmtconfig.com/) |
+| Matrix | [#mgmtconfig](https://matrix.to/#/#mgmtconfig:matrix.org) on Matrix.org |
+| Mastodon | [#mgmtconfig](https://mastodon.social/tags/mgmtconfig) |
+| Mailing list | [looking for a new home, suggestions welcome](https://gitlab.freedesktop.org/freedesktop/freedesktop/-/issues/1082) |
+| Support | [m9rx.com](https://m9rx.com/) for enterprise products and services |
 
 ## Status:
 
 Mgmt is a next generation automation tool. It has similarities to other tools in
 the configuration management space, but has a fast, modern, distributed systems
 approach. The project contains an engine and a language.
-[Please have a look at an introductory video or blog post.](docs/on-the-web.md)
+[Please have a look at a video or blog post.](docs/on-the-web.md)
 
-Mgmt is a fairly new project. It is usable today, but not yet feature complete.
-With your help you'll be able to influence our design and get us to 1.0 sooner!
-Interested users should read the [quick start guide](docs/quick-start-guide.md).
+Mgmt is over ten years old! It is very powerful today, and has a solid
+foundation and architecture which has been polished over the years. It's used in
+production with a growing number of both corporate and individual users.
+Interested parties should start with the [official website](https://mgmtconfig.com/docs/).
+
+## Sponsors:
+
+Mgmt is generously sponsored by:
+
+[![m9rx corporation](art/m9rx.png)](https://m9rx.com/)
+
+Mgmt received a generous grant from:
+
+[![nlnet foundation](art/nlnet.png)](https://nlnet.nl/project/mgmt-config/)
+
+Please reach out if you'd like to sponsor!
 
 ## Documentation:
 
@@ -89,17 +113,23 @@ Please read, enjoy and help improve our documentation!
 
 | Documentation | Additional Notes |
 |---|---|
-| [quick start guide](docs/quick-start-guide.md) | for everyone |
+| [quick start guide](https://mgmtconfig.com/docs/guide/getting-started/) | for everyone |
+| [introductory guide](https://mgmtconfig.com/docs/guide/) | for everyone |
+| [resource reference](https://mgmtconfig.com/docs/resources/) | for everyone |
+| [function reference](https://mgmtconfig.com/docs/functions/) | for everyone |
 | [frequently asked questions](docs/faq.md) | for everyone |
 | [general documentation](docs/documentation.md) | for everyone |
 | [language guide](docs/language-guide.md) | for everyone |
 | [function guide](docs/function-guide.md) | for mgmt developers |
 | [resource guide](docs/resource-guide.md) | for mgmt developers |
 | [style guide](docs/style-guide.md) | for mgmt developers |
+| [contributing guide](docs/contributing.md) | for mgmt contributors |
+| [service API guide](docs/service-guide.md) | for external developers |
 | [godoc API reference](https://godoc.org/github.com/purpleidea/mgmt) | for mgmt developers |
 | [prometheus guide](docs/prometheus.md) | for everyone |
-| [puppet guide](docs/puppet-guide.md) | for puppet sysadmins |
 | [development](docs/development.md) | for mgmt developers |
+| [videos](docs/on-the-web.md) | for everyone |
+| [blogs](docs/on-the-web.md) | for everyone |
 
 ## Questions:
 
@@ -110,24 +140,25 @@ question, and a patch with the answer!
 
 ## Get involved:
 
-Feel free to grab one of the straightforward [#mgmtlove](https://github.com/purpleidea/mgmt/labels/mgmtlove)
-issues if you're a first time contributor to the project or if you're unsure
-about what to hack on! Please get involved by working on one of these items or
-by suggesting something else! There are some lower priority issues and harder
-issues available in our [TODO](TODO.md) file. Please have a look.
+Feel free to grab one of the [issues](https://github.com/purpleidea/mgmt/issues/)
+if you're a first time contributor to the project or if you're unsure about what
+to hack on! Please get involved by working on one of these items or by
+suggesting something else!
 
 ## Bugs:
 
 Please set the `DEBUG` constant in [main.go](https://github.com/purpleidea/mgmt/blob/master/main.go)
-to `true`, and post the logs when you report the [issue](https://github.com/purpleidea/mgmt/issues).
+to `true`, and post the logs when you report the [issue](https://github.com/purpleidea/mgmt/discussions/categories/bugs).
+Please include the full `mcl` code you used as well as the exact command you
+used to run it.
 Feel free to read my article on [debugging golang programs](https://purpleidea.com/blog/2016/02/15/debugging-golang-programs/).
 
-## Patches:
+## Contributing:
 
-We'd love to have your patches! Please send them by email, or as a pull request.
+We'd love to have your patches! Please send them our way!
 
 ## On the web:
 
-[Read what people are saying and publishing about mgmt!](docs/on-the-web.md)
+[Blog posts and recorded talks about mgmt are listed here!](docs/on-the-web.md)
 
 Happy hacking!

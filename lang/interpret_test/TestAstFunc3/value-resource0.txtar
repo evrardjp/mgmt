@@ -1,0 +1,25 @@
+-- main.mcl --
+value "hello1" {
+	#any => 42, # can be any type
+	any => "wow", # can be any type
+}
+value "hello2" {
+	any => "whatever", # TODO: remove the temporary placeholder here
+	#any => "", # XXX: remove any placeholder to see the bug when absent
+}
+
+test "test" {
+	#anotherstr => "", # get it from send/recv
+}
+
+Value["hello1"].any -> Value["hello2"].any
+Value["hello2"].any -> Test["test"].anotherstr
+-- OUTPUT --
+Edge: value[hello1] -> value[hello2] # value[hello1] -> value[hello2]
+Edge: value[hello2] -> test[test] # value[hello2] -> test[test]
+Field: test[test].AnotherStr = "wow"
+Field: value[hello1].Any = "wow"
+Field: value[hello2].Any = "wow"
+Vertex: test[test]
+Vertex: value[hello1]
+Vertex: value[hello2]

@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,14 +13,25 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package interfaces
 
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"strings"
 
 	"github.com/purpleidea/mgmt/util/errwrap"
@@ -83,8 +94,8 @@ type Metadata struct {
 	// metadata file Path settings for modules. We always search in the
 	// global path if we don't find others first. This setting defaults to
 	// false, which is important because the downloader uses it to decide
-	// where to put downloaded modules. It is similar to the equivalent of
-	// a `require vendoring` flag in golang if such a thing existed. If a
+	// where to put downloaded modules. It is similar to the equivalent of a
+	// `require vendoring` flag in golang if such a thing existed. If a
 	// module sets this to true, and specifies a Path value, then only that
 	// path will be used as long as imports are present there. Otherwise it
 	// will fall-back on the global modules directory. If a module sets this
@@ -152,8 +163,8 @@ func (obj *Metadata) ToBytes() ([]byte, error) {
 //// MarshalYAML modifies the struct before it is used to build the raw output.
 //func (obj *Metadata) MarshalYAML() (interface{}, error) {
 //	// The Marshaler interface may be implemented by types to customize
-//	// their behavior when being marshaled into a YAML document. The
-//	// returned value is marshaled in place of the original value
+//	// their behavior when being marshalled into a YAML document. The
+//	// returned value is marshal;ed in place of the original value
 //	// implementing Marshaler.
 //
 //	if obj.metadataPath == "" { // make sure metadataPath isn't saved!
@@ -196,7 +207,7 @@ func ParseMetadata(reader io.Reader) (*Metadata, error) {
 	//if err := decoder.Decode(metadata); err != nil {
 	//	return nil, errwrap.Wrapf(err, "can't parse metadata")
 	//}
-	b, err := ioutil.ReadAll(reader)
+	b, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, errwrap.Wrapf(err, "can't read metadata")
 	}

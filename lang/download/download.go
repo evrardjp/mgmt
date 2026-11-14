@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,21 +13,35 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 // Package download is used for downloading language modules from git.
 package download
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path"
 	"strings"
 
 	"github.com/purpleidea/mgmt/lang/interfaces"
+	"github.com/purpleidea/mgmt/util"
 	"github.com/purpleidea/mgmt/util/errwrap"
 
-	git "gopkg.in/src-d/go-git.v4"
+	git "github.com/go-git/go-git/v5"
 )
 
 // Downloader implements the Downloader interface. It provides a mechanism to
@@ -73,7 +87,7 @@ func (obj *Downloader) Get(info *interfaces.ImportData, modulesPath string) erro
 		if err == nil {
 			return fmt.Errorf("module path (`%s`) must be a dir", modulesPath)
 		}
-		if err == os.ErrNotExist {
+		if os.IsNotExist(err) {
 			return fmt.Errorf("module path (`%s`) must exist", modulesPath)
 		}
 		return errwrap.Wrapf(err, "could not read module path (`%s`)", modulesPath)
@@ -89,10 +103,12 @@ func (obj *Downloader) Get(info *interfaces.ImportData, modulesPath string) erro
 	pull := false
 	dir := modulesPath + info.Path // TODO: is this dir unique?
 	isBare := false
+	progress := &gitProgressWriter{logf: obj.info.Logf}
 	options := &git.CloneOptions{
 		URL: info.URL,
 		// TODO: do we want to add an option for infinite recursion here?
 		RecurseSubmodules: git.DefaultSubmoduleRecursionDepth,
+		Progress:          progress,
 	}
 
 	msg := fmt.Sprintf("downloading `%s` to: `%s`", info.URL, dir)
@@ -112,13 +128,21 @@ func (obj *Downloader) Get(info *interfaces.ImportData, modulesPath string) erro
 	// that uses an `fs engine.Fs` wrapped to the git Filesystem interface:
 	// `billyFs := desfacer.New(obj.info.Fs)`
 	// TODO: repo, err := git.Clone(??? storage.Storer, billyFs, options)
-	repo, err := git.PlainClone(path.Clean(dir), isBare, options)
+	gitDir := path.Clean(dir)
+	obj.info.Logf("cloning...")
+	repo, err := git.PlainCloneContext(context.TODO(), gitDir, isBare, options)
 	if err == git.ErrRepositoryAlreadyExists {
+		repo, err = git.PlainOpen(gitDir)
+		if err != nil {
+			return errwrap.Wrapf(err, "can't open existing repo at: `%s`", dir)
+		}
+		obj.info.Logf("repo already exists!")
+
 		if obj.info.Update {
 			pull = true // make sure to pull latest...
 		}
 	} else if err != nil {
-		return errwrap.Wrapf(err, "can't clone repo: `%s` to: `%s`", info.URL, dir)
+		return errwrap.Wrapf(util.EscapeLogError(err), "can't clone repo: `%s` to: `%s`", info.URL, dir)
 	}
 
 	worktree, err := repo.Worktree()
@@ -135,10 +159,15 @@ func (obj *Downloader) Get(info *interfaces.ImportData, modulesPath string) erro
 		options := &git.PullOptions{
 			// TODO: do we want to add an option for infinite recursion here?
 			RecurseSubmodules: git.DefaultSubmoduleRecursionDepth,
+			Progress:          progress,
 		}
-		err := worktree.Pull(options)
+		obj.info.Logf("pulling...")
+		err := worktree.PullContext(context.TODO(), options)
 		if err != nil && err != git.NoErrAlreadyUpToDate {
-			return errwrap.Wrapf(err, "can't pull latest from: `%s`", info.URL)
+			return errwrap.Wrapf(util.EscapeLogError(err), "can't pull latest from: `%s`", info.URL)
+		}
+		if err == git.NoErrAlreadyUpToDate {
+			obj.info.Logf("repo already up to date!")
 		}
 	}
 
@@ -151,4 +180,15 @@ func (obj *Downloader) Get(info *interfaces.ImportData, modulesPath string) erro
 	}
 
 	return nil
+}
+
+// gitProgressWriter logs progress messages received from a remote git server.
+type gitProgressWriter struct {
+	logf func(format string, v ...interface{})
+}
+
+// Write logs remote progress data with control characters escaped.
+func (obj *gitProgressWriter) Write(p []byte) (int, error) {
+	obj.logf("git: %s", util.EscapeLog(string(p)))
+	return len(p), nil
 }

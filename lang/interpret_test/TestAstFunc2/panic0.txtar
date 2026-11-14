@@ -1,0 +1,8 @@
+-- main.mcl --
+# This should not panic.
+panic(false)
+panic(false)
+panic("")
+panic("")
+# Empty graph, no output.
+-- OUTPUT --

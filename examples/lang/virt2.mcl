@@ -2,10 +2,10 @@
 
 import "fmt"
 import "os"
-import "golang/strings"
+import "golang/strings" as golang_strings
 import "example"
 
-$input = example.str2int(strings.trim_space(os.readfile("/tmp/cpu-count")))
+$input = example.str2int(golang_strings.trim_space(os.readfile("/tmp/cpu-count")))
 $count = if $input > 8 {
 	8
 } else {
@@ -28,7 +28,7 @@ virt "mgmt4" {
 	memory => 524288,
 	state => "running",
 	transient => false,
-	boot => ["hd", ],
+	boot => ["hd"],
 	disk => [
 		struct{
 			source => "~/.local/share/libvirt/images/fedora-23-scratch.qcow2",
@@ -36,17 +36,14 @@ virt "mgmt4" {
 		},
 	],
 	osinit => "",
-	cdrom => [
-	],
-	network => [
-	],
-	filesystem => [
-	],
+	cdrom => [],
+	network => [],
+	filesystem => [],
 	auth => struct{
 		username => "",
 		password => "",
 	},
-	hotcpus => true,	# this is the default
+	hotcpus => true, # this is the default
 	restartondiverge => "",
 	restartonrefresh => false,
 }

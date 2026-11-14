@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,44 +13,56 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 // Package gapi is the Graph API implementation for the mcl language frontend.
 package gapi
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
+	cliUtil "github.com/purpleidea/mgmt/cli/util"
+	"github.com/purpleidea/mgmt/engine"
 	"github.com/purpleidea/mgmt/gapi"
 	"github.com/purpleidea/mgmt/lang"
 	"github.com/purpleidea/mgmt/lang/ast"
 	"github.com/purpleidea/mgmt/lang/download"
+	"github.com/purpleidea/mgmt/lang/format"
+	"github.com/purpleidea/mgmt/lang/format/astfmt"
 	"github.com/purpleidea/mgmt/lang/funcs/vars"
 	"github.com/purpleidea/mgmt/lang/inputs"
 	"github.com/purpleidea/mgmt/lang/interfaces"
 	"github.com/purpleidea/mgmt/lang/interpolate"
 	"github.com/purpleidea/mgmt/lang/parser"
+	"github.com/purpleidea/mgmt/lang/types"
 	"github.com/purpleidea/mgmt/lang/unification"
 	"github.com/purpleidea/mgmt/pgraph"
 	"github.com/purpleidea/mgmt/util"
 	"github.com/purpleidea/mgmt/util/errwrap"
-
-	"github.com/spf13/afero"
-	"github.com/urfave/cli/v2"
 )
 
 const (
 	// Name is the name of this frontend.
 	Name = "lang"
-
-	// flagModulePath is the name of the module-path flag.
-	flagModulePath = "module-path"
-
-	// flagDownload is the name of the download flag.
-	flagDownload = "download"
 )
 
 func init() {
@@ -61,81 +73,36 @@ func init() {
 type GAPI struct {
 	InputURI string // input URI of code file system to run
 
-	lang *lang.Lang // lang struct
+	// Data is some additional data for the lang struct.
+	Data *lang.Data
+
+	lang   *lang.Lang // lang struct
+	ctx    context.Context
+	cancel func()
+	reterr error
 
 	// this data struct is only available *after* Init, so as a result, it
 	// can not be used inside the Cli(...) method.
 	data        *gapi.Data
 	initialized bool
-	closeChan   chan struct{}
 	wg          *sync.WaitGroup // sync group for tunnel go routines
+	err         error
+	errMutex    *sync.Mutex // guards err
 }
 
-// CliFlags returns a list of flags used by the specified subcommand.
-func (obj *GAPI) CliFlags(command string) []cli.Flag {
-	result := []cli.Flag{}
-	modulePath := &cli.StringFlag{
-		Name:    flagModulePath,
-		Value:   "", // empty by default
-		Usage:   "choose the modules path (absolute)",
-		EnvVars: []string{"MGMT_MODULE_PATH"},
+// Formatter returns the mcl formatter for the lang frontend, with the real
+// parser and AST printer wired in. The cli finds this method through the gapi
+// registry, since it can't import the parser without an import cycle.
+func (obj *GAPI) Formatter() *format.Formatter {
+	return &format.Formatter{
+		LexParser:    parser.LexParseWithComments,
+		ASTFormatter: astfmt.Format,
 	}
-
-	// add this only to run (not needed for get or deploy)
-	if command == gapi.CommandRun {
-		runFlags := []cli.Flag{
-			&cli.BoolFlag{
-				Name:  flagDownload,
-				Usage: "download any missing imports (as the get command does)",
-			},
-			&cli.BoolFlag{
-				Name:  "update",
-				Usage: "update all dependencies to the latest versions",
-			},
-		}
-		result = append(result, runFlags...)
-	}
-
-	switch command {
-	case gapi.CommandGet:
-		flags := []cli.Flag{
-			&cli.IntFlag{
-				Name:  "depth d",
-				Value: -1,
-				Usage: "max recursion depth limit (-1 is unlimited)",
-			},
-			&cli.IntFlag{
-				Name:  "retry r",
-				Value: 0, // any error is a failure by default
-				Usage: "max number of retries (-1 is unlimited)",
-			},
-			//modulePath, // already defined below in fallthrough
-		}
-		result = append(result, flags...)
-		fallthrough // at the moment, we want the same code input arg...
-	case gapi.CommandRun:
-		fallthrough
-	case gapi.CommandDeploy:
-		flags := []cli.Flag{
-			// TODO: removed (temporarily?)
-			//*cli.BoolFlag{
-			//	Name:  "stdin",
-			//	Usage: "use passthrough stdin",
-			//},
-			modulePath,
-		}
-		result = append(result, flags...)
-	default:
-		return []cli.Flag{}
-	}
-
-	return result
 }
 
-// Cli takes a cli.Context, and returns our GAPI if activated. All arguments
-// should take the prefix of the registered name. On activation, if there are
-// any validation problems, you should return an error. If this was not
-// activated, then you should return a nil GAPI and a nil error. This is passed
+// Cli takes an *Info struct, and returns our deploy if activated, and if there
+// are any validation problems, you should return an error. If there is no
+// deploy, then you should return a nil deploy and a nil error. This is passed
 // in a functional file system interface. For standalone usage, this will be a
 // temporary memory-backed filesystem so that the same deploy API is used, and
 // for normal clustered usage, this will be the normal implementation which is
@@ -146,47 +113,42 @@ func (obj *GAPI) CliFlags(command string) []cli.Flag {
 // or from `run` (both of which can activate this GAPI) is that `deploy` copies
 // to an etcdFs, and `run` copies to a memFs. All GAPI's run off of the fs that
 // is passed in.
-func (obj *GAPI) Cli(cliInfo *gapi.CliInfo) (*gapi.Deploy, error) {
-	c := cliInfo.CliContext
-	cliContext := c.Lineage()[1]
-	if cliContext == nil {
-		return nil, fmt.Errorf("could not get cli context")
-	}
-	fs := cliInfo.Fs // copy files from local filesystem *into* this fs...
-	prefix := ""     // TODO: do we need this?
-	debug := cliInfo.Debug
-	logf := func(format string, v ...interface{}) {
-		cliInfo.Logf(Name+": "+format, v...)
+func (obj *GAPI) Cli(info *gapi.Info) (*gapi.Deploy, error) {
+	args, ok := info.Args.(*cliUtil.LangArgs)
+	if !ok {
+		// programming error
+		return nil, fmt.Errorf("could not convert to our struct")
 	}
 
-	if l := c.NArg(); l != 1 {
-		if l > 1 {
-			return nil, fmt.Errorf("input program must be a single arg")
-		}
-		return nil, fmt.Errorf("must specify input program")
+	fs := info.Fs // copy files from local filesystem *into* this fs...
+	prefix := ""  // TODO: do we need this?
+	debug := info.Debug
+	logf := func(format string, v ...interface{}) {
+		info.Logf(Name+": "+format, v...)
 	}
-	input := c.Args().Get(0)
 
 	// empty by default (don't set for deploy, only download)
-	modules := c.String(flagModulePath)
-	if modules != "" && (!strings.HasPrefix(modules, "/") || !strings.HasSuffix(modules, "/")) {
-		return nil, fmt.Errorf("module path is not an absolute directory")
+	modules := args.ModulePath
+	if modules != "" && !strings.HasSuffix(modules, "/") {
+		return nil, fmt.Errorf("module path does not end with a slash")
+	}
+	if modules != "" && !strings.HasPrefix(modules, "/") {
+		wd, err := os.Getwd()
+		if err != nil {
+			return nil, err
+		}
+		modules = filepath.Join(wd, modules) + "/"
 	}
 
 	// TODO: while reading through trees of metadata files, we could also
 	// check the license compatibility of deps...
 
-	osFs := afero.NewOsFs()
-	readOnlyOsFs := afero.NewReadOnlyFs(osFs) // can't be readonly to dl!
-	//bp := afero.NewBasePathFs(osFs, base) // TODO: can this prevent parent dir access?
-	afs := &afero.Afero{Fs: readOnlyOsFs} // wrap so that we're implementing ioutil
-	localFs := &util.Fs{Afero: afs}       // always the local fs
-	downloadAfs := &afero.Afero{Fs: osFs}
-	downloadFs := &util.Fs{Afero: downloadAfs} // TODO: use with a parent path preventer?
+	localFs := util.NewReadOnlyOsFs() // always the local fs
+	downloadFs := util.NewOsFs()      // can't be readonly to dl!
 
 	// the fs input here is the local fs we're reading to get the files from
 	// this is different from the fs variable which is our output dest!!!
-	output, err := inputs.ParseInput(input, localFs)
+	output, err := inputs.ParseInput(args.Input, localFs)
 	if err != nil {
 		return nil, errwrap.Wrapf(err, "could not activate an input parser")
 	}
@@ -197,21 +159,26 @@ func (obj *GAPI) Cli(cliInfo *gapi.CliInfo) (*gapi.Deploy, error) {
 	logf("lexing/parsing...")
 	xast, err := parser.LexParse(bytes.NewReader(output.Main))
 	if err != nil {
+		// annotate parse errors with a source position byline + caret
+		file := &interfaces.SourceFile{FS: output.FS, Path: output.Base + output.Metadata.Main}
+		err = interfaces.HighlightParseError(err, file, logf)
 		return nil, errwrap.Wrapf(err, "could not generate AST")
 	}
 	if debug {
 		logf("behold, the AST: %+v", xast)
 	}
 
+	// This runs the necessary downloads. It passes a downloader in, which
+	// can be used to pull down or update any missing imports.
 	var downloader interfaces.Downloader
-	if c.IsSet(flagDownload) && c.Bool(flagDownload) {
+	if args.Download {
 		downloadInfo := &interfaces.DownloadInfo{
 			Fs: downloadFs, // the local fs!
 
 			// flags are passed in during Init()
-			Noop:   cliContext.Bool("noop"),
-			Sema:   cliContext.Int("sema"),
-			Update: c.Bool("update"),
+			Noop:   info.Flags.Noop,
+			Sema:   info.Flags.Sema,
+			Update: args.Update,
 
 			Debug: debug,
 			Logf: func(format string, v ...interface{}) {
@@ -221,8 +188,8 @@ func (obj *GAPI) Cli(cliInfo *gapi.CliInfo) (*gapi.Deploy, error) {
 		}
 		// this fulfills the interfaces.Downloader interface
 		downloader = &download.Downloader{
-			Depth: c.Int("depth"), // default of infinite is -1
-			Retry: c.Int("retry"), // infinite is -1
+			Depth: args.Depth, // default of infinite is -1
+			Retry: args.Retry, // infinite is -1
 		}
 		if err := downloader.Init(downloadInfo); err != nil {
 			return nil, errwrap.Wrapf(err, "could not initialize downloader")
@@ -231,7 +198,7 @@ func (obj *GAPI) Cli(cliInfo *gapi.CliInfo) (*gapi.Deploy, error) {
 
 	importGraph, err := pgraph.NewGraph("importGraph")
 	if err != nil {
-		return nil, errwrap.Wrapf(err, "could not create graph")
+		return nil, err
 	}
 	importVertex := &pgraph.SelfVertex{
 		Name:  "",          // first node is the empty string
@@ -239,13 +206,14 @@ func (obj *GAPI) Cli(cliInfo *gapi.CliInfo) (*gapi.Deploy, error) {
 	}
 	importGraph.AddVertex(importVertex)
 
-	logf("init...")
+	//logf("init...")
+	logf("import: %s", output.Base)
 	// init and validate the structure of the AST
 	data := &interfaces.Data{
 		// TODO: add missing fields here if/when needed
-		Fs:       localFs,       // the local fs!
-		FsURI:    localFs.URI(), // TODO: is this right?
-		Base:     output.Base,   // base dir (absolute path) that this is rooted in
+		Fs:       output.FS,       // formerly: localFs // the local fs!
+		FsURI:    output.FS.URI(), // formerly: localFs.URI() // TODO: is this right?
+		Base:     output.Base,     // base dir (absolute path) that this is rooted in
 		Files:    output.Files,
 		Imports:  importVertex,
 		Metadata: output.Metadata,
@@ -253,7 +221,8 @@ func (obj *GAPI) Cli(cliInfo *gapi.CliInfo) (*gapi.Deploy, error) {
 
 		LexParser:       parser.LexParse,
 		Downloader:      downloader,
-		StrInterpolater: interpolate.InterpolateStr,
+		StrInterpolater: interpolate.StrInterpolate,
+		//Local: obj.Local, // TODO: do we need this?
 		//World: obj.World, // TODO: do we need this?
 
 		Prefix: prefix,
@@ -268,17 +237,23 @@ func (obj *GAPI) Cli(cliInfo *gapi.CliInfo) (*gapi.Deploy, error) {
 		return nil, errwrap.Wrapf(err, "could not init and validate AST")
 	}
 
-	logf("interpolating...")
+	if debug {
+		logf("interpolating...")
+	}
 	// interpolate strings and other expansionable nodes in AST
-	interpolated, err := xast.Interpolate()
+	iast, err := xast.Interpolate()
 	if err != nil {
 		return nil, errwrap.Wrapf(err, "could not interpolate AST")
 	}
 
+	hostname := ""
+	if h := info.Flags.Hostname; h != nil {
+		hostname = *h // it's optional, since this value is not used...
+	}
 	variables := map[string]interfaces.Expr{
 		"purpleidea": &ast.ExprStr{V: "hello world!"}, // james says hi
 		// TODO: change to a func when we can change hostname dynamically!
-		"hostname": &ast.ExprStr{V: ""}, // NOTE: empty b/c not used
+		"hostname": &ast.ExprStr{V: hostname}, // NOTE: can be empty b/c not used
 	}
 	consts := ast.VarPrefixToVariablesScope(vars.ConstNamespace) // strips prefix!
 	addback := vars.ConstNamespace + interfaces.ModuleSep        // add it back...
@@ -294,36 +269,115 @@ func (obj *GAPI) Cli(cliInfo *gapi.CliInfo) (*gapi.Deploy, error) {
 		Functions: ast.FuncPrefixToFunctionsScope(""), // runs funcs.LookupPrefix
 	}
 
-	logf("building scope...")
+	if debug {
+		logf("scope building...")
+	}
 	// propagate the scope down through the AST...
 	// We use SetScope because it follows all of the imports through. I did
 	// not think we needed to pass in an initial scope because the download
 	// operation should not depend on any initial scope values, since those
 	// would all be runtime changes, and we do not support dynamic imports,
 	// however, we need to since we're doing type unification to err early!
-	if err := interpolated.SetScope(scope); err != nil { // empty initial scope!
+	if err := iast.SetScope(scope); err != nil { // empty initial scope!
 		return nil, errwrap.Wrapf(err, "could not set scope")
 	}
 
-	// apply type unification
-	unificationLogf := func(format string, v ...interface{}) {
-		if debug { // unification only has debug messages...
+	// Previously the `get` command would stop here.
+	if args.OnlyDownload {
+		return nil, nil // success!
+	}
+
+	var checkErr error
+
+	unificationStrategy := make(map[string]string)
+	if name := args.UnifySolver; name != nil && *name != "" {
+		unificationStrategy[unification.StrategyNameKey] = *name
+	}
+	if len(args.UnifyOptimizations) > 0 {
+		// TODO: use a query string parser instead?
+		unificationStrategy[unification.StrategyOptimizationsKey] = strings.Join(args.UnifyOptimizations, ",")
+	}
+
+	if args.CheckUnify || !args.CheckOnly {
+		// apply type unification
+		unificationLogf := func(format string, v ...interface{}) {
 			logf("unification: "+format, v...)
 		}
+		logf("running type unification...")
+
+		solver, err := unification.LookupDefault()
+		if err != nil {
+			return nil, errwrap.Wrapf(err, "could not get default solver")
+		}
+		unifier := &unification.Unifier{
+			AST:          iast,
+			Solver:       solver,
+			Strategy:     unificationStrategy,
+			UnifiedState: types.NewUnifiedState(),
+			Debug:        debug,
+			Logf:         unificationLogf,
+		}
+		startTime := time.Now()
+		unifyErr := unifier.Unify(context.TODO())
+		delta := time.Since(startTime)
+		formatted := delta.String()
+		if delta.Milliseconds() > 1000 { // 1 second
+			formatted = delta.Truncate(time.Millisecond).String()
+		}
+		if unifyErr != nil {
+			if args.CheckOnly {
+				logf("type unification failed after %s", formatted)
+				checkErr = errwrap.Append(checkErr, errwrap.Wrapf(unifyErr, "could not unify types"))
+			} else {
+				return nil, errwrap.Wrapf(unifyErr, "could not unify types")
+			}
+		} else if args.CheckOnly {
+			logf("type unification succeeded in %s", formatted)
+		}
 	}
-	logf("running type unification...")
-	unifier := &unification.Unifier{
-		AST:    interpolated,
-		Solver: unification.SimpleInvariantSolverLogger(unificationLogf),
-		Debug:  debug,
-		Logf:   unificationLogf,
+	if args.CheckFmt {
+		// We only use the AST to find all of the involved source file
+		// paths. The formatting check re-parses each file from source,
+		// because the formatter needs the pre-interpolation AST and
+		// the comments, and neither is available in this AST anymore.
+		programs, err := ast.CollectPrograms(iast)
+		if err != nil {
+			return nil, errwrap.Wrapf(err, "could not collect AST programs")
+		}
+		files := []*interfaces.SourceFile{}
+		for _, program := range programs {
+			files = append(files, program.File)
+		}
+
+		formatter := obj.Formatter()
+		formatter.Verbose = true
+		formatter.Debug = debug
+		formatter.Logf = logf
+		formatter.Init()
+		checkOK, err := formatter.CheckFiles(context.TODO(), files)
+		if err != nil {
+			err = errwrap.Wrapf(err, "could not check mcl formatting")
+			if args.CheckOnly {
+				checkErr = errwrap.Append(checkErr, err)
+			} else {
+				return nil, err
+			}
+		} else if !checkOK {
+			err := fmt.Errorf("not formatted")
+			if args.CheckOnly {
+				checkErr = errwrap.Append(checkErr, err)
+			} else {
+				return nil, err
+			}
+		}
 	}
-	if err := unifier.Unify(); err != nil {
-		return nil, errwrap.Wrapf(err, "could not unify types")
+	if args.CheckOnly {
+		return nil, checkErr
 	}
 
 	// get the list of needed files (this is available after SetScope)
-	fileList, err := ast.CollectFiles(interpolated)
+	logf("collecting files...")
+	fileList, err := ast.CollectFiles(iast)
 	if err != nil {
 		return nil, errwrap.Wrapf(err, "could not collect files")
 	}
@@ -335,19 +389,20 @@ func (obj *GAPI) Cli(cliInfo *gapi.CliInfo) (*gapi.Deploy, error) {
 	files = append(files, output.Files...)
 	files = append(files, fileList...)
 
+	writeableFS, ok := fs.(engine.WriteableFS)
+	if !ok {
+		return nil, fmt.Errorf("the FS was not writeable")
+	}
+
 	// run some copy operations to add data into the filesystem
 	for _, fn := range output.Workers {
-		if err := fn(fs); err != nil {
+		if err := fn(writeableFS); err != nil {
 			return nil, err
 		}
 	}
 
-	// TODO: do we still need this, now that we have the Imports DAG?
-	noDuplicates := util.StrRemoveDuplicatesInList(files)
-	if len(noDuplicates) != len(files) {
-		// programming error here or in this logical test
-		return nil, fmt.Errorf("duplicates in file list found")
-	}
+	// There are duplicates if in our dag we use the same import twice.
+	files = util.StrRemoveDuplicatesInList(files)
 
 	// Add any missing dirs, so that we don't need to use `MkdirAll`...
 	// FIXME: It's possible that the dirs get generated upstream, but it's
@@ -375,10 +430,68 @@ func (obj *GAPI) Cli(cliInfo *gapi.CliInfo) (*gapi.Deploy, error) {
 	util.PathSlice(files).Sort() // sort it
 	for _, src := range files {  // absolute paths
 		// rebase path src to root file system of "/" for etcdfs...
-		dst, err := util.Rebase(src, output.Base, "/")
+
+		// everywhere we expect absolute, but we should use relative :/
+		//tree, err := util.FsTree(fs, "/")
+		//if err != nil {
+		//	return nil, err
+		//}
+		//logf("tree:\n%s", tree)
+
+		// XXX: Should we have output.Base and output.ModulesBase?
+		// XXX: Maybe we should rebase to whichever the src starts with?
+		//commonBase := util.CommonPathPrefix(src, output.Base)
+		//logf("src:\n%s", src)
+		//logf("base:\n%s", output.Base)
+		//logf("common:\n%s", commonBase)
+		commonBase := output.Base // old method!
+		// NOTE: Instead of commonBase, we used to use output.Base here,
+		// but it seems this breaks if the modules path is not inside
+		// the normal code base. Such as if the src is:
+		// /etc/mgmt/modules/github.com/purpleidea/mgmt/modules/misc/main.mcl
+		// and the base is: /etc/mgmt/main/ if we run the mgmt binary
+		// with: mgmt run lang --module-path '/etc/mgmt/modules/' /etc/mgmt/main/
+		// for example.
+		// NOTE: We could possibly always rebase onto "/", but we'd like
+		// to eliminate the local path structure from our deploys for a
+		// weak kind of privacy of that users directory structure.
+		dst, err := util.Rebase(src, commonBase, "/")
 		if err != nil {
-			// possible programming error
-			return nil, errwrap.Wrapf(err, "malformed source file path: `%s`", src)
+			if modules == "" || !strings.HasPrefix(src, modules) {
+				// possible programming error
+				logf("src:\n%s", src)
+				logf("base:\n%s", output.Base)
+				//logf("common:\n%s", commonBase)
+				return nil, errwrap.Wrapf(err, "malformed source file path: `%s`", src)
+			}
+			// HACK: maybe it's a module?
+			// If we have a different base path, it might be a
+			// module dir. Maybe this hack covers all scenarios.
+
+			// Remove the actual "modules/" dir from the end...
+			m, err := util.RemovePathSuffix(modules)
+			if err != nil {
+				return nil, errwrap.Wrapf(err, "malformed source module dir: `%s`", modules)
+			}
+
+			// ...so that we keep `/modules/` as the new module dir.
+			dst, err = util.Rebase(src, m, "/")
+			if err != nil {
+				// possible programming error
+				logf("src:\n%s", src)
+				logf("base:\n%s", m)
+				return nil, errwrap.Wrapf(err, "malformed source module path: `%s`", src)
+			}
+		} else if modules != "" && strings.HasPrefix(src, modules) {
+			// Here we've succeeded in the above rebase, but before
+			// we accept it completely, let's first check if it's
+			// actually a MODULE_PATH situation. If so, let's rebase
+			// it only the `/modules/` directory which is used in
+			// the deploy.
+			dst, err = util.Rebase(src, modules, "/"+interfaces.ModuleDirectory)
+			if err != nil {
+				return nil, errwrap.Wrapf(err, "malformed src path: `%s`", src)
+			}
 		}
 
 		if strings.HasSuffix(src, "/") { // it's a dir
@@ -399,14 +512,19 @@ func (obj *GAPI) Cli(cliInfo *gapi.CliInfo) (*gapi.Deploy, error) {
 			continue
 		}
 		// it's a regular file path
-		if err := gapi.CopyFileToFs(fs, src, dst); err != nil {
+
+		// Occasionally, we need the dir to exist first or we'll error.
+		if err := gapi.MkdirAllOnFs(writeableFS, util.Dirname(dst), 0700); err != nil {
+			return nil, errwrap.Wrapf(err, "can't mkdir at `%s`", dst)
+		}
+		if err := gapi.CopyFileToFs(writeableFS, src, dst); err != nil {
 			return nil, errwrap.Wrapf(err, "can't copy file from `%s` to `%s`", src, dst)
 		}
 	}
 
 	// display the deploy fs tree
-	if debug || true { // TODO: should this only be shown on debug?
-		logf("input: %s", input)
+	if debug { // this should only be shown on debug, or `entry` looks messy!
+		logf("input: %s", args.Input)
 		tree, err := util.FsTree(fs, "/")
 		if err != nil {
 			return nil, err
@@ -416,11 +534,18 @@ func (obj *GAPI) Cli(cliInfo *gapi.CliInfo) (*gapi.Deploy, error) {
 
 	return &gapi.Deploy{
 		Name: Name,
-		Noop: c.Bool("noop"),
-		Sema: c.Int("sema"),
+		Noop: info.Flags.Noop,
+		Sema: info.Flags.Sema,
+
+		NoAutoEdges: info.Flags.NoAutoEdges,
+		NoAutoGroup: info.Flags.NoAutoGroup,
+
 		GAPI: &GAPI{
 			InputURI: fs.URI(),
-			// TODO: add properties here...
+			Data: &lang.Data{
+				UnificationStrategy: unificationStrategy,
+				// TODO: add properties here...
+			},
 		},
 	}, nil
 }
@@ -434,34 +559,29 @@ func (obj *GAPI) Init(data *gapi.Data) error {
 		return fmt.Errorf("the InputURI param must be specified")
 	}
 	obj.data = data // store for later
-	obj.closeChan = make(chan struct{})
 	obj.wg = &sync.WaitGroup{}
+	obj.errMutex = &sync.Mutex{}
 	obj.initialized = true
-	return nil
-}
 
-// LangInit is a wrapper around the lang Init method.
-func (obj *GAPI) LangInit() error {
-	if obj.lang != nil {
-		return nil // already ran init, close first!
-	}
 	if obj.InputURI == "-" {
 		return fmt.Errorf("stdin passthrough is not supported at this time")
 	}
 
-	fs, err := obj.data.World.Fs(obj.InputURI) // open the remote file system
+	fs, err := obj.data.World.Fs(context.TODO(), obj.InputURI) // open the remote file system
 	if err != nil {
 		return errwrap.Wrapf(err, "can't load code from file system `%s`", obj.InputURI)
 	}
 	// the lang always tries to load from this standard path: /metadata.yaml
 	input := "/" + interfaces.MetadataFilename // path in remote fs
 
-	obj.lang = &lang.Lang{
+	lang := &lang.Lang{
 		Fs:    fs,
 		FsURI: obj.InputURI,
 		Input: input,
+		Data:  obj.Data,
 
 		Hostname: obj.data.Hostname,
+		Local:    obj.data.Local,
 		World:    obj.data.World,
 		Debug:    obj.data.Debug,
 		Logf: func(format string, v ...interface{}) {
@@ -469,39 +589,42 @@ func (obj *GAPI) LangInit() error {
 			obj.data.Logf(Name+": "+format, v...)
 		},
 	}
-	if err := obj.lang.Init(); err != nil {
+	if err := lang.Init(context.TODO()); err != nil { // XXX: CTX?
 		return errwrap.Wrapf(err, "can't init the lang")
 	}
+	obj.lang = lang // once we can't fail, store the struct...
+
 	return nil
 }
 
-// LangClose is a wrapper around the lang Close method.
-func (obj *GAPI) LangClose() error {
-	if obj.lang != nil {
-		err := obj.lang.Close()
-		obj.lang = nil                                    // clear it to avoid double closing
-		return errwrap.Wrapf(err, "can't close the lang") // nil passthrough
+// Info returns some data about the GAPI implementation.
+func (obj *GAPI) Info() *gapi.InfoResult {
+	return &gapi.InfoResult{
+		URI: obj.InputURI,
 	}
-	return nil
-}
-
-// Graph returns a current Graph.
-func (obj *GAPI) Graph() (*pgraph.Graph, error) {
-	if !obj.initialized {
-		return nil, fmt.Errorf("%s: GAPI is not initialized", Name)
-	}
-
-	g, err := obj.lang.Interpret()
-	if err != nil {
-		return nil, errwrap.Wrapf(err, "%s: interpret error", Name)
-	}
-
-	return g, nil
 }
 
 // Next returns nil errors every time there could be a new graph.
-func (obj *GAPI) Next() chan gapi.Next {
+func (obj *GAPI) Next(ctx context.Context) chan gapi.Next {
 	ch := make(chan gapi.Next)
+
+	// Wrap the incoming context so that Cleanup can shut us down on our own
+	// (eg: when a new deploy replaces us) without cancelling our parent.
+	ctx, obj.cancel = context.WithCancel(ctx)
+
+	obj.wg.Add(1)
+	go func() {
+		defer obj.lang.Cleanup() // after everyone closes
+		defer obj.wg.Wait()      // wait before cleanup
+		defer obj.wg.Done()
+		err := obj.lang.Run(ctx)
+		obj.errAppend(err)
+		// When run terminates, the "official" error takes precedence.
+		if err := obj.lang.Err(); err != nil {
+			obj.errAppend(err)
+		}
+	}()
+
 	obj.wg.Add(1)
 	go func() {
 		defer obj.wg.Done()
@@ -513,98 +636,38 @@ func (obj *GAPI) Next() chan gapi.Next {
 			}
 			select {
 			case ch <- next:
-			case <-obj.closeChan:
+			case <-ctx.Done():
+				obj.errAppend(ctx.Err())
 			}
 			return
 		}
-		startChan := make(chan struct{}) // start signal
-		close(startChan)                 // kick it off!
 
-		streamChan := make(chan error)
-		//defer obj.LangClose() // close any old lang
+		streamChan := obj.lang.Stream(ctx)
 
 		var ok bool
 		for {
-			var err error
-			var langSwap bool // do we need to swap the lang object?
+			var graph *pgraph.Graph
 			select {
-			// TODO: this should happen in ConfigWatch instead :)
-			case <-startChan: // kick the loop once at start
-				startChan = nil // disable
-				err = nil       // set nil as the message to send
-				langSwap = true
-
-			case err, ok = <-streamChan: // a variable changed
+			case graph, ok = <-streamChan: // a variable changed
 				if !ok { // the channel closed!
 					return
 				}
 
-			case <-obj.closeChan:
+			case <-ctx.Done():
+				obj.errAppend(ctx.Err())
 				return
 			}
 			obj.data.Logf("generating new graph...")
 
-			// skip this to pass through the err if present
-			if langSwap && err == nil {
-				obj.data.Logf("swap!")
-				// run up to these three but fail on err
-				if e := obj.LangClose(); e != nil { // close any old lang
-					err = e // pass through the err
-				} else if e := obj.LangInit(); e != nil { // init the new one!
-					err = e // pass through the err
-
-					// Always run LangClose after LangInit
-					// when done. This is currently needed
-					// because we should tell the lang obj
-					// to shut down all the running facts.
-					if e := obj.LangClose(); e != nil {
-						err = errwrap.Append(err, e) // list of errors
-					}
-				} else {
-
-					if obj.data.NoStreamWatch { // TODO: do we want to allow this for the lang?
-						obj.data.Logf("warning: language will not stream")
-						// send only one event
-						limitChan := make(chan error)
-						obj.wg.Add(1)
-						go func() {
-							defer obj.wg.Done()
-							defer close(limitChan)
-							select {
-							// only one
-							case err, ok := <-obj.lang.Stream():
-								if !ok {
-									return
-								}
-								select {
-								case limitChan <- err:
-								case <-obj.closeChan:
-									return
-								}
-							case <-obj.closeChan:
-								return
-							}
-						}()
-						streamChan = limitChan
-					} else {
-						// stream for lang events
-						streamChan = obj.lang.Stream() // update stream
-					}
-					continue // wait for stream to trigger
-				}
-			}
-
 			next := gapi.Next{
-				Exit: err != nil, // TODO: do we want to shutdown?
-				Err:  err,
+				Graph: graph,
 			}
 			select {
 			case ch <- next: // trigger a run (send a msg)
-				if err != nil {
-					return
-				}
+
 			// unblock if we exit while waiting to send!
-			case <-obj.closeChan:
+			case <-ctx.Done():
+				obj.errAppend(ctx.Err())
 				return
 			}
 		}
@@ -612,151 +675,30 @@ func (obj *GAPI) Next() chan gapi.Next {
 	return ch
 }
 
-// Close shuts down the lang GAPI.
-func (obj *GAPI) Close() error {
-	if !obj.initialized {
-		return fmt.Errorf("%s: GAPI is not initialized", Name)
+// Cleanup shuts the GAPI down and waits for it to finish before it returns. It
+// cancels the context we wrapped in Next, which tears down the language runtime
+// and its function engine (releasing any file watches, eg: inotify fds, that it
+// holds) and then blocks until everything has exited. The context.Canceled that
+// results from our own cancellation is filtered out, so this returns nil on a
+// clean shutdown and only a genuine error otherwise.
+func (obj *GAPI) Cleanup() error {
+	if obj.cancel == nil {
+		return nil // Next was never called; nothing to shut down
 	}
-	close(obj.closeChan)
-	obj.wg.Wait()
-	obj.LangClose()         // close lang, esp. if blocked in Stream() wait
-	obj.initialized = false // closed = true
-	return nil
+	obj.cancel()
+	return errwrap.NoContextCanceled(errwrap.WithoutContext(obj.Err()))
 }
 
-// Get runs the necessary downloads. This basically runs the lexer, parser and
-// sets the scope so that all the imports are followed. It passes a downloader
-// in, which can be used to pull down or update any missing imports. This will
-// also work when called with the download flag during a normal execution run.
-func (obj *GAPI) Get(getInfo *gapi.GetInfo) error {
-	c := getInfo.CliContext
-	cliContext := c.Lineage()[1]
-	if cliContext == nil {
-		return fmt.Errorf("could not get cli context")
-	}
-	prefix := "" // TODO: do we need this?
-	debug := getInfo.Debug
-	logf := getInfo.Logf
+// Err will contain the last error when Next shuts down. It waits for all the
+// running processes to exit before it returns.
+func (obj *GAPI) Err() error {
+	obj.wg.Wait()
+	return obj.err
+}
 
-	if l := c.NArg(); l != 1 {
-		if l > 1 {
-			return fmt.Errorf("input program must be a single arg")
-		}
-		return fmt.Errorf("must specify input program")
-	}
-	input := c.Args().Get(0)
-
-	// empty by default (don't set for deploy, only download)
-	modules := c.String(flagModulePath)
-	if modules != "" && (!strings.HasPrefix(modules, "/") || !strings.HasSuffix(modules, "/")) {
-		return fmt.Errorf("module path is not an absolute directory")
-	}
-
-	osFs := afero.NewOsFs()
-	readOnlyOsFs := afero.NewReadOnlyFs(osFs) // can't be readonly to dl!
-	//bp := afero.NewBasePathFs(osFs, base) // TODO: can this prevent parent dir access?
-	afs := &afero.Afero{Fs: readOnlyOsFs} // wrap so that we're implementing ioutil
-	localFs := &util.Fs{Afero: afs}       // always the local fs
-	downloadAfs := &afero.Afero{Fs: osFs}
-	downloadFs := &util.Fs{Afero: downloadAfs} // TODO: use with a parent path preventer?
-
-	// the fs input here is the local fs we're reading to get the files from
-	// this is different from the fs variable which is our output dest!!!
-	output, err := inputs.ParseInput(input, localFs)
-	if err != nil {
-		return errwrap.Wrapf(err, "could not activate an input parser")
-	}
-
-	// no need to run recursion detection since this is the beginning
-	// TODO: do the paths need to be cleaned for "../" before comparison?
-
-	logf("lexing/parsing...")
-	ast, err := parser.LexParse(bytes.NewReader(output.Main))
-	if err != nil {
-		return errwrap.Wrapf(err, "could not generate AST")
-	}
-	if debug {
-		logf("behold, the AST: %+v", ast)
-	}
-
-	downloadInfo := &interfaces.DownloadInfo{
-		Fs: downloadFs, // the local fs!
-
-		// flags are passed in during Init()
-		Noop:   cliContext.Bool("noop"),
-		Sema:   cliContext.Int("sema"),
-		Update: cliContext.Bool("update"),
-
-		Debug: debug,
-		Logf: func(format string, v ...interface{}) {
-			// TODO: is this a sane prefix to use here?
-			logf("get: "+format, v...)
-		},
-	}
-	// this fulfills the interfaces.Downloader interface
-	downloader := &download.Downloader{
-		Depth: c.Int("depth"), // default of infinite is -1
-		Retry: c.Int("retry"), // infinite is -1
-	}
-	if err := downloader.Init(downloadInfo); err != nil {
-		return errwrap.Wrapf(err, "could not initialize downloader")
-	}
-
-	importGraph, err := pgraph.NewGraph("importGraph")
-	if err != nil {
-		return errwrap.Wrapf(err, "could not create graph")
-	}
-	importVertex := &pgraph.SelfVertex{
-		Name:  "",          // first node is the empty string
-		Graph: importGraph, // store a reference to ourself
-	}
-	importGraph.AddVertex(importVertex)
-
-	logf("init...")
-	// init and validate the structure of the AST
-	data := &interfaces.Data{
-		// TODO: add missing fields here if/when needed
-		Fs:       localFs,       // the local fs!
-		FsURI:    localFs.URI(), // TODO: is this right?
-		Base:     output.Base,   // base dir (absolute path) that this is rooted in
-		Files:    output.Files,
-		Imports:  importVertex,
-		Metadata: output.Metadata,
-		Modules:  modules,
-
-		LexParser:       parser.LexParse,
-		Downloader:      downloader,
-		StrInterpolater: interpolate.InterpolateStr,
-		//World: obj.World, // TODO: do we need this?
-
-		Prefix: prefix,
-		Debug:  debug,
-		Logf: func(format string, v ...interface{}) {
-			// TODO: is this a sane prefix to use here?
-			logf("ast: "+format, v...)
-		},
-	}
-	// some of this might happen *after* interpolate in SetScope or Unify...
-	if err := ast.Init(data); err != nil {
-		return errwrap.Wrapf(err, "could not init and validate AST")
-	}
-
-	logf("interpolating...")
-	// interpolate strings and other expansionable nodes in AST
-	interpolated, err := ast.Interpolate()
-	if err != nil {
-		return errwrap.Wrapf(err, "could not interpolate AST")
-	}
-
-	logf("building scope...")
-	// propagate the scope down through the AST...
-	// we use SetScope because it follows all of the imports through. i
-	// don't think we need to pass in an initial scope because the download
-	// operation shouldn't depend on any initial scope values, since those
-	// would all be runtime changes, and we do not support dynamic imports!
-	if err := interpolated.SetScope(nil); err != nil { // empty initial scope!
-		return errwrap.Wrapf(err, "could not set scope")
-	}
-
-	return nil // success!
+// errAppend is a simple helper function.
+func (obj *GAPI) errAppend(err error) {
+	obj.errMutex.Lock()
+	obj.err = errwrap.Append(obj.err, err)
+	obj.errMutex.Unlock()
 }

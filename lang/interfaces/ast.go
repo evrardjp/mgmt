@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,14 +13,28 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package interfaces
 
 import (
 	"fmt"
 	"io"
+	"net/url"
 	"sort"
+	"strings"
 
 	"github.com/purpleidea/mgmt/engine"
 	"github.com/purpleidea/mgmt/lang/types"
@@ -56,6 +70,13 @@ type Stmt interface {
 
 	// Copy returns a light copy of the struct. Anything static will not be
 	// copied. For a full recursive copy consider using Interpolate instead.
+	// The exception is any statement which stores per-instance state when
+	// Graph runs, such as the func pointers that Output looks up in the
+	// table. Those must always be copied, even when static. Copy is how
+	// each runtime instance of a statement (loop iteration, class include,
+	// etc) gets made, and if two of those shared a statement, then each
+	// would overwrite the state of the other, and as soon as one instance
+	// was removed, the other would point at funcs that are no longer there.
 	// TODO: do we need an error in the signature?
 	Copy() (Stmt, error)
 
@@ -67,17 +88,22 @@ type Stmt interface {
 	// SetScope sets the scope here and propagates it downwards.
 	SetScope(*Scope) error
 
-	// Unify returns the list of invariants that this node produces. It does
-	// so recursively on any children elements that exist in the AST, and
-	// returns the collection to the caller.
-	Unify() ([]Invariant, error)
+	// TypeCheck returns the list of invariants that this node produces. It
+	// does so recursively on any children elements that exist in the AST,
+	// and returns the collection to the caller. It calls TypeCheck for
+	// child statements, and Infer/Check for child expressions.
+	TypeCheck() ([]*UnificationInvariant, error)
 
-	// Graph returns the reactive function graph expressed by this node.
-	Graph() (*pgraph.Graph, error)
+	// Graph returns the reactive function graph expressed by this node. It
+	// takes in the environment of any functions in scope. Intended to be
+	// called only once, creates and returns the graph and also stores it to
+	// be used in .Output if needed.
+	Graph(env *Env) (*pgraph.Graph, error)
 
 	// Output returns the output that this "program" produces. This output
-	// is what is used to build the output graph.
-	Output() (*Output, error)
+	// is what is used to build the output graph. It requires the input
+	// table of values that are used to populate each function.
+	Output(Table) (*Output, error)
 }
 
 // Expr represents an expression in the language. Expr implementations must have
@@ -106,25 +132,37 @@ type Expr interface {
 	Ordering(map[string]Node) (*pgraph.Graph, map[Node]string, error)
 
 	// SetScope sets the scope here and propagates it downwards.
-	SetScope(*Scope) error
+	SetScope(*Scope, map[string]Expr) error
 
 	// SetType sets the type definitively, and errors if it is incompatible.
 	SetType(*types.Type) error
 
 	// Type returns the type of this expression. It may speculate if it can
-	// determine it statically. This errors if it is not yet known.
+	// determine it statically. The result may contain unification variables
+	// when only part of the type is known. This errors if it is
+	// unavailable.
 	Type() (*types.Type, error)
 
-	// Unify returns the list of invariants that this node produces. It does
-	// so recursively on any children elements that exist in the AST, and
-	// returns the collection to the caller.
-	Unify() ([]Invariant, error)
+	// Infer returns the type of itself and a collection of invariants. The
+	// returned type may contain unification variables. It collects the
+	// invariants by calling Check on its children expressions. In making
+	// those calls, it passes in the known type for that child to get it to
+	// "Check" it. When the type is not known, it should create a new
+	// unification variable to pass in to the child Check calls. Infer
+	// usually only calls Check on things inside of it, and often does not
+	// call another Infer.
+	Infer() (*types.Type, []*UnificationInvariant, error)
 
-	// Graph returns the reactive function graph expressed by this node.
-	Graph() (*pgraph.Graph, error)
+	// Check is checking that the input type is equal to the object that
+	// Check is running on. In doing so, it adds any invariants that are
+	// necessary. Check must always call Infer to produce the invariant. The
+	// implementation can be generic for all expressions.
+	Check(typ *types.Type) ([]*UnificationInvariant, error)
 
-	// Func returns a function that represents this reactively.
-	Func() (Func, error)
+	// Graph returns the reactive function graph expressed by this node. It
+	// takes in the environment of any functions in scope. It also returns
+	// the function for this node.
+	Graph(env *Env) (*pgraph.Graph, Func, error)
 
 	// SetValue stores the result of the last computation of this expression
 	// node.
@@ -132,6 +170,15 @@ type Expr interface {
 
 	// Value returns the value of this expression in our type system.
 	Value() (types.Value, error)
+}
+
+// ScopeGrapher adds a method to turn an AST (Expr or Stmt) into a graph so that
+// we can debug the SetScope compilation phase.
+type ScopeGrapher interface {
+	Node
+
+	// ScopeGraph adds nodes and vertices to the supplied graph.
+	ScopeGraph(g *pgraph.Graph)
 }
 
 // Data provides some data to the node that could be useful during its lifetime.
@@ -195,7 +242,7 @@ type Data struct {
 	// StrInterpolater is a function that needs to get passed in to run the
 	// string interpolation. This is passed in this way to avoid dependency
 	// cycles.
-	StrInterpolater func(string, *Pos, *Data) (Expr, error)
+	StrInterpolater func(string, *Textarea, *Data) (Expr, error)
 
 	//World engine.World // TODO: do we need this?
 
@@ -209,6 +256,29 @@ type Data struct {
 
 	// Logf is a logger which should be used.
 	Logf func(format string, v ...interface{})
+}
+
+// AbsFilename returns the absolute filename path to the code this Data struct
+// is running. This is used to pull out a filename for error messages.
+func (obj *Data) AbsFilename() string {
+	// TODO: is this correct? Do we want to check if Metadata is nil?
+	if obj == nil || obj.Metadata == nil { // for tests
+		return ""
+	}
+	return obj.Base + obj.Metadata.Main
+}
+
+// SourceFile returns the source file which holds the code that this Data struct
+// is running. Every import produces a new Data struct, and as a result, each
+// one of these represents exactly one file. This never returns nil.
+func (obj *Data) SourceFile() *SourceFile {
+	if obj == nil { // for tests
+		return &SourceFile{}
+	}
+	return &SourceFile{
+		FS:   obj.Fs,
+		Path: obj.AbsFilename(),
+	}
 }
 
 // Scope represents a mapping between a variables identifier and the
@@ -225,45 +295,34 @@ type Data struct {
 // An interesting note about these is that they exist in a distinct namespace
 // from the variables, which could actually contain lambda functions.
 type Scope struct {
+	// Variables maps the scope of name to Expr.
 	Variables map[string]Expr
-	Functions map[string]Expr // the Expr will usually be an *ExprFunc
-	Classes   map[string]Stmt
-	// TODO: It is easier to shift a list, but let's use a map for Indexes
-	// for now in case we ever need holes...
-	Indexes map[int][]Expr // TODO: use [][]Expr instead?
+
+	// Functions is the scope of functions.
+	//
+	// The Expr will usually be an *ExprFunc. (Actually it's usually or
+	// always an *ExprSingleton, which wraps an *ExprFunc now.)
+	Functions map[string]Expr
+
+	// Classes map the name of the class to the class.
+	Classes map[string]Stmt
+
+	// Iterated is a flag that is true if this scope is inside of a for
+	// loop.
+	Iterated bool
 
 	Chain []Node // chain of previously seen node's
 }
 
 // EmptyScope returns the zero, empty value for the scope, with all the internal
-// lists initialized appropriately.
+// maps and lists initialized appropriately.
 func EmptyScope() *Scope {
 	return &Scope{
 		Variables: make(map[string]Expr),
 		Functions: make(map[string]Expr),
 		Classes:   make(map[string]Stmt),
-		Indexes:   make(map[int][]Expr),
+		Iterated:  false,
 		Chain:     []Node{},
-	}
-}
-
-// InitScope initializes any uninitialized part of the struct. It is safe to use
-// on scopes with existing data.
-func (obj *Scope) InitScope() {
-	if obj.Variables == nil {
-		obj.Variables = make(map[string]Expr)
-	}
-	if obj.Functions == nil {
-		obj.Functions = make(map[string]Expr)
-	}
-	if obj.Classes == nil {
-		obj.Classes = make(map[string]Stmt)
-	}
-	if obj.Indexes == nil {
-		obj.Indexes = make(map[int][]Expr)
-	}
-	if obj.Chain == nil {
-		obj.Chain = []Node{}
 	}
 }
 
@@ -272,38 +331,34 @@ func (obj *Scope) InitScope() {
 // or change the Expr pointers contained within, since these are references, and
 // we need those to be consistently pointing to the same things after copying.
 func (obj *Scope) Copy() *Scope {
+	if obj == nil { // allow copying nil scopes
+		return EmptyScope()
+	}
+
 	variables := make(map[string]Expr)
 	functions := make(map[string]Expr)
 	classes := make(map[string]Stmt)
-	indexes := make(map[int][]Expr)
+	iterated := obj.Iterated
 	chain := []Node{}
-	if obj != nil { // allow copying nil scopes
-		obj.InitScope()                   // safety
-		for k, v := range obj.Variables { // copy
-			variables[k] = v // we don't copy the expr's!
-		}
-		for k, v := range obj.Functions { // copy
-			functions[k] = v // we don't copy the generator func's
-		}
-		for k, v := range obj.Classes { // copy
-			classes[k] = v // we don't copy the StmtClass!
-		}
-		for k, v := range obj.Indexes { // copy
-			ixs := []Expr{}
-			for _, x := range v {
-				ixs = append(ixs, x) // we don't copy the expr's!
-			}
-			indexes[k] = ixs
-		}
-		for _, x := range obj.Chain { // copy
-			chain = append(chain, x) // we don't copy the Stmt pointer!
-		}
+
+	for k, v := range obj.Variables { // copy
+		variables[k] = v // we don't copy the expr's!
 	}
+	for k, v := range obj.Functions { // copy
+		functions[k] = v // we don't copy the generator func's
+	}
+	for k, v := range obj.Classes { // copy
+		classes[k] = v // we don't copy the StmtClass!
+	}
+	for _, x := range obj.Chain { // copy
+		chain = append(chain, x) // we don't copy the Stmt pointer!
+	}
+
 	return &Scope{
 		Variables: variables,
 		Functions: functions,
 		Classes:   classes,
-		Indexes:   indexes,
+		Iterated:  iterated,
 		Chain:     chain,
 	}
 }
@@ -333,8 +388,6 @@ func (obj *Scope) Merge(scope *Scope) error {
 	sort.Strings(namedFunctions)
 	sort.Strings(namedClasses)
 
-	obj.InitScope() // safety
-
 	for _, name := range namedVariables {
 		if _, exists := obj.Variables[name]; exists {
 			e := fmt.Errorf("variable `%s` was overwritten", name)
@@ -357,8 +410,9 @@ func (obj *Scope) Merge(scope *Scope) error {
 		obj.Classes[name] = scope.Classes[name]
 	}
 
-	// FIXME: should we merge or overwrite? (I think this isn't even used)
-	obj.Indexes = scope.Indexes // overwrite without error
+	if scope.Iterated { // XXX: how should we merge this?
+		obj.Iterated = scope.Iterated
+	}
 
 	return err
 }
@@ -375,83 +429,142 @@ func (obj *Scope) IsEmpty() bool {
 	if len(obj.Functions) > 0 {
 		return false
 	}
-	if len(obj.Indexes) > 0 { // FIXME: should we check each one? (unused?)
-		return false
-	}
 	if len(obj.Classes) > 0 {
 		return false
 	}
 	return true
 }
 
-// MaxIndexes returns the maximum index of Indexes stored in the scope. If it is
-// empty then -1 is returned.
-func (obj *Scope) MaxIndexes() int {
-	obj.InitScope() // safety
-	max := -1
-	for k := range obj.Indexes {
-		if k > max {
-			max = k
-		}
-	}
-	return max
+// Env is an environment which contains the relevant mappings. This is used at
+// the Graph(...) stage of the compiler. It does not contain classes.
+type Env struct {
+	// Variables map and Expr to a *FuncSingleton which deduplicates the use
+	// of a function.
+	Variables map[Expr]*FuncSingleton
+
+	// Functions contains the captured environment, because when we're
+	// recursing into a StmtFunc which is defined inside a for loop, we can
+	// use that to get the right Env.Variables map. As for the function
+	// itself, it's the same in each loop iteration, therefore, we find it
+	// in obj.expr of ExprCall. (Functions map[string]*Env) But actually,
+	// our new version is now this:
+	Functions map[Expr]*Env
 }
 
-// PushIndexes adds a list of expressions at the zeroth index in Indexes after
-// firsh pushing everyone else over by one. If you pass in nil input this may
-// panic!
-func (obj *Scope) PushIndexes(exprs []Expr) {
-	if exprs == nil {
-		// TODO: is this the right thing to do?
-		panic("unexpected nil input")
+// EmptyEnv returns the zero, empty value for the env, with all the internal
+// maps initialized appropriately.
+func EmptyEnv() *Env {
+	return &Env{
+		Variables: make(map[Expr]*FuncSingleton),
+		Functions: make(map[Expr]*Env),
 	}
-	obj.InitScope() // safety
-	max := obj.MaxIndexes()
-	for i := max; i >= 0; i-- { // reverse order
-		indexes, exists := obj.Indexes[i]
-		if !exists {
-			continue
-		}
-		delete(obj.Indexes, i)
-		obj.Indexes[i+1] = indexes // push it
-	}
-
-	if obj.Indexes == nil { // in case we weren't initialized yet
-		obj.Indexes = make(map[int][]Expr)
-	}
-	obj.Indexes[0] = exprs // usually the list of Args in ExprCall
 }
 
-// PullIndexes takes a list of expressions from the zeroth index in Indexes and
-// then pulls everyone over by one. The returned value is only valid if one was
-// found at the zeroth index. The returned boolean will be true if it exists.
-func (obj *Scope) PullIndexes() ([]Expr, bool) {
-	obj.InitScope()         // safety
-	if obj.Indexes == nil { // in case we weren't initialized yet
-		obj.Indexes = make(map[int][]Expr)
+// Copy makes a copy of the Env struct. This ensures that if the internal maps
+// are changed, it doesn't affect other copies of the Env. It does *not* copy or
+// change the pointers contained within, since these are references, and we need
+// those to be consistently pointing to the same things after copying.
+func (obj *Env) Copy() *Env {
+	if obj == nil { // allow copying nil envs
+		return EmptyEnv()
 	}
 
-	indexes, exists := obj.Indexes[0] // save for later
+	variables := make(map[Expr]*FuncSingleton)
+	functions := make(map[Expr]*Env)
 
-	max := obj.MaxIndexes()
-	for i := 0; i <= max; i++ {
-		ixs, exists := obj.Indexes[i]
-		if !exists {
-			continue
-		}
-		delete(obj.Indexes, i)
-		if i == 0 { // zero falls off
-			continue
-		}
-		obj.Indexes[i-1] = ixs
+	for k, v := range obj.Variables { // copy
+		variables[k] = v // we don't copy the func's!
+	}
+	for k, v := range obj.Functions { // copy
+		functions[k] = v // we don't copy the generator func's
 	}
 
-	return indexes, exists
+	return &Env{
+		Variables: variables,
+		Functions: functions,
+	}
+}
+
+// FuncSingleton is a singleton system for storing a singleton func and its
+// corresponding graph. You must pass in a `MakeFunc` builder method to generate
+// these. The graph which is returned from this must contain that Func as a
+// node.
+type FuncSingleton struct {
+	// MakeFunc builds and returns a Func and a graph that it must be
+	// contained within.
+	// XXX: Add Txn as an input arg?
+	MakeFunc func() (*pgraph.Graph, Func, error)
+
+	g *pgraph.Graph
+	f Func
+}
+
+// GraphFunc returns the previously saved graph and func if they exist. If they
+// do not, then it calls the MakeFunc method to get them, and saves a copy for
+// next time.
+// XXX: Add Txn as an input arg?
+func (obj *FuncSingleton) GraphFunc() (*pgraph.Graph, Func, error) {
+	// If obj.f already exists, just use that.
+	if obj.f != nil { // && obj.g != nil
+		return obj.g, obj.f, nil
+	}
+
+	var err error
+	obj.g, obj.f, err = obj.MakeFunc() // XXX: Add Txn as an input arg?
+	if err != nil {
+		return nil, nil, err
+	}
+	if obj.g == nil {
+		return nil, nil, fmt.Errorf("unexpected nil graph")
+	}
+	if obj.f == nil {
+		return nil, nil, fmt.Errorf("unexpected nil function")
+	}
+	return obj.g, obj.f, nil
+}
+
+// ValueEnv is a future potential argument to the Value() method on Expr.
+// XXX: Consider using this if we want to improve graph shape even more.
+type ValueEnv struct {
+	Variables map[Expr]types.Value
+}
+
+// EmptyValueEnv returns the zero, empty value for the value env, with all the
+// internal maps initialized appropriately.
+func EmptyValueEnv() *ValueEnv {
+	return &ValueEnv{
+		Variables: make(map[Expr]types.Value),
+	}
+}
+
+// Copy makes a copy of the ValueEnv struct. This ensures that if the internal
+// maps are changed, it doesn't affect other copies of the ValueEnv. It does
+// *not* copy or change the pointers contained within, since these are
+// references, and we need those to be consistently pointing to the same things
+// after copying.
+func (obj *ValueEnv) Copy() *ValueEnv {
+	if obj == nil { // allow copying nil envs
+		return EmptyValueEnv()
+	}
+
+	variables := make(map[Expr]types.Value)
+
+	for k, v := range obj.Variables { // copy
+		variables[k] = v // we don't copy the values!
+	}
+
+	return &ValueEnv{
+		Variables: variables,
+	}
 }
 
 // Arg represents a name identifier for a func or class argument declaration and
 // is sometimes accompanied by a type. This does not satisfy the Expr interface.
+// It embeds Textarea so that the parser can store the source code position,
+// which tools such as the code formatter use.
 type Arg struct {
+	Textarea
+
 	Name string
 	Type *types.Type // nil if unspecified (needs to be solved for)
 }
@@ -477,6 +590,10 @@ type Edge struct {
 	Recv  string // name of field used for send/recv (optional)
 
 	Notify bool // is there a notification being sent?
+
+	// Node is the AST node that produced this edge. It is used to point
+	// errors at the originating source position. It may be nil.
+	Node Node
 }
 
 // Output is a collection of data returned by a Stmt.
@@ -484,6 +601,11 @@ type Output struct { // returned by Stmt
 	Resources []engine.Res
 	Edges     []*Edge
 	//Exported []*Exports // TODO: add exported resources
+
+	// Nodes maps each produced resource back to the AST node that built it,
+	// so that later errors (eg: duplicate resources) can point at the
+	// originating source position. A resource may be absent from this map.
+	Nodes map[engine.Res]Node
 }
 
 // EmptyOutput returns the zero, empty value for the output, with all the
@@ -492,5 +614,115 @@ func EmptyOutput() *Output {
 	return &Output{
 		Resources: []engine.Res{},
 		Edges:     []*Edge{},
+		Nodes:     make(map[engine.Res]Node),
 	}
+}
+
+// PositionableNode is the interface implemented by AST nodes that store their
+// code position. It is implemented by node types that embed Textarea.
+type PositionableNode interface {
+	// IsSet returns if the position was already set with Locate already.
+	IsSet() bool
+
+	// Locate sets the position in zero-based (start line, start column, end
+	// line, end column) format.
+	Locate(int, int, int, int)
+
+	// Pos returns the zero-based start line and then start column position.
+	Pos() (int, int)
+
+	// End returns the zero-based end line and then end column position.
+	End() (int, int)
+
+	// String returns a friendly representation of the positions.
+	String() string
+}
+
+// TextDisplayer is a graph node that is aware of its position in the source
+// code, and can emit a textual representation of that part of the source.
+type TextDisplayer interface {
+	// Byline returns a simple version of the error location.
+	Byline() string
+
+	// HighlightText returns a textual representation of this definition for
+	// this node in source.
+	HighlightText() string
+}
+
+// SourceFile is a single file of source code. It pairs the path of that file
+// with the filesystem which contains it, because a path on its own is not
+// enough to find a file: the same path can exist in more than one filesystem.
+// For example, a module which is imported from an embedded filesystem has its
+// own root, and so its main file lives at /main.mcl inside of that filesystem,
+// and not on the local disk. Pass one of these around instead of a bare path so
+// that the two halves can never get separated.
+type SourceFile struct {
+	// FS is the filesystem which contains this file. It is optional, since
+	// some consumers (mainly tests) don't have one, in which case the
+	// contents of this file are simply not available.
+	FS engine.ReadFS
+
+	// Path is the absolute path of this file within the above filesystem.
+	Path string
+}
+
+// String returns a friendly representation of this source file. This is the
+// path on its own, since that is what a user wants to read. Use the URI method
+// instead when it matters which filesystem the file came from.
+func (obj *SourceFile) String() string {
+	if obj == nil {
+		return ""
+	}
+	return obj.Path
+}
+
+// Filename returns the printable name of this file. This is almost always just
+// the path, since that is what the user knows the file as. The exception is a
+// file which comes from an embedded filesystem, because each of those is rooted
+// at its own module, and as a result the path on its own is ambiguous: every
+// embedded module has its own /main.mcl file. Those get the full URI instead,
+// which names the module, and which can't be confused with a file on disk,
+// since a path never starts with a scheme.
+func (obj *SourceFile) Filename() string {
+	if obj == nil {
+		return ""
+	}
+	if obj.FS == nil {
+		return obj.Path
+	}
+	u, err := url.Parse(obj.FS.URI())
+	if err != nil || u.Scheme != EmbeddedScheme {
+		return obj.Path // the common case, don't dress it up
+	}
+	return obj.URI() // eg: embeddedfs:///embedded/provisioner/main.mcl
+}
+
+// URI returns a unique handle for this file. It is the URI of the filesystem
+// which contains it, joined with the path of the file inside of that. We need
+// the filesystem portion to tell two files apart, since two distinct embedded
+// modules can each contain their own /main.mcl file.
+func (obj *SourceFile) URI() string {
+	if obj == nil {
+		return ""
+	}
+	if obj.FS == nil {
+		return obj.Path
+	}
+	// The fs URI ends with the root path of that fs, and our path always
+	// starts with a slash, so drop one of the two adjacent slashes here.
+	return strings.TrimSuffix(obj.FS.URI(), "/") + obj.Path
+}
+
+// Source returns the contents of this file. It reads it from the filesystem
+// which contains it, since that is the only place it is guaranteed to exist.
+// This data is used to annotate error messages with some context from the
+// source, and as a result it is optional and it can error.
+func (obj *SourceFile) Source() ([]byte, error) {
+	if obj == nil {
+		return nil, fmt.Errorf("nil source file")
+	}
+	if obj.FS == nil {
+		return nil, fmt.Errorf("no filesystem for: %s", obj.Path)
+	}
+	return obj.FS.ReadFile(obj.Path)
 }

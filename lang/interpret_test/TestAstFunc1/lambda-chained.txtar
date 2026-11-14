@@ -1,0 +1,38 @@
+-- main.mcl --
+$prefix = "hello"
+
+# this should be a function as a value, iow a lambda
+$prefixer = func($x) {
+	$prefix + ":" + $x # i'd only ever expect one ":" in the graph
+}
+
+$out1 = $prefixer("world")
+$out2 = $prefixer($out1)
+
+test "${out1}" {}
+test "${out2}" {}
+-- OUTPUT --
+Edge: _operator -> _operator # a
+Edge: _operator -> _operator # a
+Edge: _operator -> _operator # b
+Edge: const: str("+") -> _operator # op
+Edge: const: str("+") -> _operator # op
+Edge: const: str("+") -> _operator # op
+Edge: const: str("+") -> _operator # op
+Edge: const: str(":") -> _operator # b
+Edge: const: str(":") -> _operator # b
+Edge: const: str("hello") -> _operator # a
+Edge: const: str("hello") -> _operator # a
+Edge: const: str("world") -> _operator # b
+Vertex: _operator
+Vertex: _operator
+Vertex: _operator
+Vertex: _operator
+Vertex: const: str("+")
+Vertex: const: str("+")
+Vertex: const: str("+")
+Vertex: const: str("+")
+Vertex: const: str(":")
+Vertex: const: str(":")
+Vertex: const: str("hello")
+Vertex: const: str("world")

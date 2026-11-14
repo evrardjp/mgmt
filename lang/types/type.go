@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,39 +13,61 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package types
 
 import (
 	"fmt"
+	"net"
 	"reflect"
+	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
+	"github.com/purpleidea/mgmt/util"
+	"github.com/purpleidea/mgmt/util/disjoint"
 	"github.com/purpleidea/mgmt/util/errwrap"
 )
 
 const (
 	// StructTag is the key we use in struct field names for key mapping.
 	StructTag = "lang"
+
+	// MaxInt8 is 127. It's max uint8: ^uint8(0), then we >> 1 for max int8.
+	MaxInt8 = int((^uint8(0)) >> 1)
 )
 
 // Basic types defined here as a convenience for use with Type.Cmp(X).
 var (
+	TypeNil     = NewType("nil")
 	TypeBool    = NewType("bool")
 	TypeStr     = NewType("str")
 	TypeInt     = NewType("int")
 	TypeFloat   = NewType("float")
+	TypeListStr = NewType("[]str")
 	TypeVariant = NewType("variant")
 )
 
-//go:generate stringer -type=Kind -trimprefix=Kind -output=kind_stringer.go
-
 // The Kind represents the base type of each value.
-type Kind int // this used to be called Type
+type Kind uint8 // this used to be called Type
 
 // Each Kind represents a type in the language type system.
 const (
+	// NOTE: Make sure you add entries to stringer.go if you add something.
 	KindNil Kind = iota
 	KindBool
 	KindStr
@@ -57,6 +79,8 @@ const (
 	KindFunc
 	KindVariant
 )
+
+const KindUnification Kind = Kind(MaxInt8) // keep this last
 
 // Type is the datastructure representing any type. It can be recursive for
 // container types like lists, maps, and structs.
@@ -70,6 +94,20 @@ type Type struct {
 	Ord []string
 	Out *Type // if Kind == Func, use Map and Ord for Input, Out for Output
 	Var *Type // if Kind == Variant, use Var only
+
+	// unification variable (question mark, eg ?1, ?2)
+	Uni *Elem // if Kind == Unification (optional) use Uni only
+}
+
+// Elem is the type used for the unification variable in the Uni field of Type.
+// We create this alias here to avoid needing to write *disjoint.Elem[*Type] all
+// over. This is a golang type alias. These should be created with NewElem.
+type Elem = disjoint.Elem[*Type]
+
+// NewElem creates a new set with one element and returns the sole element (the
+// representative element) of that set.
+func NewElem() *Elem {
+	return disjoint.NewElem[*Type]()
 }
 
 // TypeOf takes a reflect.Type and returns an equivalent *Type. It removes any
@@ -81,12 +119,115 @@ type Type struct {
 // Type of KindList, and KindFunc names the arguments of a func sequentially.
 // The lossy inverse of this is Reflect.
 func TypeOf(t reflect.Type) (*Type, error) {
+	opts := []TypeOfOption{
+		StructTagOpt(StructTag),
+		StrictStructTagOpt(false),
+		SkipBadStructFieldsOpt(false),
+		SkipPrivateFieldsOpt(false),
+		AllowInterfaceTypeOpt(false),
+	}
+	return ConfigurableTypeOf(t, opts...)
+}
+
+// ResTypeOf is almost identical to TypeOf, except it behaves slightly
+// differently so that it can return what is needed for resources.
+func ResTypeOf(t reflect.Type) (*Type, error) {
+	opts := []TypeOfOption{
+		StructTagOpt(StructTag),
+		StrictStructTagOpt(true),
+		SkipBadStructFieldsOpt(true),
+		SkipPrivateFieldsOpt(true),
+		AllowInterfaceTypeOpt(true),
+	}
+	return ConfigurableTypeOf(t, opts...)
+}
+
+// TypeOfOption is a type that can be used to configure the ConfigurableTypeOf
+// function.
+type TypeOfOption func(*typeOfOptions)
+
+// typeOfOptions represents the different possible configurable options.
+type typeOfOptions struct {
+	structTag           string
+	strictStructTag     bool
+	skipBadStructFields bool
+	skipPrivateFields   bool
+	allowInterfaceType  bool
+	// TODO: add more options
+}
+
+// StructTagOpt specifies whether we should skip over struct fields that errored
+// when we tried to find their type. This is used by ResTypeOf.
+func StructTagOpt(structTag string) TypeOfOption {
+	return func(opt *typeOfOptions) {
+		opt.structTag = structTag
+	}
+}
+
+// StrictStructTagOpt specifies whether we require that a struct tag be present
+// to be able to use the field. If false, then the field is skipped if it is
+// missing a struct tag.
+func StrictStructTagOpt(strictStructTag bool) TypeOfOption {
+	return func(opt *typeOfOptions) {
+		opt.strictStructTag = strictStructTag
+	}
+}
+
+// SkipBadStructFieldsOpt specifies whether we should skip over struct fields
+// that errored when we tried to find their type. This is used by ResTypeOf.
+func SkipBadStructFieldsOpt(skipBadStructFields bool) TypeOfOption {
+	return func(opt *typeOfOptions) {
+		opt.skipBadStructFields = skipBadStructFields
+	}
+}
+
+// SkipPrivateFieldsOpt specifies whether we should skip over struct fields that
+// are private or unexported. This is used by ResTypeOf.
+func SkipPrivateFieldsOpt(skipPrivateFields bool) TypeOfOption {
+	return func(opt *typeOfOptions) {
+		opt.skipPrivateFields = skipPrivateFields
+	}
+}
+
+// AllowInterfaceTypeOpt specifies whether we should allow matching on an
+// interface kind. This is used by ResTypeOf.
+func AllowInterfaceTypeOpt(allowInterfaceType bool) TypeOfOption {
+	return func(opt *typeOfOptions) {
+		opt.allowInterfaceType = allowInterfaceType
+	}
+}
+
+// ConfigurableTypeOf is a configurable version of the TypeOf function to avoid
+// repeating code for the different variants of it that we want.
+func ConfigurableTypeOf(t reflect.Type, opts ...TypeOfOption) (*Type, error) {
+	options := &typeOfOptions{ // default options
+		structTag:           "",
+		strictStructTag:     false,
+		skipBadStructFields: false,
+		skipPrivateFields:   false,
+		allowInterfaceType:  false,
+	}
+	for _, optionFunc := range opts { // apply the options
+		optionFunc(options)
+	}
+	if options.strictStructTag && options.structTag == "" {
+		return nil, fmt.Errorf("strict struct tag is set and struct tag is empty")
+	}
+
 	typ := t
 	kind := typ.Kind()
-	for kind == reflect.Ptr {
+	for kind == reflect.Pointer {
 		typ = typ.Elem() // un-nest one pointer
 		kind = typ.Kind()
 	}
+
+	// Special cases:
+	if reflect.TypeOf(net.HardwareAddr{}) == typ {
+		return &Type{
+			Kind: KindStr,
+		}, nil
+	}
+	// TODO: net/url.URL, time.Duration, etc. Note: avoid net/mail.Address
 
 	switch kind { // match on destination field kind
 	case reflect.Bool:
@@ -113,7 +254,7 @@ func TypeOf(t reflect.Type) (*Type, error) {
 		}, nil
 
 	case reflect.Array, reflect.Slice:
-		val, err := TypeOf(typ.Elem())
+		val, err := ConfigurableTypeOf(typ.Elem(), opts...)
 		if err != nil {
 			return nil, err
 		}
@@ -124,14 +265,19 @@ func TypeOf(t reflect.Type) (*Type, error) {
 		}, nil
 
 	case reflect.Map:
-		key, err := TypeOf(typ.Key()) // Key returns a map type's key type.
+		key, err := ConfigurableTypeOf(typ.Key(), opts...) // Key returns a map type's key type.
 		if err != nil {
 			return nil, err
 		}
-		val, err := TypeOf(typ.Elem()) // Elem returns a type's element type.
+		val, err := ConfigurableTypeOf(typ.Elem(), opts...) // Elem returns a type's element type.
 		if err != nil {
 			return nil, err
 		}
+
+		// XXX: Should we include this check here?
+		//if !IsHashableType(key) {
+		//	return nil, fmt.Errorf("map key type %s is not hashable", key)
+		//}
 
 		return &Type{
 			Kind: KindMap,
@@ -140,22 +286,35 @@ func TypeOf(t reflect.Type) (*Type, error) {
 		}, nil
 
 	case reflect.Struct:
-		m := make(map[string]*Type)
-		ord := []string{}
+		m := make(map[string]*Type, typ.NumField())
+		ord := make([]string, 0, typ.NumField()) // some may be skipped
 
 		for i := 0; i < typ.NumField(); i++ {
 			field := typ.Field(i)
-			tt, err := TypeOf(field.Type)
+			if options.skipPrivateFields && !field.IsExported() { // prevent infinite recursion
+				continue
+			}
+			tt, err := ConfigurableTypeOf(field.Type, opts...)
 			if err != nil {
+				if options.skipBadStructFields {
+					continue // skip over bad fields!
+				}
 				return nil, err
 			}
 			// TODO: should we skip over fields with field.Anonymous ?
 
-			// TODO: make struct field name lookup consistent with a helper function
 			// if struct field has a `lang:""` tag, use that instead of the struct field name
 			fieldName := field.Name
-			if alias, ok := field.Tag.Lookup(StructTag); ok {
-				fieldName = alias
+			if options.structTag != "" {
+				if alias, ok := field.Tag.Lookup(options.structTag); ok {
+					fieldName = alias
+				} else if options.strictStructTag {
+					continue
+				}
+			}
+
+			if util.StrInList(fieldName, ord) {
+				return nil, fmt.Errorf("duplicate struct field name: `%s` alias: `%s`", field.Name, fieldName)
 			}
 
 			m[fieldName] = tt
@@ -169,11 +328,11 @@ func TypeOf(t reflect.Type) (*Type, error) {
 		}, nil
 
 	case reflect.Func:
-		m := make(map[string]*Type)
-		ord := []string{}
+		m := make(map[string]*Type, typ.NumIn())
+		ord := make([]string, 0, typ.NumIn())
 
 		for i := 0; i < typ.NumIn(); i++ {
-			tt, err := TypeOf(typ.In(i))
+			tt, err := ConfigurableTypeOf(typ.In(i), opts...)
 			if err != nil {
 				return nil, err
 			}
@@ -186,7 +345,7 @@ func TypeOf(t reflect.Type) (*Type, error) {
 		var err error
 		// we currently leave out nil if there are no return values
 		if c := typ.NumOut(); c == 1 {
-			out, err = TypeOf(typ.Out(0))
+			out, err = ConfigurableTypeOf(typ.Out(0), opts...)
 			if err != nil {
 				return nil, err
 			}
@@ -207,7 +366,15 @@ func TypeOf(t reflect.Type) (*Type, error) {
 		}, nil
 
 	// TODO: should this return a variant type?
-	//case reflect.Interface:
+	case reflect.Interface:
+		if !options.allowInterfaceType {
+			return nil, fmt.Errorf("unable to represent type of %s without AllowInterfaceTypeOpt", typ.String())
+		}
+
+		return &Type{
+			Kind: KindVariant,
+			Var:  nil, // TODO: can we set this?
+		}, nil
 
 	default:
 		return nil, fmt.Errorf("unable to represent type of %s", typ.String())
@@ -216,7 +383,19 @@ func TypeOf(t reflect.Type) (*Type, error) {
 
 // NewType creates the Type from the string representation.
 func NewType(s string) *Type {
+	table := make(map[uint]*Elem)
+	return newType(s, table)
+}
+
+// newType creates the Type from the string representation. This private version
+// takes a table so that we can collect unification variables as we see them and
+// return a type with correctly unified unification variables.
+func newType(s string, table map[uint]*Elem) *Type {
 	switch s {
+	case "nil":
+		return &Type{
+			Kind: KindNil,
+		}
 	case "bool":
 		return &Type{
 			Kind: KindBool,
@@ -237,7 +416,7 @@ func NewType(s string) *Type {
 
 	// KindList
 	if strings.HasPrefix(s, "[]") {
-		val := NewType(s[len("[]"):])
+		val := newType(s[len("[]"):], table)
 		if val == nil {
 			return nil
 		}
@@ -271,11 +450,11 @@ func NewType(s string) *Type {
 			return nil
 		}
 
-		key := NewType(strings.Trim(s[:found], " "))
+		key := newType(strings.Trim(s[:found], " "), table)
 		if key == nil {
 			return nil
 		}
-		val := NewType(strings.Trim(s[found+1:], " "))
+		val := newType(strings.Trim(s[found+1:], " "), table)
 		if val == nil {
 			return nil
 		}
@@ -331,9 +510,14 @@ func NewType(s string) *Type {
 			var trim int
 			if s[found:found+1] == ";" {
 				trim = 1
+				// A semicolon only goes between two fields like
+				// in the language so a trailing one is invalid.
+				if strings.Trim(s[found+1:], " ") == "" {
+					return nil
+				}
 			}
 
-			typ := NewType(strings.Trim(s[:found+1-trim], " "))
+			typ := newType(strings.Trim(s[:found+1-trim], " "), table)
 			if typ == nil {
 				return nil
 			}
@@ -431,9 +615,14 @@ func NewType(s string) *Type {
 			var trim int
 			if s[found:found+1] == "," {
 				trim = 1
+				// A comma only goes between two args like in
+				// the language so a trailing one is invalid.
+				if strings.Trim(s[found+1:], " ") == "" {
+					return nil
+				}
 			}
 
-			typ := NewType(strings.Trim(s[:found+1-trim], " "))
+			typ := newType(strings.Trim(s[:found+1-trim], " "), table)
 			if typ == nil {
 				return nil
 			}
@@ -444,7 +633,7 @@ func NewType(s string) *Type {
 		// return type
 		var tail *Type
 		if out != "" { // allow functions with no return type (in parser)
-			tail = NewType(out)
+			tail = newType(out, table)
 			if tail == nil {
 				return nil
 			}
@@ -465,12 +654,59 @@ func NewType(s string) *Type {
 		}
 	}
 
+	// KindUnification
+	if strings.HasPrefix(s, "?") {
+		// find end of number...
+		var length = 0 // number of digits
+		for i := len("?"); i < len(s); i++ {
+			c := s[i]
+			if length == 0 && c == '0' {
+				return nil // can't start with a zero
+			}
+
+			// Check manually because strconv.ParseUint accepts ^0x.
+			if '0' <= c && c <= '9' {
+				length++
+				continue
+			}
+			return nil // invalid char
+		}
+
+		v := s[len("?") : len("?")+length]
+		n, err := strconv.ParseUint(v, 10, 32) // base 10, 32 bits
+		if err != nil {
+			return nil // programming error or overflow
+		}
+		num := uint(n)
+
+		// XXX: Should we instead always return new unification
+		// variables, but call .Union() on all of the ones that have the
+		// same integer? Sam says they are equivalent.
+		uni, exists := table[num]
+		if !exists {
+			uni = NewElem()  // unification variable, eg: ?1
+			table[num] = uni // store
+		}
+
+		// return a new type, may have an existing unification variable
+		return &Type{
+			Kind: KindUnification,
+			Uni:  uni, // unification variable, eg: ?1
+		}
+	}
+
 	return nil // error (this also matches the empty string as input)
 }
 
-// New creates a new Value of this type.
+// New creates a new Value of this type. It will represent the "zero" value. It
+// panics if you give it a malformed type.
 func (obj *Type) New() Value {
+	if obj == nil {
+		panic("malformed type")
+	}
 	switch obj.Kind {
+	case KindNil:
+		return NewNil()
 	case KindBool:
 		return NewBool()
 	case KindStr:
@@ -489,13 +725,24 @@ func (obj *Type) New() Value {
 		return NewFunc(obj)
 	case KindVariant:
 		return NewVariant(obj)
+	case KindUnification:
+		panic("can't make new value from unification variable kind")
 	}
 	panic("malformed type")
 }
 
 // String returns the textual representation for this type.
 func (obj *Type) String() string {
+	table := make(map[*Elem]uint)
+	return obj.string(table)
+}
+
+// string returns the textual representation for this type. This is a private
+// helper function that is used by the real String function.
+func (obj *Type) string(table map[*Elem]uint) string {
 	switch obj.Kind {
+	case KindNil:
+		return "nil"
 	case KindBool:
 		return "bool"
 	case KindStr:
@@ -509,13 +756,13 @@ func (obj *Type) String() string {
 		if obj.Val == nil {
 			panic("malformed list type")
 		}
-		return "[]" + obj.Val.String()
+		return "[]" + obj.Val.string(table)
 
 	case KindMap:
 		if obj.Key == nil || obj.Val == nil {
 			panic("malformed map type")
 		}
-		return fmt.Sprintf("map{%s: %s}", obj.Key.String(), obj.Val.String())
+		return fmt.Sprintf("map{%s: %s}", obj.Key.string(table), obj.Val.string(table))
 
 	case KindStruct: // {a bool; b int}
 		if obj.Map == nil {
@@ -533,7 +780,7 @@ func (obj *Type) String() string {
 			if t == nil {
 				panic("malformed struct field")
 			}
-			s[i] = fmt.Sprintf("%s %s", k, t.String())
+			s[i] = fmt.Sprintf("%s %s", k, t.string(table))
 		}
 		return fmt.Sprintf("struct{%s}", strings.Join(s, "; "))
 
@@ -553,17 +800,40 @@ func (obj *Type) String() string {
 			if t == nil {
 				panic("malformed func field")
 			}
-			//s[i] = fmt.Sprintf("%s %s", k, t.String()) // strict
-			s[i] = t.String()
+
+			// We need to print function arg names, so that building
+			// a new type from this string won't erase them!
+			//s[i] = t.string(table)
+			s[i] = fmt.Sprintf("%s %s", k, t.string(table)) // strict
 		}
 		var out string
 		if obj.Out != nil {
-			out = fmt.Sprintf(" %s", obj.Out.String())
+			out = fmt.Sprintf(" %s", obj.Out.string(table))
 		}
 		return fmt.Sprintf("func(%s)%s", strings.Join(s, ", "), out)
 
 	case KindVariant:
 		return "variant"
+
+	case KindUnification:
+		if obj.Uni == nil {
+			panic("malformed unification variable")
+		}
+
+		// XXX: Should we instead run .IsConnected() on the two Elem
+		// unification variables to determine if they should have the
+		// same integer representation when printing them?
+		num, exists := table[obj.Uni]
+		if !exists {
+			for _, n := range table {
+				num = max(num, n)
+			}
+			num++                // add 1
+			table[obj.Uni] = num // store
+		}
+
+		//fmt.Printf("?%d: %p\n", int(num), obj.Uni.Find()) // debug
+		return "?" + strconv.FormatUint(uint64(num), 10)
 	}
 
 	panic("malformed type")
@@ -571,6 +841,14 @@ func (obj *Type) String() string {
 
 // Cmp compares this type to another.
 func (obj *Type) Cmp(typ *Type) error {
+	table1 := make(map[*Elem]uint) // for obj
+	table2 := make(map[*Elem]uint) // for typ
+	return obj.cmp(typ, table1, table2)
+}
+
+// cmp compares this type to another. This is a private helper function that is
+// used by the real Cmp function.
+func (obj *Type) cmp(typ *Type, table1, table2 map[*Elem]uint) error {
 	if obj == nil || typ == nil {
 		return fmt.Errorf("cannot compare to nil")
 	}
@@ -578,16 +856,18 @@ func (obj *Type) Cmp(typ *Type) error {
 	// TODO: is this correct?
 	// recurse into variants if we want base type comparisons
 	//if obj.Kind == KindVariant {
-	//	return obj.Var.Cmp(t)
+	//	return obj.Var.cmp(t, table1, table2)
 	//}
 	//if t.Kind == KindVariant {
-	//	return obj.Cmp(t.Var)
+	//	return obj.cmp(t.Var, table1, table2)
 	//}
 
 	if obj.Kind != typ.Kind {
 		return fmt.Errorf("base kind does not match (%+v != %+v)", obj.Kind, typ.Kind)
 	}
 	switch obj.Kind {
+	case KindNil:
+		return nil
 	case KindBool:
 		return nil
 	case KindStr:
@@ -601,14 +881,14 @@ func (obj *Type) Cmp(typ *Type) error {
 		if obj.Val == nil || typ.Val == nil {
 			panic("malformed list type")
 		}
-		return obj.Val.Cmp(typ.Val)
+		return obj.Val.cmp(typ.Val, table1, table2)
 
 	case KindMap:
 		if obj.Key == nil || obj.Val == nil || typ.Key == nil || typ.Val == nil {
 			panic("malformed map type")
 		}
-		kerr := obj.Key.Cmp(typ.Key)
-		verr := obj.Val.Cmp(typ.Val)
+		kerr := obj.Key.cmp(typ.Key, table1, table2)
+		verr := obj.Val.cmp(typ.Val, table1, table2)
 		if kerr != nil && verr != nil {
 			return errwrap.Append(kerr, verr) // two errors
 		}
@@ -644,7 +924,7 @@ func (obj *Type) Cmp(typ *Type) error {
 			if t1 == nil || t2 == nil {
 				panic("malformed struct field")
 			}
-			if err := t1.Cmp(t2); err != nil {
+			if err := t1.cmp(t2, table1, table2); err != nil {
 				return err
 			}
 		}
@@ -675,7 +955,7 @@ func (obj *Type) Cmp(typ *Type) error {
 		//	if t1 == nil || t2 == nil {
 		//		panic("malformed func arg")
 		//	}
-		//	if err := t1.Cmp(t2); err != nil {
+		//	if err := t1.cmp(t2, table1, table2); err != nil {
 		//		return err
 		//	}
 		//}
@@ -698,13 +978,13 @@ func (obj *Type) Cmp(typ *Type) error {
 				panic("malformed func arg")
 			}
 
-			if err := t1.Cmp(t2); err != nil {
+			if err := t1.cmp(t2, table1, table2); err != nil {
 				return err
 			}
 		}
 
 		if obj.Out != nil || typ.Out != nil {
-			if err := obj.Out.Cmp(typ.Out); err != nil {
+			if err := obj.Out.cmp(typ.Out, table1, table2); err != nil {
 				return err
 			}
 		}
@@ -717,13 +997,148 @@ func (obj *Type) Cmp(typ *Type) error {
 		}
 		// TODO: should we Cmp obj.Var with typ.Var ? -- not necessarily
 		return nil
+
+	// used for testing
+	case KindUnification:
+		if obj.Uni == nil || typ.Uni == nil {
+			panic("malformed unification variable")
+		}
+
+		// If both types store and lookup variables symmetrically and in
+		// the same order, then the count's should also match.
+		// XXX: Should we instead run .IsConnected() on the two Elem
+		// unification variables to determine if they should have the
+		// same integer representation when printing them?
+		num1, exists := table1[obj.Uni]
+		if !exists {
+			for _, n := range table1 {
+				num1 = max(num1, n)
+			}
+			num1++                 // add 1
+			table1[obj.Uni] = num1 // store
+		}
+
+		num2, exists := table2[typ.Uni]
+		if !exists {
+			for _, n := range table2 {
+				num2 = max(num2, n)
+			}
+			num2++                 // add 1
+			table2[typ.Uni] = num2 // store
+		}
+		if num1 != num2 {
+			return fmt.Errorf("unbalanced unification variables")
+		}
+		return nil
 	}
 	return fmt.Errorf("unknown kind")
 }
 
 // Copy copies this type so that inplace modification won't affect the original.
+// Each unification variable in the copy is a new one, but any which were the
+// same in the original, including any which were unified together, are still
+// the same as each other in the copy. Any variable which was already solved is
+// replaced by a copy of its solution.
 func (obj *Type) Copy() *Type {
-	return NewType(obj.String()) // hack to do this easily
+	return obj.copy(make(map[*Elem]*Elem))
+}
+
+// copy copies this type. This is a private helper function that is used by the
+// real Copy function. The table maps the root of each of the original
+// unification variables to its replacement in the copy.
+func (obj *Type) copy(table map[*Elem]*Elem) *Type {
+	typ := &Type{
+		Kind: obj.Kind,
+	}
+	switch obj.Kind {
+	case KindNil:
+	case KindBool:
+	case KindStr:
+	case KindInt:
+	case KindFloat:
+
+	case KindList:
+		if obj.Val == nil {
+			panic("malformed list type")
+		}
+		typ.Val = obj.Val.copy(table)
+
+	case KindMap:
+		if obj.Key == nil || obj.Val == nil {
+			panic("malformed map type")
+		}
+		typ.Key = obj.Key.copy(table)
+		typ.Val = obj.Val.copy(table)
+
+	case KindStruct: // {a bool; b int}
+		if obj.Map == nil {
+			panic("malformed struct type")
+		}
+		if len(obj.Map) != len(obj.Ord) {
+			panic("malformed struct length")
+		}
+		typ.Map = make(map[string]*Type, len(obj.Ord))
+		typ.Ord = make([]string, 0, len(obj.Ord))
+		for _, k := range obj.Ord {
+			t, ok := obj.Map[k]
+			if !ok {
+				panic("malformed struct order")
+			}
+			if t == nil {
+				panic("malformed struct field")
+			}
+			typ.Map[k] = t.copy(table)
+			typ.Ord = append(typ.Ord, k)
+		}
+
+	case KindFunc:
+		if obj.Map == nil {
+			panic("malformed func type")
+		}
+		if len(obj.Map) != len(obj.Ord) {
+			panic("malformed func length")
+		}
+		typ.Map = make(map[string]*Type, len(obj.Ord))
+		typ.Ord = make([]string, 0, len(obj.Ord))
+		for _, k := range obj.Ord {
+			t, ok := obj.Map[k]
+			if !ok {
+				panic("malformed func order")
+			}
+			if t == nil {
+				panic("malformed func field")
+			}
+			typ.Map[k] = t.copy(table)
+			typ.Ord = append(typ.Ord, k)
+		}
+		if obj.Out != nil {
+			typ.Out = obj.Out.copy(table)
+		}
+
+	case KindVariant:
+		if obj.Var != nil {
+			typ.Var = obj.Var.copy(table)
+		}
+
+	case KindUnification:
+		if obj.Uni == nil {
+			panic("malformed unification variable")
+		}
+		root := obj.Uni.Find() // variables in the same set are the same
+		if root.Data != nil {  // solved, so copy the solution instead
+			return root.Data.copy(table)
+		}
+		uni, exists := table[root]
+		if !exists {
+			uni = NewElem()   // unification variable, eg: ?1
+			table[root] = uni // store
+		}
+		typ.Uni = uni
+
+	default:
+		panic("malformed type")
+	}
+	return typ
 }
 
 // Reflect returns a representative type satisfying the golang Type Interface.
@@ -759,7 +1174,8 @@ func (obj *Type) Reflect() reflect.Type {
 			panic("malformed struct length")
 		}
 
-		fields := []reflect.StructField{}
+		fields := make([]reflect.StructField, 0, len(obj.Ord))
+		seen := make(map[string]string, len(obj.Ord)) // exported name -> field name
 		for _, k := range obj.Ord {
 			t, ok := obj.Map[k]
 			if !ok {
@@ -769,10 +1185,32 @@ func (obj *Type) Reflect() reflect.Type {
 				panic("malformed struct field")
 			}
 
+			// Our struct field names are lowercase, which
+			// reflect.StructOf would panic on, since those are
+			// unexported, so export the name by capitalizing it,
+			// and store the original in the `lang` struct tag,
+			// which TypeOf and Into already use for this mapping.
+			r, size := utf8.DecodeRuneInString(k)
+			u := unicode.ToUpper(r)
+			if !unicode.IsUpper(u) { // eg: leading underscore
+				// reflect.StructOf would panic on anything unexported
+				panic(fmt.Sprintf("struct has unexportable field: %s", k))
+			}
+			name := string(u) + k[size:]
+			if dup, exists := seen[name]; exists {
+				panic(fmt.Sprintf("struct fields `%s` and `%s` both export as `%s`", dup, k, name))
+			}
+			seen[name] = k
+
+			var tag reflect.StructTag
+			if name != k { // renamed, keep the original in the tag
+				tag = reflect.StructTag(fmt.Sprintf("%s:%q", StructTag, k))
+			}
+
 			fields = append(fields, reflect.StructField{
-				Name: k, // struct field name
+				Name: name, // exported struct field name
 				Type: t.Reflect(),
-				//Tag:  `mgmt:"foo"`, // unused
+				Tag:  tag,
 			})
 		}
 
@@ -786,7 +1224,7 @@ func (obj *Type) Reflect() reflect.Type {
 			panic("malformed func length")
 		}
 
-		in := []reflect.Type{}
+		in := make([]reflect.Type, 0, len(obj.Ord))
 		for _, k := range obj.Ord {
 			t, ok := obj.Map[k]
 			if !ok {
@@ -799,7 +1237,7 @@ func (obj *Type) Reflect() reflect.Type {
 			in = append(in, t.Reflect())
 		}
 
-		out := []reflect.Type{} // only one return arg
+		out := make([]reflect.Type, 0, 1) // only one return arg
 		if obj.Out != nil {
 			out = append(out, obj.Out.Reflect())
 		}
@@ -833,6 +1271,8 @@ func (obj *Type) HasVariant() bool {
 		return false
 	}
 	switch obj.Kind {
+	case KindNil:
+		return false
 	case KindBool:
 		return false
 	case KindStr:
@@ -903,6 +1343,99 @@ func (obj *Type) HasVariant() bool {
 
 	case KindVariant:
 		return true // found it!
+
+	case KindUnification:
+		return false // TODO: Do we want to panic here instead?
+	}
+
+	panic("malformed type")
+}
+
+// HasUni tells us if the type contains any unification variables.
+func (obj *Type) HasUni() bool {
+	if obj == nil {
+		return false
+	}
+	if obj.Uni != nil {
+		return true // found it (by this method)
+	}
+
+	switch obj.Kind {
+	case KindNil:
+		return false
+	case KindBool:
+		return false
+	case KindStr:
+		return false
+	case KindInt:
+		return false
+	case KindFloat:
+		return false
+
+	case KindList:
+		if obj.Val == nil {
+			panic("malformed list type")
+		}
+		return obj.Val.HasUni()
+
+	case KindMap:
+		if obj.Key == nil || obj.Val == nil {
+			panic("malformed map type")
+		}
+		return obj.Key.HasUni() || obj.Val.HasUni()
+
+	case KindStruct: // {a bool; b int}
+		if obj.Map == nil {
+			panic("malformed struct type")
+		}
+		if len(obj.Map) != len(obj.Ord) {
+			panic("malformed struct length")
+		}
+		for _, k := range obj.Ord {
+			t, ok := obj.Map[k]
+			if !ok {
+				panic("malformed struct order")
+			}
+			if t == nil {
+				panic("malformed struct field")
+			}
+			if t.HasUni() {
+				return true
+			}
+		}
+		return false
+
+	case KindFunc:
+		if obj.Map == nil {
+			panic("malformed func type")
+		}
+		if len(obj.Map) != len(obj.Ord) {
+			panic("malformed func length")
+		}
+		for _, k := range obj.Ord {
+			t, ok := obj.Map[k]
+			if !ok {
+				panic("malformed func order")
+			}
+			if t == nil {
+				panic("malformed func field")
+			}
+			if t.HasUni() {
+				return true
+			}
+		}
+		if obj.Out != nil {
+			if obj.Out.HasUni() {
+				return true
+			}
+		}
+		return false
+
+	case KindVariant:
+		return obj.Var.HasUni()
+
+	case KindUnification:
+		return true // found it!
 	}
 
 	panic("malformed type")
@@ -916,6 +1449,7 @@ func (obj *Type) HasVariant() bool {
 // string, and if it is compatible with the variant type it will be "variant"...
 // Comparing to a partial can only match "impossible" (error) or possible (nil).
 // This now also supports comparing a partial type to a variant type as well...
+// TODO: Should we support KindUnification somehow?
 func (obj *Type) ComplexCmp(typ *Type) (string, error) {
 	// match simple "placeholder" variants... skip variants w/ sub types
 	isVariant := func(t *Type) bool { return t != nil && t.Kind == KindVariant && t.Var == nil }
@@ -947,6 +1481,8 @@ func (obj *Type) ComplexCmp(typ *Type) (string, error) {
 
 	// only container types are left to match...
 	switch obj.Kind {
+	case KindNil:
+		return "", nil // regular cmp
 	case KindBool:
 		return "", nil // regular cmp
 	case KindStr:

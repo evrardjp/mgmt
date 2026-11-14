@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,12 +13,26 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 // Package errwrap contains some error helpers.
 package errwrap
 
 import (
+	"context"
+
 	"github.com/hashicorp/go-multierror"
 	"github.com/pkg/errors"
 )
@@ -45,8 +59,68 @@ func Append(reterr, err error) error {
 	return multierror.Append(reterr, err)
 }
 
+// Join takes a list of errors and combines them into a multierror with Append.
+func Join(errs []error) error {
+	if len(errs) == 0 {
+		return nil
+	}
+	if len(errs) == 1 {
+		return errs[0]
+	}
+	var reterr error
+	for _, e := range errs {
+		reterr = Append(reterr, e)
+	}
+	return reterr
+}
+
+// WithoutContext passes through an error if it's nil or is a normal error. If
+// it is a multierror, then it removes all errors of context cancellation unless
+// that's all there is. If there's one error remaining, it returns that.
+// Otherwise it returns a new multierror with what's left.
+func WithoutContext(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	multiErr, ok := err.(*multierror.Error)
+	if !ok {
+		return err
+	}
+
+	if len(multiErr.Errors) == 0 {
+		return err // unexpected
+	}
+
+	errs := []error{}
+	for _, e := range multiErr.Errors {
+		if e == context.Canceled {
+			continue // remove
+		}
+		errs = append(errs, e)
+	}
+
+	if len(errs) == 0 {
+		return context.Canceled
+	}
+	//if len(errs) == 1 {
+	//	return errs[0]
+	//}
+
+	return Join(errs)
+}
+
+// NoContextCanceled return nil if the error is a context.Canceled. Otherwise it
+// returns the error.
+func NoContextCanceled(err error) error {
+	if err == context.Canceled {
+		return nil
+	}
+	return err
+}
+
 // String returns a string representation of the error. In particular, if the
-// error is nil, it returns an empty string instead of panicing.
+// error is nil, it returns an empty string instead of panicking.
 func String(err error) string {
 	if err == nil {
 		return ""

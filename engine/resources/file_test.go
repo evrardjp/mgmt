@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,16 +13,31 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
-// +build !root
+//go:build !root
 
 package resources
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/gob"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/purpleidea/mgmt/engine"
@@ -59,7 +74,7 @@ func TestFileAutoEdge1(t *testing.T) {
 		t.Logf("test: "+format, v...)
 	}
 	// run artificially without the entire engine
-	if err := autoedge.AutoEdge(g, debug, logf); err != nil {
+	if err := autoedge.AutoEdge(context.TODO(), g, debug, logf); err != nil {
 		t.Errorf("error running autoedges: %v", err)
 	}
 
@@ -262,4 +277,179 @@ func TestFileAbsolute1(t *testing.T) {
 	if f1.Validate() == nil || f2.Validate() == nil || f3.Validate() == nil {
 		t.Errorf("file res should have failed validate")
 	}
+}
+
+func TestFileSELinuxValidate(t *testing.T) {
+	s1 := "system_u:object_r:tmp_t:s0"
+	// SELinux should not be allowed with State: absent
+	f := &FileRes{
+		Path:    "/tmp/foo",
+		State:   FileStateAbsent,
+		SELinux: &s1,
+	}
+	if err := f.Validate(); err == nil {
+		t.Errorf("param SELinux with State: absent should fail validation")
+	}
+
+	// SELinux should be allowed with State: exists
+	f = &FileRes{
+		Path:    "/tmp/foo",
+		State:   FileStateExists,
+		SELinux: &s1,
+	}
+	if err := f.Validate(); err != nil {
+		t.Errorf("param SELinux with State: exists should pass validation: %v", err)
+	}
+
+	// SELinux as nil should be allowed with State: absent
+	f = &FileRes{
+		Path:    "/tmp/foo",
+		State:   FileStateAbsent,
+		SELinux: nil,
+	}
+	if err := f.Validate(); err != nil {
+		t.Errorf("param SELinux as nil with State: absent should pass validation: %v", err)
+	}
+}
+
+func TestFileSELinuxCmp(t *testing.T) {
+	s1 := "system_u:object_r:tmp_t:s0"
+	s2 := "system_u:object_r:user_tmp_t:s0"
+
+	f1 := &FileRes{
+		Path:    "/tmp/foo",
+		SELinux: &s1,
+	}
+	f2 := &FileRes{
+		Path:    "/tmp/foo",
+		SELinux: &s1,
+	}
+	if err := f1.Cmp(f2); err != nil {
+		t.Errorf("identical SELinux param should match: %v", err)
+	}
+
+	f3 := &FileRes{
+		Path:    "/tmp/foo",
+		SELinux: &s2,
+	}
+	if err := f1.Cmp(f3); err == nil {
+		t.Errorf("different SELinux param should not match")
+	}
+
+	f4 := &FileRes{
+		Path:    "/tmp/foo",
+		SELinux: nil,
+	}
+	if err := f1.Cmp(f4); err == nil {
+		t.Errorf("param SELinux vs nil SELinux should not match")
+	}
+}
+
+func TestFileModeOctal(t *testing.T) {
+	// The traditional unix setuid/setgid/sticky bits (04000, 02000, 01000)
+	// live in different positions than the os.FileMode bits that os.Chmod
+	// and fileInfo.Mode() use, so an octal mode string must translate them.
+	// Without that, eg: "4755" parses to os.FileMode(0o4755) which is
+	// neither os.ModeSetuid nor equal to what the filesystem reports, so
+	// chmodCheckApply would never converge.
+	tests := []struct {
+		mode string
+		out  os.FileMode
+	}{
+		{"755", os.FileMode(0755)},
+		{"0644", os.FileMode(0644)},
+		{"4755", os.FileMode(0755) | os.ModeSetuid},
+		{"2755", os.FileMode(0755) | os.ModeSetgid},
+		{"1755", os.FileMode(0755) | os.ModeSticky},
+		{"7755", os.FileMode(0755) | os.ModeSetuid | os.ModeSetgid | os.ModeSticky},
+	}
+	for _, test := range tests {
+		f := &FileRes{
+			Path: "/tmp/foo",
+			Mode: test.mode,
+		}
+		m, err := f.mode()
+		if err != nil {
+			t.Errorf("mode %q: %v", test.mode, err)
+			continue
+		}
+		if m != test.out {
+			t.Errorf("mode %q: got %s (%#o), want %s (%#o)", test.mode, m, m, test.out, test.out)
+		}
+	}
+}
+
+// TestFileReversedEncode checks that the reversal of a file resource survives
+// being encoded with ResToB64, which is how it gets stored between runs. Both
+// Content and SELinux use a pointer to an empty string to mean "make it empty"
+// as distinct from nil which means "leave it alone", and gob turned the former
+// into the latter, so a reversal could not restore an empty file, or remove an
+// selinux context which mgmt had added.
+func TestFileReversedEncode(t *testing.T) {
+	// reverse returns the reversal of a file resource, which has the given
+	// content and selinux context, for a file which is originally empty. No
+	// state is set, since the reversal of "exists" would be "absent" which
+	// doesn't keep any content.
+	reverse := func(t *testing.T, content, selinux *string) *FileRes {
+		p := filepath.Join(t.TempDir(), "f1")
+		if err := os.WriteFile(p, []byte{}, 0600); err != nil {
+			t.Fatalf("func WriteFile: %v", err)
+		}
+		res, err := engine.NewNamedResource("file", p)
+		if err != nil {
+			t.Fatalf("func NewNamedResource: %v", err)
+		}
+		fileRes := res.(*FileRes) // must not panic
+		fileRes.Content = content
+		fileRes.SELinux = selinux
+
+		rev, err := fileRes.Reversed(context.Background())
+		if err != nil {
+			t.Fatalf("func Reversed: %v", err)
+		}
+		return rev.(*FileRes) // must not panic
+	}
+
+	// encode returns the file resource after a round trip through the
+	// encoding which is used to store reversals.
+	encode := func(t *testing.T, res *FileRes) *FileRes {
+		s, err := engineUtil.ResToB64(res)
+		if err != nil {
+			t.Fatalf("func ResToB64: %v", err)
+		}
+		out, err := engineUtil.B64ToRes(s)
+		if err != nil {
+			t.Fatalf("func B64ToRes: %v", err)
+		}
+		return out.(*FileRes) // must not panic
+	}
+
+	t.Run("content", func(t *testing.T) {
+		content := "hello\n"
+		rev := reverse(t, &content, nil)
+		if rev.Content == nil || *rev.Content != "" {
+			t.Fatalf("expected the reversal to restore empty content, got: %v", rev.Content)
+		}
+		if out := encode(t, rev); out.Content == nil || *out.Content != "" {
+			t.Errorf("expected decoded empty content, got: %v", out.Content)
+		}
+	})
+
+	t.Run("selinux", func(t *testing.T) {
+		selinux := "system_u:object_r:etc_t:s0"
+		rev := reverse(t, nil, &selinux)
+		if rev.SELinux == nil {
+			t.Fatalf("expected the reversal to have an selinux context")
+		}
+		// The reversal holds the original context, which depends on the
+		// host, so check what we got, and then the empty context, which
+		// is what we get if the file had none, and so must be removed.
+		for _, s := range []string{*rev.SELinux, ""} {
+			*rev.SELinux = s
+			out := encode(t, rev)
+			if out.SELinux == nil || *out.SELinux != s {
+				t.Errorf("expected decoded selinux context %q, got: %v", s, out.SELinux)
+			}
+		}
+	})
 }

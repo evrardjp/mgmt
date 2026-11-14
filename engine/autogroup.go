@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,19 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package engine
 
@@ -39,10 +51,16 @@ type GroupableRes interface {
 	SetAutoGroupMeta(*AutoGroupMeta)
 
 	// GroupCmp compares two resources and decides if they're suitable for
-	// grouping. This usually needs to be unique to your resource.
+	// grouping. This usually needs to be unique to your resource. The two
+	// resources must share the first colon-separated chunk of their kind
+	// (eg: "http:server" and "http:server:ui" both start with "http") or
+	// they will never even be offered to this method, since the grouping
+	// algorithm uses that fact to prune the candidate pairs. Grouping
+	// across entirely unrelated kinds was never a sensible thing to do.
 	GroupCmp(res GroupableRes) error
 
-	// GroupRes groups resource argument (res) into self.
+	// GroupRes groups resource argument (res) into self. Callers of this
+	// method should probably also run SetParent.
 	GroupRes(res GroupableRes) error
 
 	// IsGrouped determines if we are grouped.
@@ -54,8 +72,15 @@ type GroupableRes interface {
 	// GetGroup returns everyone grouped inside me.
 	GetGroup() []GroupableRes // return everyone grouped inside me
 
-	// SetGroup sets the grouped resources into me.
+	// SetGroup sets the grouped resources into me. Callers of this method
+	// should probably also run SetParent.
 	SetGroup([]GroupableRes)
+
+	// Parent returns the parent groupable resource that I am inside of.
+	Parent() GroupableRes
+
+	// SetParent tells a particular grouped resource who their parent is.
+	SetParent(res GroupableRes)
 }
 
 // AutoGroupMeta provides some parameters specific to automatic grouping.
@@ -82,6 +107,7 @@ type AutoGrouper interface {
 	Init(*pgraph.Graph) error                                        // only call once
 	VertexNext() (pgraph.Vertex, pgraph.Vertex, error)               // mostly algorithmic
 	VertexCmp(pgraph.Vertex, pgraph.Vertex) error                    // can we merge these ?
+	VertexViable(pgraph.Vertex, pgraph.Vertex) error                 // does the graph allow it ?
 	VertexMerge(pgraph.Vertex, pgraph.Vertex) (pgraph.Vertex, error) // vertex merge fn to use
 	EdgeMerge(pgraph.Edge, pgraph.Edge) pgraph.Edge                  // edge merge fn to use
 	VertexTest(bool) (bool, error)                                   // call until false

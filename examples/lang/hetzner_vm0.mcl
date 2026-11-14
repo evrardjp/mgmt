@@ -1,12 +1,14 @@
 import "os"
+import "sys"
+import "golang/strings" as golang_strings
 #import "deploy"
 
-# read token from a local path outside repo:
-$f = "../localsecrets/apitoken.txt"
-$token = os.readfile($f)
+# read token from a local path outside the repo:
+$f = sys.getenv("HOME") + "/.config/hetzner/apitoken.txt"
+$token = golang_strings.trim_space(os.readfile($f))
 
 # alternatively, read from the deploy:
-# $token = deploy.readfile(...)
+# $token = golang_strings.trim_space(deploy.readfile(...))
 
 # or give the string directly:
 # $token = "..."
@@ -27,10 +29,9 @@ hetzner:vm "resourcedemo" {
 	# serverconfig params: full options must be requested from Hetzner API
 	# static reference on https://github.com/JefMasereel/hcloud-go-getopts
 	# for example:
-	servertype => "cx11", 		# `cx11`, `cx21`, `cx31`
-	datacenter => "hel1-dc2", 	# `nbg1-dc3`, `fsn1-dc14`, `hel1-dc2`
-	image => "debian-10", 		# `centos-7`, `ubuntu-18.04`, `debian-10`
-
+	servertype => "cx33", # `cx23`, `cx33`, `cx43`
+	datacenter => "fsn1-dc14", # `nbg1-dc3`, `fsn1-dc14`, `hel1-dc2`
+	image => "debian-13", # `rocky-10`, `ubuntu-24.04`, `debian-13`
 	# provide a cloud-init script that will be run at server creation (optional)
 	userdata => "",
 
@@ -40,11 +41,11 @@ hetzner:vm "resourcedemo" {
 
 	# list the SSH keys to be enabled when using rescue mode
 	# note: must be a subset of the keys registered with the project!
-	serverrescuekeys => ["bootstrap-test-key",],
+	serverrescuekeys => ["bootstrap-test-key"],
 
 	# set wait interval and timeout in seconds
 	waitinterval => 1,
-	waittimeout => 5*60,
+	waittimeout => 5 * 60,
 
 	# set polling interval in seconds
 	Meta:poll => 10,

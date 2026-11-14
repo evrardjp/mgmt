@@ -67,6 +67,37 @@ Whenever a constant or function parameter is defined, try and have the safer or
 default value be the `zero` value. For example, instead of `const NoDanger`, use
 `const AllowDanger` so that the `false` value is the safe scenario.
 
+### Method receiver pointers
+
+You almost always want any method receivers to be declared on the pointer to the
+struct. There are only a few rare situations where this is not the case. This
+makes it easier to merge future changes that mutate the state without wondering
+why you now have two different copies of a struct. When you do need to copy a
+a struct, you can add a `Copy()` method to it. It's true that in many situations
+adding the pointer adds a small performance penalty, but we haven't found them
+to be significant in practice. If you do have a performance sensitive patch
+which benefits from skipping the pointer, please demonstrate this need with
+data first.
+
+#### Example
+
+```golang
+type Foo struct {
+	Whatever string
+	// ...
+}
+
+// Bar is implemented correctly as a pointer on Foo.
+func (obj *Foo) Bar(baz string) int {
+	// ...
+}
+
+// Bar is implemented *incorrectly* without a pointer to Foo.
+func (obj Foo) Bar(baz string) int {
+	// ...
+}
+```
+
 ### Method receiver naming
 
 [Contrary](https://github.com/golang/go/wiki/CodeReviewComments#receiver-names)
@@ -98,9 +129,9 @@ For example, in a short string snippet you can use `s` instead of `myString`, as
 well as other common choices. `i` is a common `int` counter, `f` for files, `fn`
 for functions, `x` for something else and so on.
 
-### Variable re-use
+### Variable reuse
 
-Feel free to create and use new variables instead of attempting to re-use the
+Feel free to create and use new variables instead of attempting to reuse the
 same string. For example, if a function input arg is named `s`, you can use a
 new variable to receive the first computation result on `s` instead of storing
 it back into the original `s`. This avoids confusion if a different part of the
@@ -114,7 +145,7 @@ MyNotIdealFunc(s string, b bool) string {
 	if !b {
 		return s + "hey"
 	}
-	s = strings.Replace(s, "blah", "", -1) // not ideal (re-use of `s` var)
+	s = strings.Replace(s, "blah", "", -1) // not ideal (reuse of `s` var)
 	return s
 }
 
@@ -122,7 +153,7 @@ MyOkayFunc(s string, b bool) string {
 	if !b {
 		return s + "hey"
 	}
-	s2 := strings.Replace(s, "blah", "", -1) // doesn't re-use `s` variable
+	s2 := strings.Replace(s, "blah", "", -1) // doesn't reuse `s` variable
 	return s2
 }
 
@@ -140,6 +171,24 @@ If a function takes a specifier (often a bool) it's sometimes better to name
 that variable (often with a `const`) rather than leaving a naked `bool` in the
 code. For example, `x := MyFoo("blah", false)` is less clear than
 `const useMagic = false; x := MyFoo("blah", useMagic)`.
+
+### Empty slice declarations
+
+When declaring a new empty slice, there are three different mechanisms:
+
+1. `a := []string{}`
+
+2. `var a []string`
+
+3. `a := make([]string, 0)`
+
+In general, we prefer the first method because we find that it is succinct, and
+very readable. The third method is the least recommended because you're adding
+extra data that a smart compiler could probably figure out on its own. There are
+performance implications between these three methods, so unless your code is in
+a fast path or memory constrained environment where this matters (and that you
+ideally have proof of this) please use the methods as ordered as much as
+possible.
 
 ### Consistent ordering
 
@@ -173,8 +222,14 @@ overloaded, and in particular it was even already used by the
 ## Overview for mcl code
 
 The `mcl` language is quite new, so this guide will probably change over time as
-we find what's best, and hopefully we'll be able to add an `mclfmt` tool in the
-future so that less of this needs to be documented. (Patches welcome!)
+we find what's best. Most of the formatting rules are automated now: run
+`mgmt fmt` in your source directory to recursively format every mcl file below
+it, `mgmt fmt <file>` for a single file, or `mgmt fmt --test` to only check. The
+`mgmt check` command also verifies the formatting unless you use the `--no-fmt`
+flag. The formatter uses tabs for indentation, preserves your blank lines
+(collapsing repeats), preserves your choice of single-line vs multi-line lists,
+maps, structs and call args, and keeps your comments and parenthesis where you
+wrote them.
 
 ### Indentation
 
@@ -206,6 +261,23 @@ like: `import "https://github.com/purpleidea/mgmt-banana/"` and namespace it as
 `banana`. Of course you can always pick the namespace yourself on import with:
 `import "https://github.com/purpleidea/mgmt-banana/" as tomato` or something
 similar.
+
+### Imports
+
+When importing "golang" modules such as "golang/strings" it's recommended to use
+the `import "golang/strings" as golang_strings` format. This is to avoid
+confusion with the normal core package you get from `import "strings"`.
+
+In the long-term, we expect to remove the `"golang/"` namespace when our own
+standard library is complete enough.
+
+### Bugs
+
+Multiline type signatures are allowed by the parser, but will be collapsed down
+to a single line when you run the formatter. If you have end of line comments on
+any of the lines, then will be moved outside of the type signature. This is rare
+but could be unexpected if you're writing weird type signatures. Perhaps we'll
+change this behaviour in the future.
 
 ### Licensing
 

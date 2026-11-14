@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,19 +13,31 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
-// +build !nodocker
+//go:build !nodocker
 
 package resources
 
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"regexp"
 	"strings"
-	"time"
+	"sync"
 
 	"github.com/purpleidea/mgmt/engine"
 	"github.com/purpleidea/mgmt/engine/traits"
@@ -34,8 +46,11 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/client"
+	dockerImage "github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/registry"
+	dockerClient "github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
 )
 
@@ -46,18 +61,13 @@ const (
 	ContainerStopped = "stopped"
 	// ContainerRemoved is the removed container state.
 	ContainerRemoved = "removed"
-
-	// initCtxTimeout is the length of time, in seconds, before requests are
-	// cancelled in Init.
-	initCtxTimeout = 20
-	// checkApplyCtxTimeout is the length of time, in seconds, before
-	// requests are cancelled in CheckApply.
-	checkApplyCtxTimeout = 120
 )
 
 func init() {
 	engine.RegisterResource("docker:container", func() engine.Res { return &DockerContainerRes{} })
 }
+
+var _ engine.EdgeableRes = &DockerContainerRes{} // compile time check
 
 // DockerContainerRes is a docker container resource.
 type DockerContainerRes struct {
@@ -65,26 +75,38 @@ type DockerContainerRes struct {
 	traits.Edgeable
 
 	// State of the container must be running, stopped, or removed.
-	State string `yaml:"state"`
+	State string `lang:"state" yaml:"state"`
+
 	// Image is a docker image, or image:tag.
-	Image string `yaml:"image"`
+	Image string `lang:"image" yaml:"image"`
+
 	// Cmd is a command, or list of commands to run on the container.
-	Cmd []string `yaml:"cmd"`
-	// Env is a list of environment variables. E.g. ["VAR=val",].
-	Env []string `yaml:"env"`
-	// Ports is a map of port bindings. E.g. {"tcp" => {80 => 8080},}.
-	Ports map[string]map[int64]int64 `yaml:"ports"`
+	Cmd []string `lang:"cmd" yaml:"cmd"`
+
+	// Env is a list of environment variables. E.g. ["VAR=val"].
+	Env []string `lang:"env" yaml:"env"`
+
+	// Ports is a map of port bindings. E.g. {"tcp" => {8080 => 80}}. The
+	// key is the host port, and the val is the inner service port to
+	// forward to.
+	Ports map[string]map[int64]int64 `lang:"ports" yaml:"ports"`
+
 	// APIVersion allows you to override the host's default client API
 	// version.
-	APIVersion string `yaml:"apiversion"`
+	APIVersion string `lang:"apiversion" yaml:"apiversion"`
 
 	// Force, if true, this will destroy and redeploy the container if the
 	// image is incorrect.
-	Force bool `yaml:"force"`
-
-	client *client.Client // docker api client
+	Force bool `lang:"force" yaml:"force"`
 
 	init *engine.Init
+
+	client *dockerClient.Client // docker api client
+
+	once  *sync.Once
+	start chan struct{} // closes by once
+	sflag bool          // first time happened?
+	ready chan struct{} // closes by once
 }
 
 // Default returns some sensible defaults for this resource.
@@ -141,44 +163,73 @@ func (obj *DockerContainerRes) Validate() error {
 
 // Init runs some startup code for this resource.
 func (obj *DockerContainerRes) Init(init *engine.Init) error {
-	var err error
 	obj.init = init // save for later
 
-	ctx, cancel := context.WithTimeout(context.Background(), initCtxTimeout*time.Second)
-	defer cancel()
+	obj.once = &sync.Once{}
+	obj.start = make(chan struct{})
+	obj.ready = make(chan struct{})
 
-	// Initialize the docker client.
-	obj.client, err = client.NewClientWithOpts(client.WithVersion(obj.APIVersion))
-	if err != nil {
-		return errwrap.Wrapf(err, "error creating docker client")
-	}
-
-	// Validate the image.
-	resp, err := obj.client.ImageSearch(ctx, obj.Image, types.ImageSearchOptions{Limit: 1})
-	if err != nil {
-		return errwrap.Wrapf(err, "error searching for image")
-	}
-	if len(resp) == 0 {
-		return fmt.Errorf("image: %s not found", obj.Image)
-	}
 	return nil
 }
 
-// Close is run by the engine to clean up after the resource is done.
-func (obj *DockerContainerRes) Close() error {
-	return obj.client.Close() // close the docker client
+// Cleanup is run by the engine to clean up after the resource is done.
+func (obj *DockerContainerRes) Cleanup() error {
+	return nil
 }
 
 // Watch is the primary listener for this resource and it outputs events.
-func (obj *DockerContainerRes) Watch() error {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+func (obj *DockerContainerRes) Watch(ctx context.Context) error {
+	var client *dockerClient.Client
+	var err error
 
-	eventChan, errChan := obj.client.Events(ctx, types.EventsOptions{})
+	for {
+		client, err = dockerClient.NewClientWithOpts(dockerClient.WithVersion(obj.APIVersion))
+		if err == nil {
+			// the above won't check the connection, force that here
+			_, err = client.Ping(ctx)
+		}
+		if err == nil {
+			break
+		}
+		// If we didn't connect right away, it might be because we're
+		// waiting for someone to install the docker package, and start
+		// the service. We might even have an edge between this resource
+		// and those dependencies, but that doesn't stop this Watch from
+		// starting up. As a result, we will wait *once* for CheckApply
+		// to unlock us, since that runs in dependency order.
+		// This error looks like: Cannot connect to the Docker daemon at
+		// unix:///var/run/docker.sock. Is the docker daemon running?
+		if dockerClient.IsErrConnectionFailed(err) && !obj.sflag {
+			// notify engine that we're running so that CheckApply
+			// can start...
+			if err := obj.init.Event(ctx); err != nil {
+				return err
+			}
+			select {
+			case <-obj.start:
+				obj.sflag = true
+				continue
 
-	obj.init.Running() // when started, notify engine that we're running
+			case <-ctx.Done(): // don't block
+				close(obj.ready) // tell CheckApply to unblock!
+				return nil
+			}
+		}
+		close(obj.ready) // tell CheckApply to unblock!
+		return errwrap.Wrapf(err, "error creating docker client")
+	}
+	defer client.Close() // success, so close it later
 
-	var send = false // send event?
+	eventChan, errChan := client.Events(ctx, events.ListOptions{})
+	close(obj.ready) // tell CheckApply to start now that events are running
+
+	// notify engine that we're running
+	if !obj.sflag {
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
+	}
+
 	for {
 		select {
 		case event, ok := <-eventChan:
@@ -188,7 +239,6 @@ func (obj *DockerContainerRes) Watch() error {
 			if obj.init.Debug {
 				obj.init.Logf("%+v", event)
 			}
-			send = true
 
 		case err, ok := <-errChan:
 			if !ok {
@@ -196,28 +246,49 @@ func (obj *DockerContainerRes) Watch() error {
 			}
 			return err
 
-		case <-obj.init.Done: // closed by the engine to signal shutdown
-			return nil
+		case <-ctx.Done(): // closed by the engine to signal shutdown
+			return ctx.Err()
 		}
 
-		// do all our event sending all together to avoid duplicate msgs
-		if send {
-			send = false
-			obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
 		}
 	}
 }
 
 // CheckApply method for Docker resource.
-func (obj *DockerContainerRes) CheckApply(apply bool) (bool, error) {
+func (obj *DockerContainerRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
+
+	obj.once.Do(func() { close(obj.start) }) // Tell Watch() it's safe to start again.
+	// Now wait to make sure events are started before we make changes!
+	select {
+	case <-obj.ready:
+	case <-ctx.Done(): // don't block
+		return false, ctx.Err()
+	}
+
 	var id string
 	var destroy bool
+	var err error
 
-	ctx, cancel := context.WithTimeout(context.Background(), checkApplyCtxTimeout*time.Second)
-	defer cancel()
+	// Initialize the docker client.
+	obj.client, err = dockerClient.NewClientWithOpts(dockerClient.WithVersion(obj.APIVersion))
+	if err != nil {
+		return false, errwrap.Wrapf(err, "error creating docker client")
+	}
+	defer obj.client.Close() // close the docker client
+
+	// Validate the image.
+	resp, err := obj.client.ImageSearch(ctx, obj.Image, registry.SearchOptions{Limit: 1})
+	if err != nil {
+		return false, errwrap.Wrapf(err, "error searching for image")
+	}
+	if len(resp) == 0 {
+		return false, fmt.Errorf("image: %s not found", obj.Image)
+	}
 
 	// List any container whose name matches this resource.
-	opts := types.ContainerListOptions{
+	opts := container.ListOptions{
 		All:     true,
 		Filters: filters.NewArgs(filters.KeyValuePair{Key: "name", Value: obj.Name()}),
 	}
@@ -229,7 +300,9 @@ func (obj *DockerContainerRes) CheckApply(apply bool) (bool, error) {
 	if len(containerList) > 1 {
 		return false, fmt.Errorf("more than one container named %s", obj.Name())
 	}
-	if len(containerList) == 0 && obj.State == ContainerRemoved {
+	// NOTE: If container doesn't exist, we might as well accept "stopped"
+	// as valid for now, at least until we rewrite this horrible code.
+	if len(containerList) == 0 && (obj.State == ContainerRemoved || obj.State == ContainerStopped) {
 		return true, nil
 	}
 	if len(containerList) == 1 {
@@ -250,6 +323,8 @@ func (obj *DockerContainerRes) CheckApply(apply bool) (bool, error) {
 		}
 	}
 
+	// XXX: Check if defined ports matches what we expect.
+
 	if !apply {
 		return false, nil
 	}
@@ -262,14 +337,14 @@ func (obj *DockerContainerRes) CheckApply(apply bool) (bool, error) {
 		if err := obj.containerStop(ctx, id, nil); err != nil {
 			return false, err
 		}
-		return false, obj.containerRemove(ctx, id, types.ContainerRemoveOptions{})
+		return false, obj.containerRemove(ctx, id, container.RemoveOptions{})
 	}
 
 	if destroy {
 		if err := obj.containerStop(ctx, id, nil); err != nil {
 			return false, err
 		}
-		if err := obj.containerRemove(ctx, id, types.ContainerRemoveOptions{}); err != nil {
+		if err := obj.containerRemove(ctx, id, container.RemoveOptions{}); err != nil {
 			return false, err
 		}
 		containerList = []types.Container{} // zero the list
@@ -277,12 +352,12 @@ func (obj *DockerContainerRes) CheckApply(apply bool) (bool, error) {
 
 	if len(containerList) == 0 { // no container was found
 		// Download the specified image if it doesn't exist locally.
-		p, err := obj.client.ImagePull(ctx, obj.Image, types.ImagePullOptions{})
+		p, err := obj.client.ImagePull(ctx, obj.Image, dockerImage.PullOptions{})
 		if err != nil {
 			return false, errwrap.Wrapf(err, "error pulling image")
 		}
 		// Wait for the image to download, EOF signals that it's done.
-		if _, err := ioutil.ReadAll(p); err != nil {
+		if _, err := io.ReadAll(p); err != nil {
 			return false, errwrap.Wrapf(err, "error reading image pull result")
 		}
 
@@ -298,15 +373,25 @@ func (obj *DockerContainerRes) CheckApply(apply bool) (bool, error) {
 			PortBindings: make(map[nat.Port][]nat.PortBinding),
 		}
 
-		for k, v := range obj.Ports {
+		for proto, v := range obj.Ports {
+			// On the outside, on the host, we'd see 8080 which is p
+			// and on the inside, the container would have something
+			// running on 80, which is q.
 			for p, q := range v {
-				containerConfig.ExposedPorts[nat.Port(k)] = struct{}{}
-				hostConfig.PortBindings[nat.Port(fmt.Sprintf("%d/%s", p, k))] = []nat.PortBinding{
-					{
-						HostIP:   "0.0.0.0",
-						HostPort: fmt.Sprintf("%d", q),
-					},
+				// Port is a string containing port number and
+				// protocol in the format "80/tcp".
+				port := fmt.Sprintf("%d/%s", q, proto)
+				n := nat.Port(port)
+				containerConfig.ExposedPorts[n] = struct{}{} // PortSet
+
+				pb := nat.PortBinding{
+					HostIP:   "0.0.0.0",
+					HostPort: fmt.Sprintf("%d", p), // eg: 8080
 				}
+				if _, exists := hostConfig.PortBindings[n]; !exists {
+					hostConfig.PortBindings[n] = []nat.PortBinding{}
+				}
+				hostConfig.PortBindings[n] = append(hostConfig.PortBindings[n], pb)
 			}
 		}
 
@@ -317,13 +402,14 @@ func (obj *DockerContainerRes) CheckApply(apply bool) (bool, error) {
 		id = c.ID
 	}
 
-	return false, obj.containerStart(ctx, id, types.ContainerStartOptions{})
+	return false, obj.containerStart(ctx, id, container.StartOptions{})
 }
 
 // containerStart starts the specified container, and waits for it to start.
-func (obj *DockerContainerRes) containerStart(ctx context.Context, id string, opts types.ContainerStartOptions) error {
+func (obj *DockerContainerRes) containerStart(ctx context.Context, id string, opts container.StartOptions) error {
+	obj.init.Logf("starting...")
 	// Get an events channel for the container we're about to start.
-	eventOpts := types.EventsOptions{
+	eventOpts := events.ListOptions{
 		Filters: filters.NewArgs(filters.KeyValuePair{Key: "container", Value: id}),
 	}
 	eventCh, errCh := obj.client.Events(ctx, eventOpts)
@@ -332,6 +418,7 @@ func (obj *DockerContainerRes) containerStart(ctx context.Context, id string, op
 		return errwrap.Wrapf(err, "error starting container")
 	}
 	// Wait for a message on eventChan that says the container has started.
+	// TODO: Should we add ctx here or does cancelling above guarantee exit?
 	select {
 	case event := <-eventCh:
 		if event.Status != "start" {
@@ -344,9 +431,14 @@ func (obj *DockerContainerRes) containerStart(ctx context.Context, id string, op
 }
 
 // containerStop stops the specified container and waits for it to stop.
-func (obj *DockerContainerRes) containerStop(ctx context.Context, id string, timeout *time.Duration) error {
+func (obj *DockerContainerRes) containerStop(ctx context.Context, id string, timeout *int) error {
+	obj.init.Logf("stopping...")
 	ch, errCh := obj.client.ContainerWait(ctx, id, container.WaitConditionNotRunning)
-	obj.client.ContainerStop(ctx, id, timeout)
+	stopOpts := container.StopOptions{
+		Timeout: timeout,
+	}
+	_ = obj.client.ContainerStop(ctx, id, stopOpts)
+	// TODO: Should we add ctx here or does cancelling above guarantee exit?
 	select {
 	case <-ch:
 	case err := <-errCh:
@@ -357,9 +449,11 @@ func (obj *DockerContainerRes) containerStop(ctx context.Context, id string, tim
 
 // containerRemove removes the specified container and waits for it to be
 // removed.
-func (obj *DockerContainerRes) containerRemove(ctx context.Context, id string, opts types.ContainerRemoveOptions) error {
+func (obj *DockerContainerRes) containerRemove(ctx context.Context, id string, opts container.RemoveOptions) error {
+	obj.init.Logf("removing...")
 	ch, errCh := obj.client.ContainerWait(ctx, id, container.WaitConditionRemoved)
-	obj.client.ContainerRemove(ctx, id, opts)
+	_ = obj.client.ContainerRemove(ctx, id, opts)
+	// TODO: Should we add ctx here or does cancelling above guarantee exit?
 	select {
 	case <-ch:
 	case err := <-errCh:
@@ -386,7 +480,7 @@ func (obj *DockerContainerRes) Cmp(r engine.Res) error {
 		return errwrap.Wrapf(err, "the Cmd field differs")
 	}
 	if err := util.SortedStrSliceCompare(obj.Env, res.Env); err != nil {
-		return errwrap.Wrapf(err, "tne Env field differs")
+		return errwrap.Wrapf(err, "the Env field differs")
 	}
 	if len(obj.Ports) != len(res.Ports) {
 		return fmt.Errorf("the Ports length differs")
@@ -422,7 +516,7 @@ type DockerContainerResAutoEdges struct {
 
 // AutoEdges returns edges to any docker:image resource that matches the image
 // specified in the docker:container resource definition.
-func (obj *DockerContainerRes) AutoEdges() (engine.AutoEdge, error) {
+func (obj *DockerContainerRes) AutoEdges(ctx context.Context) (engine.AutoEdge, error) {
 	var result []engine.ResUID
 	var reversed bool
 	if obj.State != "removed" {
@@ -440,7 +534,7 @@ func (obj *DockerContainerRes) AutoEdges() (engine.AutoEdge, error) {
 	}, nil
 }
 
-// Next returnes the next automatic edge.
+// Next returns the next automatic edge.
 func (obj *DockerContainerResAutoEdges) Next() []engine.ResUID {
 	if len(obj.UIDs) == 0 {
 		return nil
@@ -457,7 +551,7 @@ func (obj *DockerContainerResAutoEdges) Test(input []bool) bool {
 		return false
 	}
 	if len(input) != 1 { // in case we get given bad data
-		panic(fmt.Sprintf("Expecting a single value!"))
+		panic("Expecting a single value!")
 	}
 	return true // keep going
 }

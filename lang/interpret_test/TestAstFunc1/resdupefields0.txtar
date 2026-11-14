@@ -1,0 +1,32 @@
+-- main.mcl --
+test "test" {
+	anotherstr => "test",
+
+	Meta => true ?: struct{
+		noop => false,
+		retry => -1,
+		retryreset => false,
+		delay => 0,
+		timeout => 1000,
+		poll => 5,
+		limit => 4.2,
+		burst => 3,
+		reset => false,
+		sema => ["foo:1", "bar:3"],
+		rewatch => false,
+		realize => true,
+		dollar => false,
+		hidden => false,
+		export => ["hostname"],
+		async => false,
+		reverse => true,
+		autoedge => true,
+		autogroup => true,
+	},
+	Meta:noop => false,
+	#Meta:poll => $b ?: 42,
+	#Meta:autoedge => true,
+	#Meta:autogroup => false,
+}
+-- OUTPUT --
+# err: errGraph: resource has duplicate meta entry of: noop: /main.mcl @ 1:1-29:2

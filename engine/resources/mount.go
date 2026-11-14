@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,19 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package resources
 
@@ -21,7 +33,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,9 +42,9 @@ import (
 	"github.com/purpleidea/mgmt/engine"
 	"github.com/purpleidea/mgmt/engine/traits"
 	engineUtil "github.com/purpleidea/mgmt/engine/util"
-	"github.com/purpleidea/mgmt/recwatch"
 	"github.com/purpleidea/mgmt/util"
 	"github.com/purpleidea/mgmt/util/errwrap"
+	"github.com/purpleidea/mgmt/util/recwatch"
 
 	sdbus "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/coreos/go-systemd/v22/unit"
@@ -50,7 +61,8 @@ func init() {
 const (
 	// procFilesystems is a file that lists all the valid filesystem types.
 	procFilesystems = "/proc/filesystems"
-	// procPath is the path to /proc/mounts which contains all active mounts.
+	// procPath is the path to /proc/mounts which contains all active
+	// mounts.
 	procPath = "/proc/mounts"
 	// fstabPath is the path to the fstab file which defines mounts.
 	fstabPath = "/etc/fstab"
@@ -63,8 +75,8 @@ const (
 	// loopFileUmask is the umask (permissions) used to read the loop file.
 	loopFileUmask = 0660
 
-	// devDisk is the path where disks and partitions can be found, organized
-	// by uuid/label/path.
+	// devDisk is the path where disks and partitions can be found,
+	// organized by uuid/label/path.
 	devDisk = "/dev/disk/"
 	// diskByUUID is the location of symlinks for devices by UUID.
 	diskByUUID = devDisk + "by-uuid/"
@@ -109,13 +121,24 @@ type MountRes struct {
 
 	init *engine.Init
 
-	// State must be exists ot absent. If absent, remaining fields are ignored.
-	State   string            `yaml:"state"`
-	Device  string            `yaml:"device"`  // location of the device or image
-	Type    string            `yaml:"type"`    // the type of filesystem
-	Options map[string]string `yaml:"options"` // mount options
-	Freq    int               `yaml:"freq"`    // dump frequency
-	PassNo  int               `yaml:"passno"`  // verification order
+	// State must be exists or absent. If absent, remaining fields are
+	// ignored.
+	State string `lang:"state" yaml:"state"`
+
+	// Device is the location of the device or image.
+	Device string `lang:"device" yaml:"device"`
+
+	// Type of the filesystem.
+	Type string `lang:"type" yaml:"type"`
+
+	// Options are mount options.
+	Options map[string]string `lang:"options" yaml:"options"`
+
+	// Freq is the dump frequency.
+	Freq int `lang:"freq" yaml:"freq"`
+
+	// PassNo is the verification order.
+	PassNo int `lang:"passno" yaml:"passno"`
 
 	mount *fstab.Mount // struct representing the mount
 }
@@ -137,7 +160,7 @@ func (obj *MountRes) Validate() error {
 	}
 
 	// validate type
-	fs, err := ioutil.ReadFile(procFilesystems)
+	fs, err := os.ReadFile(procFilesystems)
 	if err != nil {
 		return errwrap.Wrapf(err, "error reading %s", procFilesystems)
 	}
@@ -185,14 +208,14 @@ func (obj *MountRes) Init(init *engine.Init) error {
 	return nil
 }
 
-// Close is run by the engine to clean up after the resource is done.
-func (obj *MountRes) Close() error {
+// Cleanup is run by the engine to clean up after the resource is done.
+func (obj *MountRes) Cleanup() error {
 	return nil
 }
 
 // Watch listens for signals from the mount unit associated with the resource.
 // It also watch for changes to /etc/fstab, where mounts are defined.
-func (obj *MountRes) Watch() error {
+func (obj *MountRes) Watch(ctx context.Context) error {
 	// make sure systemd is running
 	if !systemdUtil.IsRunningSystemd() {
 		return fmt.Errorf("systemd is not running")
@@ -222,65 +245,108 @@ func (obj *MountRes) Watch() error {
 	defer conn.RemoveSignal(ch)
 
 	// watch the fstab file
-	recWatcher, err := recwatch.NewRecWatcher(fstabPath, false)
+	recWatcher, err := recwatch.NewRecWatcher(ctx, fstabPath, false)
 	if err != nil {
 		return err
 	}
 	// close the recwatcher when we're done
-	defer recWatcher.Close()
+	defer recWatcher.Cleanup()
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
-	var send bool
-	var done bool
 	for {
 		select {
 		case event, ok := <-recWatcher.Events():
-			if !ok {
-				if done {
-					return nil
-				}
-				done = true
-				continue
+			if ctx.Err() != nil {
+				return ctx.Err() // engine is shutting us down
+			}
+			if !ok { // channel shutdown
+				return fmt.Errorf("unexpected close")
+			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
 			}
 			if err := event.Error; err != nil {
-				return errwrap.Wrapf(err, "unknown recwatcher error")
+				return err
 			}
 			if obj.init.Debug {
 				obj.init.Logf("event(%s): %v", event.Body.Name, event.Body.Op)
 			}
 
-			send = true
-
 		case event, ok := <-ch:
-			if !ok {
-				if done {
-					return nil
-				}
-				done = true
-				continue
+			if ctx.Err() != nil {
+				return ctx.Err() // engine is shutting us down
+			}
+			if !ok { // channel shutdown
+				return fmt.Errorf("unexpected close")
 			}
 			if obj.init.Debug {
 				obj.init.Logf("event: %+v", event)
 			}
 
-			send = true
-
-		case <-obj.init.Done: // closed by the engine to signal shutdown
-			return nil
+		case <-ctx.Done(): // closed by the engine to signal shutdown
+			return ctx.Err()
 		}
 
-		// do all our event sending all together to avoid duplicate msgs
-		if send {
-			send = false
-			obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
 		}
 	}
 }
 
+// fstabEntryAdd adds the given mount to the provided fstab file.
+func (obj *MountRes) fstabEntryAdd(file string, mount *fstab.Mount) error {
+	mounts, err := fstab.ParseFile(file)
+	if err != nil {
+		return errwrap.Wrapf(err, "error parsing file: %s", file)
+	}
+	for _, m := range mounts {
+		// if the entry exists, we're done
+		if m.Equals(mount) {
+			return nil
+		}
+	}
+	// mount does not exist so we need to add it
+	mounts = append(mounts, mount)
+	return obj.fstabWrite(file, mounts)
+}
+
+// fstabEntryRemove removes the given mount from the provided fstab file.
+func (obj *MountRes) fstabEntryRemove(file string, mount *fstab.Mount) error {
+	mounts, err := fstab.ParseFile(file)
+	if err != nil {
+		return errwrap.Wrapf(err, "error parsing file: %s", file)
+	}
+	filtered := fstab.Mounts{}
+	for _, m := range mounts {
+		// remove any entry with the defined mountpoint
+		if m.File == mount.File {
+			continue
+		}
+		filtered = append(filtered, m)
+	}
+	return obj.fstabWrite(file, filtered)
+}
+
+// fstabWrite generates an fstab file with the given mounts, and writes them to
+// the provided fstab file.
+func (obj *MountRes) fstabWrite(file string, mounts fstab.Mounts) error {
+	// build the file contents
+	contents := fmt.Sprintf("# Generated by %s at %d", obj.init.Program, time.Now().UnixNano()) + "\n"
+	contents = contents + mounts.String() + "\n"
+	// write the file
+	if err := os.WriteFile(file, []byte(contents), fstabUmask); err != nil {
+		return errwrap.Wrapf(err, "error writing fstab file: %s", file)
+	}
+	return nil
+}
+
 // fstabCheckApply checks /etc/fstab for entries corresponding to the resource
 // definition, and adds or deletes the entry as needed.
-func (obj *MountRes) fstabCheckApply(apply bool) (bool, error) {
+func (obj *MountRes) fstabCheckApply(ctx context.Context, apply bool) (bool, error) {
 	exists, err := fstabEntryExists(fstabPath, obj.mount)
 	if err != nil {
 		return false, errwrap.Wrapf(err, "error checking if fstab entry exists")
@@ -310,7 +376,7 @@ func (obj *MountRes) fstabCheckApply(apply bool) (bool, error) {
 
 // mountCheckApply checks if the defined resource is mounted, and mounts or
 // unmounts it according to the defined state.
-func (obj *MountRes) mountCheckApply(apply bool) (bool, error) {
+func (obj *MountRes) mountCheckApply(ctx context.Context, apply bool) (bool, error) {
 	exists, err := mountExists(procPath, obj.mount)
 	if err != nil {
 		return false, errwrap.Wrapf(err, "error checking if mount exists")
@@ -329,7 +395,7 @@ func (obj *MountRes) mountCheckApply(apply bool) (bool, error) {
 	if obj.State == "exists" {
 		// Reload mounts from /etc/fstab by performing a `daemon-reload` and
 		// restarting `local-fs.target` and `remote-fs.target` units.
-		if err := mountReload(); err != nil {
+		if err := mountReload(ctx); err != nil {
 			return false, errwrap.Wrapf(err, "error reloading /etc/fstab")
 		}
 		return false, nil // we're done
@@ -344,16 +410,16 @@ func (obj *MountRes) mountCheckApply(apply bool) (bool, error) {
 // CheckApply is run to check the state and, if apply is true, to apply the
 // necessary changes to reach the desired state. This is run before Watch and
 // again if Watch finds a change occurring to the state.
-func (obj *MountRes) CheckApply(apply bool) (bool, error) {
+func (obj *MountRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 	checkOK := true
 
-	if c, err := obj.fstabCheckApply(apply); err != nil {
+	if c, err := obj.fstabCheckApply(ctx, apply); err != nil {
 		return false, err
 	} else if !c {
 		checkOK = false
 	}
 
-	if c, err := obj.mountCheckApply(apply); err != nil {
+	if c, err := obj.mountCheckApply(ctx, apply); err != nil {
 		return false, err
 	} else if !c {
 		checkOK = false
@@ -372,6 +438,9 @@ func (obj *MountRes) Cmp(r engine.Res) error {
 	if obj.State != res.State {
 		return fmt.Errorf("the State differs")
 	}
+	if obj.Device != res.Device {
+		return fmt.Errorf("the Device differs")
+	}
 	if obj.Type != res.Type {
 		return fmt.Errorf("the Type differs")
 	}
@@ -379,7 +448,7 @@ func (obj *MountRes) Cmp(r engine.Res) error {
 		return fmt.Errorf("the Options differ")
 	}
 	if obj.Freq != res.Freq {
-		return fmt.Errorf("the Type differs")
+		return fmt.Errorf("the Freq differs")
 	}
 	if obj.PassNo != res.PassNo {
 		return fmt.Errorf("the PassNo differs")
@@ -445,7 +514,7 @@ func strMapEq(x, y map[string]string) bool {
 		return false
 	}
 	for k, v := range x {
-		if val, ok := x[k]; !ok || v != val {
+		if val, ok := y[k]; !ok || v != val {
 			return false
 		}
 	}
@@ -465,51 +534,6 @@ func fstabEntryExists(file string, mount *fstab.Mount) (bool, error) {
 		}
 	}
 	return false, nil
-}
-
-// fstabEntryAdd adds the given mount to the provided fstab file.
-func (obj *MountRes) fstabEntryAdd(file string, mount *fstab.Mount) error {
-	mounts, err := fstab.ParseFile(file)
-	if err != nil {
-		return errwrap.Wrapf(err, "error parsing file: %s", file)
-	}
-	for _, m := range mounts {
-		// if the entry exists, we're done
-		if m.Equals(mount) {
-			return nil
-		}
-	}
-	// mount does not exist so we need to add it
-	mounts = append(mounts, mount)
-	return obj.fstabWrite(file, mounts)
-}
-
-// fstabEntryRemove removes the given mount from the provided fstab file.
-func (obj *MountRes) fstabEntryRemove(file string, mount *fstab.Mount) error {
-	mounts, err := fstab.ParseFile(file)
-	if err != nil {
-		return errwrap.Wrapf(err, "error parsing file: %s", file)
-	}
-	for i, m := range mounts {
-		// remove any entry with the defined mountpoint
-		if m.File == mount.File {
-			mounts = append(mounts[:i], mounts[i+1:]...)
-		}
-	}
-	return obj.fstabWrite(file, mounts)
-}
-
-// fstabWrite generates an fstab file with the given mounts, and writes them to
-// the provided fstab file.
-func (obj *MountRes) fstabWrite(file string, mounts fstab.Mounts) error {
-	// build the file contents
-	contents := fmt.Sprintf("# Generated by %s at %d", obj.init.Program, time.Now().UnixNano()) + "\n"
-	contents = contents + mounts.String() + "\n"
-	// write the file
-	if err := ioutil.WriteFile(file, []byte(contents), fstabUmask); err != nil {
-		return errwrap.Wrapf(err, "error writing fstab file: %s", file)
-	}
-	return nil
 }
 
 // mountExists returns true, if a given mount exists in the given file
@@ -573,7 +597,7 @@ func mountCompare(def, proc *fstab.Mount) (bool, error) {
 
 // mountReload performs a daemon-reload and restarts fs-local.target and
 // fs-remote.target, to let systemd mount any new entries in /etc/fstab.
-func mountReload() error {
+func mountReload(ctx context.Context) error {
 	// establish a godbus connection
 	conn, err := util.SystemBusPrivateUsable()
 	if err != nil {
@@ -587,12 +611,12 @@ func mountReload() error {
 	}
 
 	// systemctl restart local-fs.target
-	if err := restartUnit(conn, "local-fs.target"); err != nil {
+	if err := restartUnit(ctx, conn, "local-fs.target"); err != nil {
 		return errwrap.Wrapf(err, "error restarting unit")
 	}
 
 	// systemctl restart remote-fs.target
-	if err := restartUnit(conn, "remote-fs.target"); err != nil {
+	if err := restartUnit(ctx, conn, "remote-fs.target"); err != nil {
 		return errwrap.Wrapf(err, "error restarting unit")
 	}
 
@@ -601,9 +625,9 @@ func mountReload() error {
 
 // restartUnit restarts the given dbus unit and waits for it to finish starting
 // up. If restartTimeout is exceeded, it will return an error.
-func restartUnit(conn *dbus.Conn, unit string) error {
+func restartUnit(ctx context.Context, conn *dbus.Conn, unit string) error {
 	// timeout if we don't get the JobRemoved event
-	ctx, cancel := context.WithTimeout(context.TODO(), dbusRestartCtxTimeout*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, dbusRestartCtxTimeout*time.Second)
 	defer cancel()
 
 	// Add a dbus rule to watch the systemd1 JobRemoved signal used to wait
@@ -717,6 +741,7 @@ func getLoopInfo(loop string) (*loopInfo, error) {
 
 	// deserialize the contents
 	retInfo := &loopInfo{}
+	//nolint:gosec // G103: unsafe.Pointer is required to pass the struct to the ioctl syscall
 	_, _, errno := unix.Syscall(unix.SYS_IOCTL, f.Fd(), getStatus64, uintptr(unsafe.Pointer(retInfo)))
 	if errno == unix.ENXIO {
 		return nil, fmt.Errorf("device not backed by a file")

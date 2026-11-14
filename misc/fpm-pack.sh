@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # This script packages rpm, deb, and pacman packages of mgmt with fpm. The
 # first argument is the distro type, and the second argument is the version. All
 # subsequent arguments are the dependencies.
@@ -9,7 +9,7 @@ BINARY="mgmt"
 # git tag pointing to the current commit
 TAG=$(git tag -l --points-at HEAD)
 # maintainer email
-MAINTAINER="mgmtconfig@purpleidea.com"
+MAINTAINER="fpm@mgmtconfig.com"
 # project url
 URL="https://github.com/purpleidea/mgmt/"
 # project description
@@ -120,4 +120,4 @@ fpm \
 	${CHANGELOG} \
 	${DEPS} \
 	"misc/mgmt.service"="/usr/lib/systemd/system/mgmt.service" \
-	"$BINARY"="$PREFIX/mgmt"
+	"$BINARY"="$PREFIX/mgmt" # XXX: this is taking the wrong file and not respective arch!

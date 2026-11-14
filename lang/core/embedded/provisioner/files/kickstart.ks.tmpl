@@ -1,0 +1,229 @@
+{{ if .Comment -}}
+#
+#	{{ .Comment }}
+#
+{{- end }}
+#
+#	readme
+#
+# All of this is based on reading docs, experimentation, and the kickstarts repo
+# at: https://pagure.io/fedora-kickstarts which I am not an expert at reading.
+# If you have recommendations for improvements, please let us know! Thanks.
+#
+# flavour: {{ .Flavour }}
+# part: {{ .Part }}
+# bios: {{ .Bios }}
+
+#
+#	system
+#
+text	# text based install (not graphical)
+{{ if .Lang -}}
+{{- $length_minus1 := math_minus1 (len .Lang | printf "%d" | golang_strconv_atoi ) -}}
+lang {{ index .Lang 0 }}
+{{- if gt (len .Lang) 1 }} --addsupport=
+{{- range $i, $x := .Lang -}}
+{{ if eq $i 0 }}{{ continue }}{{ end }}
+{{- $x -}}
+{{- if lt $i $length_minus1 -}},{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+keyboard us
+{{ if .Timezone -}}
+# System timezone
+timezone {{ .Timezone }} --utc
+{{ end -}}
+{{ range $server := .Ntp_servers -}}
+timesource --ntp-server {{ $server }}
+{{ end }}
+
+#
+#	security
+#
+{{ if .Password -}}
+# password can be encrypted with:
+# python3 -c 'import crypt; print(crypt.crypt("password", crypt.mksalt(crypt.METHOD_SHA512)))'
+# or
+# openssl passwd -6 -salt <YOUR_SALT> (salt can be omitted to generate one)
+rootpw --iscrypted --allow-ssh {{ .Password }}
+{{ else }}
+rootpw --iscrypted --lock
+{{- end }}
+selinux --enforcing
+services --enabled=sshd,NetworkManager,chronyd
+{{ if .Sshkeys -}}
+# TODO: sort in a deterministic order
+{{ range $user, $pubkey := .Sshkeys -}}
+{{ if $pubkey -}}
+sshkey --username {{ $user }} "{{ $pubkey }}"
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+#
+#	networking
+#
+# --device=link
+#	specifies the first interface with its link in the up state
+# --activate
+#	any matching devices beyond the first will also be activated
+#
+network --bootproto=dhcp --device=link --activate{{ if .Hostname }} --hostname={{ .Hostname }}{{ end }}
+
+firewall --enabled --service=mdns
+
+#
+#	partitioning
+#
+# TODO: add more magic partitioning schemes
+
+%pre --interpreter=/bin/bash
+# detect all USB disks using udevadm (we want to ignore ipxe disks for example)
+usb_disks=$(for dev in /sys/block/sd*; do
+	devname=$(basename "$dev")
+	if udevadm info --query=property --name=/dev/$devname | grep -q '^ID_BUS=usb'; then
+		echo -n "$devname"
+	fi
+done | paste -sd, -)
+
+# Output the ignoredisk directive to a temporary file.
+if [ "${usb_disks}" != "" ]; then
+	echo "ignoredisk --drives=${usb_disks}" > /tmp/ignoredisk.ks
+else
+	echo "# no ignoredisk directive" > /tmp/ignoredisk.ks
+fi
+%end
+%include /tmp/ignoredisk.ks
+
+# XXX: We use --passphrase="password" as a temp password since "" doesn't work!
+zerombr
+clearpart --all --initlabel --disklabel={{ if .Bios }}msdos{{ else }}gpt{{ end }}
+{{ if eq .Part "btrfs" -}}
+autopart --type=btrfs --noswap --nohome{{ if .Luks }} --encrypted --passphrase="password"{{ end }}
+{{- else if eq .Part "plain" -}}
+autopart --type=plain --nohome{{ if .Luks }} --encrypted --passphrase="password"{{ end }}
+{{- else -}}
+autopart --type=plain --nohome{{ if .Luks }} --encrypted --passphrase="password"{{ end }}
+{{- end }}
+
+{{ if .Luks -}}
+%post --interpreter=/bin/bash --log /root/post_partitioning.log --erroronfail
+# This runs in our chroot, so this file is /mnt/sysimage/etc/crypttab to the OS.
+
+# Assume only one LUKS root device for now.
+LUKS_DEV=$(blkid -t TYPE=crypto_LUKS -o device --list-one)
+echo -n 'password' > /tmp/password
+echo -n '' > /tmp/empty
+# Get cryptsetup to set this to an empty password! (This was hard.)
+#cryptsetup luksAddKey --new-key-slot=1 --force-password --key-file=/tmp/password $LUKS_DEV /tmp/empty
+cryptsetup luksChangeKey --key-slot=0 --force-password --key-file=/tmp/password $LUKS_DEV /tmp/empty
+
+# Add the try-empty-password option to boot non-interactively.
+sed -i '/^luks-/ s/$/,try-empty-password=true/' /etc/crypttab
+
+dracut --force --regenerate-all
+#update-initramfs -u # on debian (I think)
+%end
+{{ end -}}
+
+#
+#	repositories
+#
+{{ if .Url -}}
+url --url="{{ .Url }}"
+{{- end }}
+
+{{ if .Repos -}}
+# TODO: sort in a deterministic order
+{{- range $name, $baseurl := .Repos }}
+repo --name="{{ $name }}" --baseurl="{{ $baseurl }}"
+{{- end }}
+{{- end }}
+
+#
+#	packages
+#
+%packages --timeout 60 --retries 3 # handle spurious failures
+@core
+@standard
+@hardware-support
+{{ if eq .Flavour "Workstation" -}}
+# Packages for Workstation:
+-initial-setup
+-initial-setup-gui
+gnome-initial-setup
+#anaconda-webui
+@base-x
+@fonts
+@input-methods
+@multimedia
+@printing
+-@guest-desktop-agents
+glibc-all-langpacks
+-@dial-up
+-@input-methods
+-@standard
+# Install workstation-product-environment to resolve RhBug:1891500
+@^workstation-product-environment
+# Exclude unwanted packages from @anaconda-tools group
+-gfs2-utils
+-reiserfs-utils
+{{- else if eq .Flavour "Server" -}}
+# Packages for Server:
+fedora-release-server
+# install the default groups for the server environment since installing the environment is not working
+@server-product
+@headless-management
+@networkmanager-submodules
+@container-management
+@domain-client
+@guest-agents
+@server-hardware-support
+-initial-setup-gui
+-generic-release*
+{{- end }}
+# User packages:
+{{ range $i, $x := .Packages -}}
+{{ $x }}
+{{ end -}}
+%end
+
+#
+#	misc
+#
+bootloader --timeout=1
+
+# make sure that initial-setup runs and lets us do all the configuration bits
+firstboot --reconfig
+
+#
+#	flavour
+#
+{{ if eq .Flavour "Workstation" -}}
+%post
+# Explicitly set graphical.target as default as this is how initial-setup detects which version to run
+systemctl set-default graphical.target
+%end
+{{ else if eq .Flavour "Server" -}}
+%post
+# setup systemd to boot to the right runlevel
+echo -n "Setting default runlevel to multiuser text mode"
+systemctl set-default multi-user.target
+echo .
+%end
+{{ end -}}
+
+#
+#	post
+#
+%post --log /root/post_ks.log --erroronfail
+{{ range $i, $x := .Post -}}
+{{ $x }}
+{{ end -}}
+%end
+
+#
+#	reboot after installation
+#
+reboot

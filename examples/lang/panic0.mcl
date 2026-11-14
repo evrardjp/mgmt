@@ -1,0 +1,21 @@
+import "panic/" as nested # local, relative module to prove it can nest
+
+panic(false) # should NOT panic
+panic(false) # should NOT panic
+panic("") # should NOT panic
+panic("") # should NOT panic
+panic(true) # should panic
+panic(true) # should panic
+panic("fail1") # should panic
+panic("fail2") # should panic
+
+include nested.foo()
+
+test "test" {
+	anotherstr => "hello!\n",
+}
+
+# this is what we're simulating:
+#if panic("whatever1") {	# this is a function (and an if statement)
+#	_panic "panic" {}	# this is a resource
+#}

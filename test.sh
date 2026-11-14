@@ -1,4 +1,4 @@
-#!/bin/bash -e
+#!/usr/bin/env -S bash -e
 # runs all (or selected) test suite(s) in test/ and aggregates results
 # Usage:
 #	./test.sh
@@ -31,7 +31,8 @@ function run-testsuite() {
 	# if not running all tests or if this test is not explicitly selected, skip it
 	if test -z "$testsuite" || test "test-$testsuite" = "$testname"; then
 		fold_start "$testname"
-		"$@" || failures=$([ -n "$failures" ] && echo "$failures\\n$@" || echo "$@")
+		description="$testname ($@)"
+		"$@" || failures=$([ -n "$failures" ] && echo "$failures\\n$description" || echo "$description")
 		fold_end "$testname"
 	fi
 }
@@ -44,7 +45,7 @@ function skip-testsuite() {
 		echo skipping "$@" "($REASON)"
 		echo 'SKIP'
 	else
-		# if a skipped suite is explicity called, run it anyway
+		# if a skipped suite is explicitly called, run it anyway
 		if test "test-$testsuite" == "$testname"; then
 			run-testsuite "$@"
 		fi
@@ -54,22 +55,30 @@ function skip-testsuite() {
 # used at the end to tell if everything went fine
 failures=''
 
+if label-block "gomod"; then
+	skip-testsuite ./test/test-gomod.sh # skip for now
+fi
+
 if label-block "basic"; then
 	run-testsuite ./test/test-vet.sh
 	run-testsuite ./test/test-misc.sh
 	run-testsuite ./test/test-gofmt.sh
+	run-testsuite ./test/test-mclfmt.sh
 	run-testsuite ./test/test-yamlfmt.sh
 	run-testsuite ./test/test-bashfmt.sh
 	run-testsuite ./test/test-headerfmt.sh
 	run-testsuite ./test/test-markdownlint.sh
 	run-testsuite ./test/test-commit-message.sh
+	run-testsuite ./test/test-badascii-comments.sh
+	run-testsuite ./test/test-docs-generate.sh
+	#run-testsuite ./test/test-gettext.sh	# unpredictable for now
 	run-testsuite ./test/test-govet.sh
-	# FIXME: this fails with go.mod
-	skip-testsuite ./test/test-examples.sh
+	run-testsuite ./test/test-examples.sh
 	run-testsuite ./test/test-gotest.sh
 	# FIXME: this fails with go.mod
-	skip-testsuite ./test/test-gometalinter.sh
-	run-testsuite ./test/test-golint.sh	# test last, because this test is somewhat arbitrary
+	#skip-testsuite ./test/test-gometalinter.sh	# deprecated
+	run-testsuite ./test/test-golangci-lint.sh	# test last, because this test is somewhat arbitrary
+	#run-testsuite ./test/test-golint.sh	# TODO: add back this diff logic with golangci-lint
 	# FIXME: this now fails everywhere :(
 	skip-testsuite ./test/test-reproducible.sh
 fi
@@ -78,7 +87,7 @@ fi
 # run-test ./test/test-crossbuild.sh
 
 # do these longer tests only when running on ci
-if in_ci; then
+if in_env; then
 	if label-block "shell"; then
 		run-testsuite ./test/test-shell.sh
 	fi

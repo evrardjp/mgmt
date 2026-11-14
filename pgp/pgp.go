@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,19 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 // Package pgp contains the code related to both code and host signing and
 // encryption.
@@ -24,8 +36,8 @@ import (
 	"bytes"
 	"crypto"
 	"encoding/base64"
-	"io/ioutil"
-	"log"
+	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -69,7 +81,6 @@ func Import(privKeyPath string) (*PGP, error) {
 		Entity: entity,
 	}
 
-	log.Printf("PGP: Imported key: %s", obj.Entity.PrivateKey.KeyIdShortString())
 	return obj, nil
 }
 
@@ -89,13 +100,12 @@ func Generate(name, comment, email string, hash *crypto.Hash) (*PGP, error) {
 		Entity: entity,
 	}
 
-	log.Printf("PGP: Created key: %s", obj.Entity.PrivateKey.KeyIdShortString())
 	return obj, nil
 }
 
 // SaveKey writes the whole entity (including private key!) to a .gpg file.
 func (obj *PGP) SaveKey(path string) error {
-	f, err := os.Create(path)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return errwrap.Wrapf(err, "can't create file from given path")
 	}
@@ -130,7 +140,9 @@ func (obj *PGP) WriteFile(path string, buff *bytes.Buffer) error {
 	if err != nil {
 		return errwrap.Wrapf(err, "can't create writer")
 	}
-	buff.WriteTo(w)
+	if _, err := buff.WriteTo(w); err != nil {
+		return errwrap.Wrapf(err, "can't write buffer")
+	}
 
 	if err := w.Flush(); err != nil {
 		return errwrap.Wrapf(err, "can't flush buffered data")
@@ -140,7 +152,7 @@ func (obj *PGP) WriteFile(path string, buff *bytes.Buffer) error {
 
 // CreateWriter remove duplicate function.
 func createWriter(path string) (*bufio.Writer, error) {
-	f, err := os.Create(path)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return nil, errwrap.Wrapf(err, "can't create file from given path")
 	}
@@ -155,7 +167,7 @@ func (obj *PGP) Encrypt(to *openpgp.Entity, msg string) (string, error) {
 	}
 
 	// encode to base64
-	bytes, err := ioutil.ReadAll(buf)
+	bytes, err := io.ReadAll(buf)
 	if err != nil {
 		return "", errwrap.Wrapf(err, "can't read unverified body")
 	}
@@ -199,7 +211,7 @@ func (obj *PGP) Decrypt(encString string) (string, error) {
 		return "", errwrap.Wrapf(err, "can't read message")
 	}
 
-	bytes, err := ioutil.ReadAll(md.UnverifiedBody)
+	bytes, err := io.ReadAll(md.UnverifiedBody)
 	if err != nil {
 		return "", errwrap.Wrapf(err, "can't read unverified body")
 	}
@@ -221,13 +233,13 @@ func ParseIdentity(identity string) (name, comment, email string, err error) {
 	// get name
 	n := strings.Split(identity, " <")
 	if len(n) != 2 {
-		return "", "", "", errwrap.Wrapf(err, "user string mal formated")
+		return "", "", "", fmt.Errorf("user string malformed")
 	}
 
 	// get email and comment
 	ec := strings.Split(n[1], "> ")
 	if len(ec) != 2 {
-		return "", "", "", errwrap.Wrapf(err, "user string mal formated")
+		return "", "", "", fmt.Errorf("user string malformed")
 	}
 
 	return n[0], ec[1], ec[0], nil

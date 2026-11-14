@@ -1,0 +1,53 @@
+# Start on host-a with:
+# ./mgmt run --tmp-prefix --hostname host-a lang examples/lang/remote-jump1.mcl
+# Each host receives this same deploy and launches only the next host. Each hop
+# needs SSH keys and known_hosts entries for its next destination already setup.
+
+import "fmt"
+import "sys"
+import "world"
+
+$hosts = ["host-a", "host-b", "host-c"]
+$user = "root"
+
+for $i, $host in $hosts {
+	if $hostname == $host {
+		print "jump" {
+			msg => "running on ${host}",
+		}
+
+		if $i + 1 < len($hosts) {
+			$next = $hosts[$i + 1]
+			remote "remote" {
+				hostname => $next, # match the next host's branch in this deploy
+				remote => "ssh://${user}@${next}:22/",
+
+				# if you have other mgmt/etcd's running on 2379
+				#tunnel_addr => "127.0.0.1:0", # not recommended
+
+				tunnelled => true, # tunnel the etcd connection back through ssh
+				transient => true, # stop the remote instance when we shut down
+				caching => true, # cache the remote binary
+
+				Meta:async => true, # let the kv below work away
+			}
+		}
+	}
+}
+
+# Every host publishes a greeting to the same etcd through the SSH tunnels. The
+# file on each host updates as greetings arrive from all participants.
+$ns = "remote-jump"
+kv "${ns}" {
+	key => $ns,
+	value => fmt.printf("on: ${hostname} load is: %f", sys.load()->x1),
+	mapped => true,
+}
+
+# Watch these file contents live with:
+# watch -cn 0.1 'cat /tmp/mgmt-remote-jump | jq -C'
+$exchanged = world.kvlookup($ns)
+file "/tmp/mgmt-remote-jump" {
+	state => "exists",
+	content => fmt.printf("%v\n", $exchanged),
+}

@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,540 +13,115 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
-// +build !root
+//go:build !root
 
 package lang
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"net"
 	"os"
+	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/purpleidea/mgmt/converger"
 	"github.com/purpleidea/mgmt/engine"
+	"github.com/purpleidea/mgmt/engine/graph"
 	"github.com/purpleidea/mgmt/engine/graph/autoedge"
-	"github.com/purpleidea/mgmt/engine/resources"
+	"github.com/purpleidea/mgmt/engine/graph/autogroup"
+	"github.com/purpleidea/mgmt/engine/local"
+	engineUtil "github.com/purpleidea/mgmt/engine/util"
 	"github.com/purpleidea/mgmt/etcd"
+	etcdClient "github.com/purpleidea/mgmt/etcd/client"
 	"github.com/purpleidea/mgmt/lang/ast"
-	"github.com/purpleidea/mgmt/lang/funcs"
+	"github.com/purpleidea/mgmt/lang/funcs/dage"
 	"github.com/purpleidea/mgmt/lang/funcs/vars"
 	"github.com/purpleidea/mgmt/lang/inputs"
 	"github.com/purpleidea/mgmt/lang/interfaces"
 	"github.com/purpleidea/mgmt/lang/interpolate"
 	"github.com/purpleidea/mgmt/lang/interpret"
 	"github.com/purpleidea/mgmt/lang/parser"
+	"github.com/purpleidea/mgmt/lang/types"
 	"github.com/purpleidea/mgmt/lang/unification"
 	"github.com/purpleidea/mgmt/pgraph"
 	"github.com/purpleidea/mgmt/util"
+	"github.com/purpleidea/mgmt/util/errwrap"
 
 	"github.com/kylelemons/godebug/pretty"
-	"github.com/spf13/afero"
+	"golang.org/x/tools/txtar"
 )
 
 const (
 	runGraphviz = false // run graphviz in tests?
+
+	doOverwriteTest = false // overwrite tests (hacker mode)
 )
 
-func vertexAstCmpFn(v1, v2 pgraph.Vertex) (bool, error) {
-	//fmt.Printf("V1: %T %+v\n", v1, v1)
-	//node := v1.(*funcs.Node)
-	//fmt.Printf("node: %T %+v\n", node, node)
-	//fmt.Printf("V2: %T %+v\n", v2, v2)
-	if v1.String() == "" || v2.String() == "" {
-		return false, fmt.Errorf("oops, empty vertex")
-	}
-	return v1.String() == v2.String(), nil
+var (
+	testMutex   *sync.Mutex     // guards testCounter
+	testCounter map[string]uint // counts how many times each test ran
+
+	testMemoryAddressRegexp = regexp.MustCompile(`0x[0-9a-f]+`)
+)
+
+func init() {
+	testMutex = &sync.Mutex{}
+	testCounter = make(map[string]uint)
 }
 
-func edgeAstCmpFn(e1, e2 pgraph.Edge) (bool, error) {
-	if e1.String() == "" || e2.String() == "" {
-		return false, fmt.Errorf("oops, empty edge")
-	}
-	return e1.String() == e2.String(), nil
+// ConfigProperties are some values that are used to specify how each test runs.
+type ConfigProperties struct {
+
+	// MaximumCount specifies how many times this test can run safely in a
+	// single iteration. If zero then this means infinite.
+	MaximumCount uint `json:"maximum-count"`
+
+	// NeedsLoopback specifies that this test needs to open a loopback TCP
+	// listener. If the environment forbids this, the test is skipped. This
+	// is often needed for tests that may run in a container sandbox.
+	NeedsLoopback bool `json:"needs-loopback"`
 }
 
-type vtex string
-
-func (obj *vtex) String() string {
-	return string(*obj)
-}
-
-type edge string
-
-func (obj *edge) String() string {
-	return string(*obj)
-}
-
-func TestAstFunc0(t *testing.T) {
-	scope := &interfaces.Scope{ // global scope
-		Variables: map[string]interfaces.Expr{
-			"hello":  &ast.ExprStr{V: "world"},
-			"answer": &ast.ExprInt{V: 42},
-		},
-		// all the built-in top-level, core functions enter here...
-		Functions: ast.FuncPrefixToFunctionsScope(""), // runs funcs.LookupPrefix
+// checkPrerequisites skips a test when its required infrastructure is not
+// available in the current environment.
+func (obj *ConfigProperties) checkPrerequisites(t *testing.T) {
+	t.Helper()
+	if !obj.NeedsLoopback {
+		return
 	}
 
-	type test struct { // an individual test
-		name  string
-		code  string
-		fail  bool
-		scope *interfaces.Scope
-		graph *pgraph.Graph
-	}
-	testCases := []test{}
-
-	{
-		graph, _ := pgraph.NewGraph("g")
-		testCases = append(testCases, test{ // 0
-			"nil",
-			``,
-			false,
-			nil,
-			graph,
-		})
-	}
-	{
-		graph, _ := pgraph.NewGraph("g")
-		testCases = append(testCases, test{
-			name:  "scope only",
-			code:  ``,
-			fail:  false,
-			scope: scope, // use the scope defined above
-			graph: graph,
-		})
-	}
-	{
-		graph, _ := pgraph.NewGraph("g")
-		// empty graph at the moment, because they're all unused!
-		//v1, v2 := vtex("int(42)"), vtex("var(x)")
-		//e1 := edge("var:x")
-		//graph.AddVertex(&v1, &v2)
-		//graph.AddEdge(&v1, &v2, &e1)
-		testCases = append(testCases, test{
-			name: "two vars",
-			code: `
-				$x = 42
-				$y = $x
-			`,
-			// TODO: this should fail with an unused variable error!
-			fail:  false,
-			graph: graph,
-		})
-	}
-	{
-		graph, _ := pgraph.NewGraph("g")
-		testCases = append(testCases, test{
-			name: "self-referential vars",
-			code: `
-				$x = $y
-				$y = $x
-			`,
-			fail:  true,
-			graph: graph,
-		})
-	}
-	{
-		graph, _ := pgraph.NewGraph("g")
-		v1, v2, v3, v4, v5 := vtex("int(42)"), vtex("var(a)"), vtex("var(b)"), vtex("var(c)"), vtex(`str("t")`)
-		e1, e2, e3 := edge("var:a"), edge("var:b"), edge("var:c")
-		graph.AddVertex(&v1, &v2, &v3, &v4, &v5)
-		graph.AddEdge(&v1, &v2, &e1)
-		graph.AddEdge(&v2, &v3, &e2)
-		graph.AddEdge(&v3, &v4, &e3)
-		testCases = append(testCases, test{
-			name: "chained vars",
-			code: `
-				test "t" {
-					int64ptr => $c,
-				}
-				$c = $b
-				$b = $a
-				$a = 42
-			`,
-			fail:  false,
-			graph: graph,
-		})
-	}
-	{
-		graph, _ := pgraph.NewGraph("g")
-		v1, v2 := vtex("bool(true)"), vtex("var(b)")
-		graph.AddVertex(&v1, &v2)
-		e1 := edge("var:b")
-		graph.AddEdge(&v1, &v2, &e1)
-		testCases = append(testCases, test{
-			name: "simple bool",
-			code: `
-				if $b {
-				}
-				$b = true
-			`,
-			fail:  false,
-			graph: graph,
-		})
-	}
-	{
-		graph, _ := pgraph.NewGraph("g")
-		v1, v2, v3, v4, v5 := vtex(`str("t")`), vtex(`str("+")`), vtex("int(42)"), vtex("int(13)"), vtex(fmt.Sprintf(`call:%s(str("+"), int(42), int(13))`, funcs.OperatorFuncName))
-		graph.AddVertex(&v1, &v2, &v3, &v4, &v5)
-		e1, e2, e3 := edge("op"), edge("a"), edge("b")
-		graph.AddEdge(&v2, &v5, &e1)
-		graph.AddEdge(&v3, &v5, &e2)
-		graph.AddEdge(&v4, &v5, &e3)
-		testCases = append(testCases, test{
-			name: "simple operator",
-			code: `
-				test "t" {
-					int64ptr => 42 + 13,
-				}
-			`,
-			fail:  false,
-			scope: scope,
-			graph: graph,
-		})
-	}
-	{
-		graph, _ := pgraph.NewGraph("g")
-		v1, v2, v3 := vtex(`str("t")`), vtex(`str("-")`), vtex(`str("+")`)
-		v4, v5, v6 := vtex("int(42)"), vtex("int(13)"), vtex("int(99)")
-		v7 := vtex(fmt.Sprintf(`call:%s(str("+"), int(42), int(13))`, funcs.OperatorFuncName))
-		v8 := vtex(fmt.Sprintf(`call:%s(str("-"), call:%s(str("+"), int(42), int(13)), int(99))`, funcs.OperatorFuncName, funcs.OperatorFuncName))
-
-		graph.AddVertex(&v1, &v2, &v3, &v4, &v5, &v6, &v7, &v8)
-		e1, e2, e3 := edge("op"), edge("a"), edge("b")
-		graph.AddEdge(&v3, &v7, &e1)
-		graph.AddEdge(&v4, &v7, &e2)
-		graph.AddEdge(&v5, &v7, &e3)
-
-		e4, e5, e6 := edge("op"), edge("a"), edge("b")
-		graph.AddEdge(&v2, &v8, &e4)
-		graph.AddEdge(&v7, &v8, &e5)
-		graph.AddEdge(&v6, &v8, &e6)
-		testCases = append(testCases, test{
-			name: "simple operators",
-			code: `
-				test "t" {
-					int64ptr => 42 + 13 - 99,
-				}
-			`,
-			fail:  false,
-			scope: scope,
-			graph: graph,
-		})
-	}
-	{
-		graph, _ := pgraph.NewGraph("g")
-		v1, v2 := vtex("bool(true)"), vtex(`str("t")`)
-		v3, v4 := vtex("int(13)"), vtex("int(42)")
-		v5, v6 := vtex("var(i)"), vtex("var(x)")
-		v7, v8 := vtex(`str("+")`), vtex(fmt.Sprintf(`call:%s(str("+"), int(42), var(i))`, funcs.OperatorFuncName))
-
-		e1, e2, e3, e4, e5 := edge("op"), edge("a"), edge("b"), edge("var:i"), edge("var:x")
-		graph.AddVertex(&v1, &v2, &v3, &v4, &v5, &v6, &v7, &v8)
-		graph.AddEdge(&v3, &v5, &e4)
-
-		graph.AddEdge(&v7, &v8, &e1)
-		graph.AddEdge(&v4, &v8, &e2)
-		graph.AddEdge(&v5, &v8, &e3)
-
-		graph.AddEdge(&v8, &v6, &e5)
-		testCases = append(testCases, test{
-			name: "nested resource and scoped var",
-			code: `
-				if true {
-					test "t" {
-						int64ptr => $x,
-					}
-					$x = 42 + $i
-				}
-				$i = 13
-			`,
-			fail:  false,
-			scope: scope,
-			graph: graph,
-		})
-	}
-	{
-		testCases = append(testCases, test{
-			name: "out of scope error",
-			code: `
-				# should be out of scope, and a compile error!
-				if $b {
-				}
-				if true {
-					$b = true
-				}
-			`,
-			fail: true,
-		})
-	}
-	{
-		testCases = append(testCases, test{
-			name: "variable re-declaration error",
-			code: `
-				# this should fail b/c of variable re-declaration
-				$x = "hello"
-				$x = "world"	# woops
-			`,
-			fail: true,
-		})
-	}
-	{
-		graph, _ := pgraph.NewGraph("g")
-		v1, v2, v3 := vtex(`str("hello")`), vtex(`str("world")`), vtex("bool(true)")
-		v4, v5 := vtex("var(x)"), vtex(`str("t")`)
-
-		graph.AddVertex(&v1, &v3, &v4, &v5)
-		_ = v2 // v2 is not used because it's shadowed!
-		e1 := edge("var:x")
-		// only one edge! (cool)
-		graph.AddEdge(&v1, &v4, &e1)
-
-		testCases = append(testCases, test{
-			name: "variable shadowing",
-			code: `
-				# this should be okay, because var is shadowed
-				$x = "hello"
-				if true {
-					$x = "world"	# shadowed
-				}
-				test "t" {
-					stringptr => $x,
-				}
-			`,
-			fail:  false,
-			graph: graph,
-		})
-	}
-	{
-		graph, _ := pgraph.NewGraph("g")
-		v1, v2, v3 := vtex(`str("hello")`), vtex(`str("world")`), vtex("bool(true)")
-		v4, v5 := vtex("var(x)"), vtex(`str("t")`)
-
-		graph.AddVertex(&v2, &v3, &v4, &v5)
-		_ = v1 // v1 is not used because it's shadowed!
-		e1 := edge("var:x")
-		// only one edge! (cool)
-		graph.AddEdge(&v2, &v4, &e1)
-
-		testCases = append(testCases, test{
-			name: "variable shadowing inner",
-			code: `
-				# this should be okay, because var is shadowed
-				$x = "hello"
-				if true {
-					$x = "world"	# shadowed
-					test "t" {
-						stringptr => $x,
-					}
-				}
-			`,
-			fail:  false,
-			graph: graph,
-		})
-	}
-	//	// FIXME: blocked by: https://github.com/purpleidea/mgmt/issues/199
-	//{
-	//	graph, _ := pgraph.NewGraph("g")
-	//	v0 := vtex("bool(true)")
-	//	v1, v2 := vtex(`str("hello")`), vtex(`str("world")`)
-	//	v3, v4 := vtex("var(x)"), vtex("var(x)") // different vertices!
-	//	v5, v6 := vtex(`str("t1")`), vtex(`str("t2")`)
-	//
-	//	graph.AddVertex(&v0, &v1, &v2, &v3, &v4, &v5, &v6)
-	//	e1, e2 := edge("var:x"), edge("var:x")
-	//	graph.AddEdge(&v1, &v3, &e1)
-	//	graph.AddEdge(&v2, &v4, &e2)
-	//
-	//	testCases = append(testCases, test{
-	//		name: "variable shadowing both",
-	//		code: `
-	//			# this should be okay, because var is shadowed
-	//			$x = "hello"
-	//			if true {
-	//				$x = "world"	# shadowed
-	//				test "t2" {
-	//					stringptr => $x,
-	//				}
-	//			}
-	//			test "t1" {
-	//				stringptr => $x,
-	//			}
-	//		`,
-	//		fail: false,
-	//		graph: graph,
-	//	})
-	//}
-	//	// FIXME: blocked by: https://github.com/purpleidea/mgmt/issues/199
-	//{
-	//	graph, _ := pgraph.NewGraph("g")
-	//	v1, v2 := vtex(`str("cowsay")`), vtex(`str("cowsay")`)
-	//	v3, v4 := vtex(`str("installed)`), vtex(`str("newest")`)
-	//
-	//	graph.AddVertex(&v1, &v2, &v3, &v4)
-	//
-	//	testCases = append(testCases, test{
-	//		name: "duplicate resource",
-	//		code: `
-	//			# these two are allowed because they are compatible
-	//			pkg "cowsay" {
-	//				state => "installed",
-	//			}
-	//			pkg "cowsay" {
-	//				state => "newest",
-	//			}
-	//		`,
-	//		fail: false,
-	//		graph: graph,
-	//	})
-	//}
-	{
-		testCases = append(testCases, test{
-			name: "variable re-declaration and type change error",
-			code: `
-				# this should fail b/c of variable re-declaration
-				$x = "wow"
-				$x = 99	# woops, but also a change of type :P
-			`,
-			fail: true,
-		})
-	}
-
-	names := []string{}
-	for index, tc := range testCases { // run all the tests
-		if tc.name == "" {
-			t.Errorf("test #%d: not named", index)
-			continue
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			t.Skipf("loopback TCP listeners are unavailable: %v", err)
 		}
-		if util.StrInList(tc.name, names) {
-			t.Errorf("test #%d: duplicate sub test name of: %s", index, tc.name)
-			continue
-		}
-		names = append(names, tc.name)
-
-		//if index != 3 { // hack to run a subset (useful for debugging)
-		//if tc.name != "simple operators" {
-		//	continue
-		//}
-
-		t.Run(fmt.Sprintf("test #%d (%s)", index, tc.name), func(t *testing.T) {
-			name, code, fail, scope, exp := tc.name, tc.code, tc.fail, tc.scope, tc.graph
-
-			t.Logf("\n\ntest #%d (%s) ----------------\n\n", index, name)
-			str := strings.NewReader(code)
-			xast, err := parser.LexParse(str)
-			if err != nil {
-				t.Errorf("test #%d: FAIL", index)
-				t.Errorf("test #%d: lex/parse failed with: %+v", index, err)
-				return
-			}
-			t.Logf("test #%d: AST: %+v", index, xast)
-
-			data := &interfaces.Data{
-				// TODO: add missing fields here if/when needed
-				StrInterpolater: interpolate.InterpolateStr,
-
-				Debug: testing.Verbose(), // set via the -test.v flag to `go test`
-				Logf: func(format string, v ...interface{}) {
-					t.Logf("ast: "+format, v...)
-				},
-			}
-			// some of this might happen *after* interpolate in SetScope or Unify...
-			if err := xast.Init(data); err != nil {
-				t.Errorf("test #%d: FAIL", index)
-				t.Errorf("test #%d: could not init and validate AST: %+v", index, err)
-				return
-			}
-
-			iast, err := xast.Interpolate()
-			if err != nil {
-				t.Errorf("test #%d: FAIL", index)
-				t.Errorf("test #%d: interpolate failed with: %+v", index, err)
-				return
-			}
-
-			// propagate the scope down through the AST...
-			err = iast.SetScope(scope)
-			if !fail && err != nil {
-				t.Errorf("test #%d: FAIL", index)
-				t.Errorf("test #%d: could not set scope: %+v", index, err)
-				return
-			}
-			if fail && err != nil {
-				return // fail happened during set scope, don't run unification!
-			}
-
-			// apply type unification
-			logf := func(format string, v ...interface{}) {
-				t.Logf(fmt.Sprintf("test #%d", index)+": unification: "+format, v...)
-			}
-			unifier := &unification.Unifier{
-				AST:    iast,
-				Solver: unification.SimpleInvariantSolverLogger(logf),
-				Debug:  testing.Verbose(),
-				Logf:   logf,
-			}
-			err = unifier.Unify()
-			if !fail && err != nil {
-				t.Errorf("test #%d: FAIL", index)
-				t.Errorf("test #%d: could not unify types: %+v", index, err)
-				return
-			}
-			// maybe it will fail during graph below instead?
-			//if fail && err == nil {
-			//	t.Errorf("test #%d: FAIL", index)
-			//	t.Errorf("test #%d: unification passed, expected fail", index)
-			//	continue
-			//}
-			if fail && err != nil {
-				return // fail happened during unification, don't run Graph!
-			}
-
-			// build the function graph
-			graph, err := iast.Graph()
-
-			if !fail && err != nil {
-				t.Errorf("test #%d: FAIL", index)
-				t.Errorf("test #%d: functions failed with: %+v", index, err)
-				return
-			}
-			if fail && err == nil {
-				t.Errorf("test #%d: FAIL", index)
-				t.Errorf("test #%d: functions passed, expected fail", index)
-				return
-			}
-
-			if fail { // can't process graph if it's nil
-				// TODO: match against expected error
-				t.Logf("test #%d: error: %+v", index, err)
-				return
-			}
-
-			t.Logf("test #%d: graph: %+v", index, graph)
-			// TODO: improve: https://github.com/purpleidea/mgmt/issues/199
-			if err := graph.GraphCmp(exp, vertexAstCmpFn, edgeAstCmpFn); err != nil {
-				t.Errorf("test #%d: FAIL\n\n", index)
-				t.Logf("test #%d:   actual (g1): %v%s\n\n", index, graph, fullPrint(graph))
-				t.Logf("test #%d: expected (g2): %v%s\n\n", index, exp, fullPrint(exp))
-				t.Errorf("test #%d: cmp error:\n%v", index, err)
-				return
-			}
-
-			for i, v := range graph.Vertices() {
-				t.Logf("test #%d: vertex(%d): %+v", index, i, v)
-			}
-			for v1 := range graph.Adjacency() {
-				for v2, e := range graph.Adjacency()[v1] {
-					t.Logf("test #%d: edge(%+v): %+v -> %+v", index, e, v1, v2)
-				}
-			}
-		})
+		t.Fatalf("could not test loopback TCP listener: %v", err)
+	}
+	if err := listener.Close(); err != nil {
+		t.Fatalf("could not close loopback TCP listener: %v", err)
 	}
 }
 
@@ -555,6 +130,7 @@ func TestAstFunc1(t *testing.T) {
 	const magicError = "# err: "
 	const magicErrorLexParse = "errLexParse: "
 	const magicErrorInit = "errInit: "
+	const magicInterpolate = "errInterpolate: "
 	const magicErrorSetScope = "errSetScope: "
 	const magicErrorUnify = "errUnify: "
 	const magicErrorGraph = "errGraph: "
@@ -566,134 +142,33 @@ func TestAstFunc1(t *testing.T) {
 	}
 	t.Logf("tests directory is: %s", dir)
 
-	variables := map[string]interfaces.Expr{
-		"purpleidea": &ast.ExprStr{V: "hello world!"}, // james says hi
-		// TODO: change to a func when we can change hostname dynamically!
-		"hostname": &ast.ExprStr{V: ""}, // NOTE: empty b/c not used
-	}
-	consts := ast.VarPrefixToVariablesScope(vars.ConstNamespace) // strips prefix!
-	addback := vars.ConstNamespace + interfaces.ModuleSep        // add it back...
-	variables, err = ast.MergeExprMaps(variables, consts, addback)
-	if err != nil {
-		t.Errorf("couldn't merge in consts: %+v", err)
-		return
-	}
-
-	scope := &interfaces.Scope{ // global scope
-		Variables: variables,
-		// all the built-in top-level, core functions enter here...
-		Functions: ast.FuncPrefixToFunctionsScope(""), // runs funcs.LookupPrefix
-	}
-
-	type errs struct {
-		failLexParse bool
-		failInit     bool
-		failSetScope bool
-		failUnify    bool
-		failGraph    bool
-	}
 	type test struct { // an individual test
 		name string
-		path string // relative sub directory path inside tests dir
-		fail bool
-		//graph *pgraph.Graph
-		expstr string // expected graph in string format
-		errs   errs
+		path string // relative txtar path inside tests dir
 	}
 	testCases := []test{}
-	//{
-	//	graph, _ := pgraph.NewGraph("g")
-	//	testCases = append(testCases, test{
-	//		name:   "simple hello world",
-	//		path:   "hello0/",
-	//		fail:   false,
-	//		expstr: graph.Sprint(),
-	//	})
-	//}
 
 	// build test array automatically from reading the dir
-	files, err := ioutil.ReadDir(dir)
+	files, err := os.ReadDir(dir)
 	if err != nil {
 		t.Errorf("could not read through tests directory: %+v", err)
 		return
 	}
 	sorted := []string{}
 	for _, f := range files {
-		if !f.IsDir() {
+		if !strings.HasSuffix(f.Name(), ".txtar") {
 			continue
 		}
+
 		sorted = append(sorted, f.Name())
 	}
 	sort.Strings(sorted)
 	for _, f := range sorted {
-		graphFile := f + ".graph" // expected graph file
-		graphFileFull := dir + graphFile
-		info, err := os.Stat(graphFileFull)
-		if err != nil || info.IsDir() {
-			t.Errorf("missing: %s", graphFile)
-			t.Errorf("(err: %+v)", err)
-			continue
-		}
-		content, err := ioutil.ReadFile(graphFileFull)
-		if err != nil {
-			t.Errorf("could not read graph file: %+v", err)
-			return
-		}
-		str := string(content) // expected graph
-
-		// if the graph file has a magic error string, it's a failure
-		errStr := ""
-		failLexParse := false
-		failInit := false
-		failSetScope := false
-		failUnify := false
-		failGraph := false
-		if strings.HasPrefix(str, magicError) {
-			errStr = strings.TrimPrefix(str, magicError)
-			str = errStr
-
-			if strings.HasPrefix(str, magicErrorLexParse) {
-				errStr = strings.TrimPrefix(str, magicErrorLexParse)
-				str = errStr
-				failLexParse = true
-			}
-			if strings.HasPrefix(str, magicErrorInit) {
-				errStr = strings.TrimPrefix(str, magicErrorInit)
-				str = errStr
-				failInit = true
-			}
-			if strings.HasPrefix(str, magicErrorSetScope) {
-				errStr = strings.TrimPrefix(str, magicErrorSetScope)
-				str = errStr
-				failSetScope = true
-			}
-			if strings.HasPrefix(str, magicErrorUnify) {
-				errStr = strings.TrimPrefix(str, magicErrorUnify)
-				str = errStr
-				failUnify = true
-			}
-			if strings.HasPrefix(str, magicErrorGraph) {
-				errStr = strings.TrimPrefix(str, magicErrorGraph)
-				str = errStr
-				failGraph = true
-			}
-		}
-
 		// add automatic test case
 		testCases = append(testCases, test{
-			name:   fmt.Sprintf("dir: %s", f),
-			path:   f + "/",
-			fail:   errStr != "",
-			expstr: str,
-			errs: errs{
-				failLexParse: failLexParse,
-				failInit:     failInit,
-				failSetScope: failSetScope,
-				failUnify:    failUnify,
-				failGraph:    failGraph,
-			},
+			name: f,
+			path: f, // <something>.txtar
 		})
-		//t.Logf("adding: %s", f + "/")
 	}
 
 	if testing.Short() {
@@ -722,22 +197,196 @@ func TestAstFunc1(t *testing.T) {
 			continue
 		}
 		t.Run(testName, func(t *testing.T) {
-			name, path, fail, expstr, errs := tc.name, tc.path, tc.fail, strings.Trim(tc.expstr, "\n"), tc.errs
-			src := dir + path // location of the test
-			failLexParse := errs.failLexParse
-			failInit := errs.failInit
-			failSetScope := errs.failSetScope
-			failUnify := errs.failUnify
-			failGraph := errs.failGraph
+			name, path := tc.name, tc.path
+			tmpdir := t.TempDir() // gets cleaned up at end, new dir for each call
+			src := tmpdir         // location of the test
+			txtarFile := dir + path
+
+			archive, err := txtar.ParseFile(txtarFile)
+			if err != nil {
+				t.Errorf("err parsing txtar(%s): %+v", txtarFile, err)
+				return
+			}
+			comment := strings.TrimSpace(string(archive.Comment))
+			if comment != "" {
+				t.Logf("comment: %s\n", comment)
+			}
+
+			// copy files out into the test temp directory
+			var testOutput []byte
+			var testConfig []byte
+			found := false
+			for _, file := range archive.Files {
+				if file.Name == "OUTPUT" {
+					testOutput = file.Data
+					found = true
+					continue
+				}
+				if file.Name == "CONFIG" {
+					testConfig = file.Data
+					continue
+				}
+
+				name := filepath.Join(tmpdir, file.Name)
+				dir := filepath.Dir(name)
+				if err := os.MkdirAll(dir, 0750); err != nil {
+					t.Errorf("err making dir(%s): %+v", dir, err)
+					return
+				}
+				if err := os.WriteFile(name, file.Data, 0600); err != nil {
+					t.Errorf("err writing file(%s): %+v", name, err)
+					return
+				}
+			}
+
+			var c ConfigProperties // add pointer to get nil if empty
+			if len(testConfig) > 0 {
+				if err := json.Unmarshal(testConfig, &c); err != nil {
+					t.Errorf("err parsing txtar(%s) config: %+v", txtarFile, err)
+					return
+				}
+			}
+			if testing.Verbose() {
+				t.Logf("config: %+v", c)
+			}
+			c.checkPrerequisites(t)
+
+			testMutex.Lock()               // global
+			count := testCounter[t.Name()] // global
+			testCounter[t.Name()]++
+			testMutex.Unlock()
+
+			if c.MaximumCount != 0 && count >= c.MaximumCount {
+				if count == c.MaximumCount { // logf once
+					t.Logf("Skipping test after count: %d", count)
+				}
+				return
+			}
+
+			if !found { // skip missing tests
+				return
+			}
+
+			expstr := string(testOutput) // expected graph
+			expstrs := []string{}
+
+			// if the graph file has a magic error string, it's a failure
+			errStr := ""
+			errMagic := ""
+			failLexParse := false
+			failInit := false
+			failInterpolate := false
+			failSetScope := false
+			failUnify := false
+			failGraph := false
+			if strings.HasPrefix(expstr, magicError) {
+				expstrs = strings.Split(expstr, "\n")
+				for i := len(expstrs) - 1; i >= 0; i-- { // reverse
+					if strings.TrimSpace(expstrs[i]) == "" {
+						expstrs = append(expstrs[:i], expstrs[i+1:]...) // remove it (from the end)
+						continue
+					}
+					expstrs[i] = strings.TrimPrefix(expstrs[i], magicError) // trim the magic prefix off
+				}
+				errStr = strings.TrimPrefix(expstr, magicError)
+				expstr = errStr
+				t.Logf("errStr has length %d", len(errStr))
+
+				if strings.HasPrefix(expstr, magicErrorLexParse) {
+					errMagic = magicErrorLexParse
+					errStr = strings.TrimPrefix(expstr, magicErrorLexParse)
+					expstr = errStr
+					failLexParse = true
+				}
+				if strings.HasPrefix(expstr, magicErrorInit) {
+					errMagic = magicErrorInit
+					errStr = strings.TrimPrefix(expstr, magicErrorInit)
+					expstr = errStr
+					failInit = true
+				}
+				if strings.HasPrefix(expstr, magicInterpolate) {
+					errMagic = magicInterpolate
+					errStr = strings.TrimPrefix(expstr, magicInterpolate)
+					expstr = errStr
+					failInterpolate = true
+				}
+				if strings.HasPrefix(expstr, magicErrorSetScope) {
+					errMagic = magicErrorSetScope
+					errStr = strings.TrimPrefix(expstr, magicErrorSetScope)
+					expstr = errStr
+					failSetScope = true
+				}
+				if strings.HasPrefix(expstr, magicErrorUnify) {
+					errMagic = magicErrorUnify
+					errStr = strings.TrimPrefix(expstr, magicErrorUnify)
+					expstr = errStr
+					failUnify = true
+				}
+				if strings.HasPrefix(expstr, magicErrorGraph) {
+					errMagic = magicErrorGraph
+					errStr = strings.TrimPrefix(expstr, magicErrorGraph)
+					expstr = errStr
+					failGraph = true
+				}
+			}
+			for i, x := range expstrs { // trim the magic prefix off
+				expstrs[i] = strings.TrimPrefix(x, errMagic)
+			}
+			foundErr := func(s string) bool {
+				for _, x := range expstrs {
+					if x == s {
+						return true // matched!
+					}
+				}
+				return false // unexpected
+			}
+
+			fail := errStr != ""
+			expstr = strings.Trim(expstr, "\n")
+
+			logCache := "" // save for comparing logs in tests
+			logCacher := func(format string, v ...interface{}) {
+				logCache += fmt.Sprintf(format, v...) + "\n"
+			}
+			expFilter := func(expstr string) string {
+				parts := strings.SplitN(expstr, "\n", 2)
+				if len(parts) == 1 {
+					return ""
+				}
+				var filtered []string
+				for _, line := range strings.Split(parts[1], "\n") {
+					if !strings.HasPrefix(line, magicError) {
+						filtered = append(filtered, line)
+					}
+				}
+				return strings.Join(filtered, "\n")
+			}
 
 			t.Logf("\n\ntest #%d (%s) ----------------\npath: %s\n\n", index, name, src)
 
 			logf := func(format string, v ...interface{}) {
 				t.Logf(fmt.Sprintf("test #%d", index)+": "+format, v...)
 			}
-			mmFs := afero.NewMemMapFs()
-			afs := &afero.Afero{Fs: mmFs} // wrap so that we're implementing ioutil
-			fs := &util.Fs{Afero: afs}
+			fs := util.NewMemFs()
+
+			variables := map[string]interfaces.Expr{
+				"purpleidea": &ast.ExprStr{V: "hello world!"}, // james says hi
+				// TODO: change to a func when we can change hostname dynamically!
+				"hostname": &ast.ExprStr{V: ""}, // NOTE: empty b/c not used
+			}
+			consts := ast.VarPrefixToVariablesScope(vars.ConstNamespace) // strips prefix!
+			addback := vars.ConstNamespace + interfaces.ModuleSep        // add it back...
+			variables, err = ast.MergeExprMaps(variables, consts, addback)
+			if err != nil {
+				t.Errorf("couldn't merge in consts: %+v", err)
+				return
+			}
+
+			scope := &interfaces.Scope{ // global scope
+				Variables: variables,
+				// all the built-in top-level, core functions enter here...
+				Functions: ast.FuncPrefixToFunctionsScope(""), // runs funcs.LookupPrefix
+			}
 
 			// use this variant, so that we don't copy the dir name
 			// this is the equivalent to running `rsync -a src/ /`
@@ -784,6 +433,13 @@ func TestAstFunc1(t *testing.T) {
 
 			reader := bytes.NewReader(output.Main)
 			xast, err := parser.LexParse(reader)
+			if err != nil {
+				// annotate parse errors with a source position
+				// byline and caret highlight (cached for matching)
+				logCache = "" // reset
+				file := &interfaces.SourceFile{FS: output.FS, Path: output.Base + output.Metadata.Main}
+				err = interfaces.HighlightParseError(err, file, logCacher)
+			}
 			if (!fail || !failLexParse) && err != nil {
 				t.Errorf("test #%d: FAIL", index)
 				t.Errorf("test #%d: lex/parse failed with: %+v", index, err)
@@ -791,12 +447,19 @@ func TestAstFunc1(t *testing.T) {
 			}
 			if failLexParse && err != nil {
 				s := err.Error() // convert to string
-				if s != expstr {
+				if !foundErr(s) {
 					t.Errorf("test #%d: FAIL", index)
 					t.Errorf("test #%d: expected different error", index)
 					t.Logf("test #%d: err: %s", index, s)
 					t.Logf("test #%d: exp: %s", index, expstr)
 				}
+
+				// multiline caret matching from logf
+				if s := expFilter(expstr); s != "" && !strings.Contains(logCache, s) {
+					t.Errorf("test #%d: err:\n%s", index, logCache)
+					t.Errorf("test #%d: exp:\n%s", index, s)
+				}
+
 				return // fail happened during lex parse, don't run init/interpolate!
 			}
 			if failLexParse && err == nil {
@@ -821,16 +484,16 @@ func TestAstFunc1(t *testing.T) {
 
 			data := &interfaces.Data{
 				// TODO: add missing fields here if/when needed
-				Fs:       fs,
-				FsURI:    fs.URI(),     // TODO: is this right?
-				Base:     output.Base,  // base dir (absolute path) the metadata file is in
-				Files:    output.Files, // no really needed here afaict
+				Fs:       output.FS,       // formerly: fs
+				FsURI:    output.FS.URI(), // formerly: fs.URI() // TODO: is this right?
+				Base:     output.Base,     // base dir (absolute path) the metadata file is in
+				Files:    output.Files,    // no really needed here afaict
 				Imports:  importVertex,
 				Metadata: output.Metadata,
 				Modules:  "/" + interfaces.ModuleDirectory, // not really needed here afaict
 
 				LexParser:       parser.LexParse,
-				StrInterpolater: interpolate.InterpolateStr,
+				StrInterpolater: interpolate.StrInterpolate,
 
 				Debug: testing.Verbose(), // set via the -test.v flag to `go test`
 				Logf: func(format string, v ...interface{}) {
@@ -846,7 +509,7 @@ func TestAstFunc1(t *testing.T) {
 			}
 			if failInit && err != nil {
 				s := err.Error() // convert to string
-				if s != expstr {
+				if !foundErr(s) {
 					t.Errorf("test #%d: FAIL", index)
 					t.Errorf("test #%d: expected different error", index)
 					t.Logf("test #%d: err: %s", index, s)
@@ -861,9 +524,24 @@ func TestAstFunc1(t *testing.T) {
 			}
 
 			iast, err := xast.Interpolate()
-			if err != nil {
+			if (!fail || !failInterpolate) && err != nil {
 				t.Errorf("test #%d: FAIL", index)
 				t.Errorf("test #%d: interpolate failed with: %+v", index, err)
+				return
+			}
+			if failInterpolate && err != nil {
+				s := err.Error() // convert to string
+				if !foundErr(s) {
+					t.Errorf("test #%d: FAIL", index)
+					t.Errorf("test #%d: expected different error", index)
+					t.Logf("test #%d: err: %s", index, s)
+					t.Logf("test #%d: exp: %s", index, expstr)
+				}
+				return // fail happened during interpolate, don't run setscope!
+			}
+			if failInterpolate && err == nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: interpolate passed, expected fail", index)
 				return
 			}
 
@@ -876,7 +554,7 @@ func TestAstFunc1(t *testing.T) {
 			}
 			if failSetScope && err != nil {
 				s := err.Error() // convert to string
-				if s != expstr {
+				if !foundErr(s) {
 					t.Errorf("test #%d: FAIL", index)
 					t.Errorf("test #%d: expected different error", index)
 					t.Logf("test #%d: err: %s", index, s)
@@ -894,13 +572,20 @@ func TestAstFunc1(t *testing.T) {
 			xlogf := func(format string, v ...interface{}) {
 				logf("unification: "+format, v...)
 			}
-			unifier := &unification.Unifier{
-				AST:    iast,
-				Solver: unification.SimpleInvariantSolverLogger(xlogf),
-				Debug:  testing.Verbose(),
-				Logf:   xlogf,
+			solver, err := unification.LookupDefault()
+			if err != nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: solver lookup failed with: %+v", index, err)
+				return
 			}
-			err = unifier.Unify()
+			unifier := &unification.Unifier{
+				AST:          iast,
+				Solver:       solver,
+				UnifiedState: types.NewUnifiedState(),
+				Debug:        testing.Verbose(),
+				Logf:         xlogf,
+			}
+			err = unifier.Unify(context.TODO())
 			if (!fail || !failUnify) && err != nil {
 				t.Errorf("test #%d: FAIL", index)
 				t.Errorf("test #%d: could not unify types: %+v", index, err)
@@ -908,7 +593,7 @@ func TestAstFunc1(t *testing.T) {
 			}
 			if failUnify && err != nil {
 				s := err.Error() // convert to string
-				if s != expstr {
+				if !foundErr(s) {
 					t.Errorf("test #%d: FAIL", index)
 					t.Errorf("test #%d: expected different error", index)
 					t.Logf("test #%d: err: %s", index, s)
@@ -923,8 +608,7 @@ func TestAstFunc1(t *testing.T) {
 			}
 
 			// build the function graph
-			graph, err := iast.Graph()
-
+			fgraph, err := iast.Graph(interfaces.EmptyEnv()) // XXX: Ask Sam
 			if (!fail || !failGraph) && err != nil {
 				t.Errorf("test #%d: FAIL", index)
 				t.Errorf("test #%d: functions failed with: %+v", index, err)
@@ -932,7 +616,7 @@ func TestAstFunc1(t *testing.T) {
 			}
 			if failGraph && err != nil { // can't process graph if it's nil
 				s := err.Error() // convert to string
-				if s != expstr {
+				if !foundErr(s) {
 					t.Errorf("test #%d: FAIL", index)
 					t.Errorf("test #%d: expected different error", index)
 					t.Logf("test #%d: err: %s", index, s)
@@ -946,25 +630,25 @@ func TestAstFunc1(t *testing.T) {
 				return
 			}
 
-			t.Logf("test #%d: graph: %s", index, graph)
-			for i, v := range graph.Vertices() {
+			t.Logf("test #%d: graph: %s", index, fgraph)
+			for i, v := range fgraph.Vertices() {
 				t.Logf("test #%d: vertex(%d): %+v", index, i, v)
 			}
-			for v1 := range graph.Adjacency() {
-				for v2, e := range graph.Adjacency()[v1] {
+			for v1 := range fgraph.Adjacency() {
+				for v2, e := range fgraph.Adjacency()[v1] {
 					t.Logf("test #%d: edge(%+v): %+v -> %+v", index, e, v1, v2)
 				}
 			}
 			if runGraphviz {
 				t.Logf("test #%d: Running graphviz...", index)
-				if err := graph.ExecGraphviz("dot", "/tmp/graphviz.dot", ""); err != nil {
+				if err := fgraph.ExecGraphviz(context.TODO(), "/tmp/graphviz.dot"); err != nil {
 					t.Errorf("test #%d: FAIL", index)
 					t.Errorf("test #%d: writing graph failed: %+v", index, err)
 					return
 				}
 			}
 
-			str := strings.Trim(graph.Sprint(), "\n") // text format of graph
+			str := strings.Trim(fgraph.Sprint(), "\n") // text format of graph
 			if expstr == magicEmpty {
 				expstr = ""
 			}
@@ -978,6 +662,10 @@ func TestAstFunc1(t *testing.T) {
 			str = sortHack(str)
 			expstr = sortHack(expstr)
 			if expstr != str {
+				if overwriteTest(t, index, txtarFile, archive, str) {
+					return
+				}
+
 				t.Errorf("test #%d: FAIL\n\n", index)
 				t.Logf("test #%d:   actual (g1):\n%s\n\n", index, str)
 				t.Logf("test #%d: expected (g2):\n%s\n\n", index, expstr)
@@ -988,11 +676,11 @@ func TestAstFunc1(t *testing.T) {
 				return
 			}
 
-			for i, v := range graph.Vertices() {
+			for i, v := range fgraph.Vertices() {
 				t.Logf("test #%d: vertex(%d): %+v", index, i, v)
 			}
-			for v1 := range graph.Adjacency() {
-				for v2, e := range graph.Adjacency()[v1] {
+			for v1 := range fgraph.Adjacency() {
+				for v2, e := range fgraph.Adjacency()[v1] {
 					t.Logf("test #%d: edge(%+v): %+v -> %+v", index, e, v1, v2)
 				}
 			}
@@ -1014,6 +702,7 @@ func TestAstFunc2(t *testing.T) {
 	const magicErrorSetScope = "errSetScope: "
 	const magicErrorUnify = "errUnify: "
 	const magicErrorGraph = "errGraph: "
+	const magicErrorStream = "errStream: "
 	const magicErrorInterpret = "errInterpret: "
 	const magicErrorAutoEdge = "errAutoEdge: "
 	const magicEmpty = "# empty!"
@@ -1024,158 +713,36 @@ func TestAstFunc2(t *testing.T) {
 	}
 	t.Logf("tests directory is: %s", dir)
 
-	variables := map[string]interfaces.Expr{
-		"purpleidea": &ast.ExprStr{V: "hello world!"}, // james says hi
-		// TODO: change to a func when we can change hostname dynamically!
-		"hostname": &ast.ExprStr{V: ""}, // NOTE: empty b/c not used
-	}
-	consts := ast.VarPrefixToVariablesScope(vars.ConstNamespace) // strips prefix!
-	addback := vars.ConstNamespace + interfaces.ModuleSep        // add it back...
-	variables, err = ast.MergeExprMaps(variables, consts, addback)
-	if err != nil {
-		t.Errorf("couldn't merge in consts: %+v", err)
-		return
-	}
-
-	scope := &interfaces.Scope{ // global scope
-		Variables: variables,
-		// all the built-in top-level, core functions enter here...
-		Functions: ast.FuncPrefixToFunctionsScope(""), // runs funcs.LookupPrefix
-	}
-
-	type errs struct {
-		failLexParse    bool
-		failInit        bool
-		failInterpolate bool
-		failSetScope    bool
-		failUnify       bool
-		failGraph       bool
-		failInterpret   bool
-		failAutoEdge    bool
-	}
 	type test struct { // an individual test
 		name string
-		path string // relative sub directory path inside tests dir
-		fail bool
-		//graph *pgraph.Graph
-		expstr string // expected output graph in string format
-		errs   errs
+		path string // relative txtar path inside tests dir
 	}
 	testCases := []test{}
-	//{
-	//	graph, _ := pgraph.NewGraph("g")
-	//	testCases = append(testCases, test{
-	//		name:   "simple hello world",
-	//		path:   "hello0/",
-	//		fail:   false,
-	//		expstr: graph.Sprint(),
-	//	})
-	//}
 
 	// build test array automatically from reading the dir
-	files, err := ioutil.ReadDir(dir)
+	files, err := os.ReadDir(dir)
 	if err != nil {
 		t.Errorf("could not read through tests directory: %+v", err)
 		return
 	}
 	sorted := []string{}
 	for _, f := range files {
-		if !f.IsDir() {
+		if f.IsDir() {
 			continue
 		}
+		if !strings.HasSuffix(f.Name(), ".txtar") {
+			continue
+		}
+
 		sorted = append(sorted, f.Name())
 	}
 	sort.Strings(sorted)
 	for _, f := range sorted {
-		graphFile := f + ".output" // expected output graph file
-		graphFileFull := dir + graphFile
-		info, err := os.Stat(graphFileFull)
-		if err != nil || info.IsDir() {
-			t.Errorf("missing: %s", graphFile)
-			t.Errorf("(err: %+v)", err)
-			continue
-		}
-		content, err := ioutil.ReadFile(graphFileFull)
-		if err != nil {
-			t.Errorf("could not read graph file: %+v", err)
-			return
-		}
-		str := string(content) // expected graph
-
-		// if the graph file has a magic error string, it's a failure
-		errStr := ""
-		failLexParse := false
-		failInit := false
-		failInterpolate := false
-		failSetScope := false
-		failUnify := false
-		failGraph := false
-		failInterpret := false
-		failAutoEdge := false
-		if strings.HasPrefix(str, magicError) {
-			errStr = strings.TrimPrefix(str, magicError)
-			str = errStr
-
-			if strings.HasPrefix(str, magicErrorLexParse) {
-				errStr = strings.TrimPrefix(str, magicErrorLexParse)
-				str = errStr
-				failLexParse = true
-			}
-			if strings.HasPrefix(str, magicErrorInit) {
-				errStr = strings.TrimPrefix(str, magicErrorInit)
-				str = errStr
-				failInit = true
-			}
-			if strings.HasPrefix(str, magicInterpolate) {
-				errStr = strings.TrimPrefix(str, magicInterpolate)
-				str = errStr
-				failInterpolate = true
-			}
-			if strings.HasPrefix(str, magicErrorSetScope) {
-				errStr = strings.TrimPrefix(str, magicErrorSetScope)
-				str = errStr
-				failSetScope = true
-			}
-			if strings.HasPrefix(str, magicErrorUnify) {
-				errStr = strings.TrimPrefix(str, magicErrorUnify)
-				str = errStr
-				failUnify = true
-			}
-			if strings.HasPrefix(str, magicErrorGraph) {
-				errStr = strings.TrimPrefix(str, magicErrorGraph)
-				str = errStr
-				failGraph = true
-			}
-			if strings.HasPrefix(str, magicErrorInterpret) {
-				errStr = strings.TrimPrefix(str, magicErrorInterpret)
-				str = errStr
-				failInterpret = true
-			}
-			if strings.HasPrefix(str, magicErrorAutoEdge) {
-				errStr = strings.TrimPrefix(str, magicErrorAutoEdge)
-				str = errStr
-				failAutoEdge = true
-			}
-		}
-
 		// add automatic test case
 		testCases = append(testCases, test{
-			name:   fmt.Sprintf("dir: %s", f),
-			path:   f + "/",
-			fail:   errStr != "",
-			expstr: str,
-			errs: errs{
-				failLexParse:    failLexParse,
-				failInit:        failInit,
-				failInterpolate: failInterpolate,
-				failSetScope:    failSetScope,
-				failUnify:       failUnify,
-				failGraph:       failGraph,
-				failInterpret:   failInterpret,
-				failAutoEdge:    failAutoEdge,
-			},
+			name: f,
+			path: f, // <something>.txtar
 		})
-		//t.Logf("adding: %s", f + "/")
 	}
 
 	if testing.Short() {
@@ -1204,38 +771,267 @@ func TestAstFunc2(t *testing.T) {
 			continue
 		}
 		t.Run(testName, func(t *testing.T) {
-			name, path, fail, expstr, errs := tc.name, tc.path, tc.fail, strings.Trim(tc.expstr, "\n"), tc.errs
-			src := dir + path // location of the test
-			failLexParse := errs.failLexParse
-			failInit := errs.failInit
-			failInterpolate := errs.failInterpolate
-			failSetScope := errs.failSetScope
-			failUnify := errs.failUnify
-			failGraph := errs.failGraph
-			failInterpret := errs.failInterpret
-			failAutoEdge := errs.failAutoEdge
+			name, path := tc.name, tc.path
+			tmpdir := t.TempDir() // gets cleaned up at end, new dir for each call
+			src := tmpdir         // location of the test
+			txtarFile := dir + path
+
+			archive, err := txtar.ParseFile(txtarFile)
+			if err != nil {
+				t.Errorf("err parsing txtar(%s): %+v", txtarFile, err)
+				return
+			}
+			comment := strings.TrimSpace(string(archive.Comment))
+			if comment != "" {
+				t.Logf("comment: %s\n", comment)
+			}
+
+			// copy files out into the test temp directory
+			var testOutput []byte
+			var testConfig []byte
+			found := false
+			for _, file := range archive.Files {
+				if file.Name == "OUTPUT" {
+					testOutput = file.Data
+					found = true
+					continue
+				}
+				if file.Name == "CONFIG" {
+					testConfig = file.Data
+					continue
+				}
+
+				name := filepath.Join(tmpdir, file.Name)
+				dir := filepath.Dir(name)
+				if err := os.MkdirAll(dir, 0750); err != nil {
+					t.Errorf("err making dir(%s): %+v", dir, err)
+					return
+				}
+				if err := os.WriteFile(name, file.Data, 0600); err != nil {
+					t.Errorf("err writing file(%s): %+v", name, err)
+					return
+				}
+			}
+
+			var c ConfigProperties // add pointer to get nil if empty
+			if len(testConfig) > 0 {
+				if err := json.Unmarshal(testConfig, &c); err != nil {
+					t.Errorf("err parsing txtar(%s) config: %+v", txtarFile, err)
+					return
+				}
+			}
+			if testing.Verbose() {
+				t.Logf("config: %+v", c)
+			}
+			c.checkPrerequisites(t)
+
+			testMutex.Lock()               // global
+			count := testCounter[t.Name()] // global
+			testCounter[t.Name()]++
+			testMutex.Unlock()
+
+			if c.MaximumCount != 0 && count >= c.MaximumCount {
+				if count == c.MaximumCount { // logf once
+					t.Logf("Skipping test after count: %d", count)
+				}
+				return
+			}
+
+			if !found { // skip missing tests
+				return
+			}
+
+			expstr := string(testOutput) // expected graph
+			expstrs := []string{}
+
+			// if the graph file has a magic error string, it's a failure
+			errStr := ""
+			errMagic := ""
+			failLexParse := false
+			failInit := false
+			failInterpolate := false
+			failSetScope := false
+			failUnify := false
+			failGraph := false
+			failStream := false
+			failInterpret := false
+			failAutoEdge := false
+			if strings.HasPrefix(expstr, magicError) {
+				expstrs = strings.Split(expstr, "\n")
+				for i := len(expstrs) - 1; i >= 0; i-- { // reverse
+					if strings.TrimSpace(expstrs[i]) == "" {
+						expstrs = append(expstrs[:i], expstrs[i+1:]...) // remove it (from the end)
+						continue
+					}
+					expstrs[i] = strings.TrimPrefix(expstrs[i], magicError) // trim the magic prefix off
+				}
+				errStr = strings.TrimPrefix(expstr, magicError)
+				expstr = errStr
+
+				if strings.HasPrefix(expstr, magicErrorLexParse) {
+					errMagic = magicErrorLexParse
+					errStr = strings.TrimPrefix(expstr, magicErrorLexParse)
+					expstr = errStr
+					failLexParse = true
+				}
+				if strings.HasPrefix(expstr, magicErrorInit) {
+					errMagic = magicErrorInit
+					errStr = strings.TrimPrefix(expstr, magicErrorInit)
+					expstr = errStr
+					failInit = true
+				}
+				if strings.HasPrefix(expstr, magicInterpolate) {
+					errMagic = magicInterpolate
+					errStr = strings.TrimPrefix(expstr, magicInterpolate)
+					expstr = errStr
+					failInterpolate = true
+				}
+				if strings.HasPrefix(expstr, magicErrorSetScope) {
+					errMagic = magicErrorSetScope
+					errStr = strings.TrimPrefix(expstr, magicErrorSetScope)
+					expstr = errStr
+					failSetScope = true
+				}
+				if strings.HasPrefix(expstr, magicErrorUnify) {
+					errMagic = magicErrorUnify
+					errStr = strings.TrimPrefix(expstr, magicErrorUnify)
+					expstr = errStr
+					failUnify = true
+				}
+				if strings.HasPrefix(expstr, magicErrorGraph) {
+					errMagic = magicErrorGraph
+					errStr = strings.TrimPrefix(expstr, magicErrorGraph)
+					expstr = errStr
+					failGraph = true
+				}
+				if strings.HasPrefix(expstr, magicErrorStream) {
+					errMagic = magicErrorStream
+					errStr = strings.TrimPrefix(expstr, magicErrorStream)
+					expstr = errStr
+					failStream = true
+				}
+				if strings.HasPrefix(expstr, magicErrorInterpret) {
+					errMagic = magicErrorInterpret
+					errStr = strings.TrimPrefix(expstr, magicErrorInterpret)
+					expstr = errStr
+					failInterpret = true
+				}
+				if strings.HasPrefix(expstr, magicErrorAutoEdge) {
+					errMagic = magicErrorAutoEdge
+					errStr = strings.TrimPrefix(expstr, magicErrorAutoEdge)
+					expstr = errStr
+					failAutoEdge = true
+				}
+			}
+			for i, x := range expstrs { // trim the magic prefix off
+				expstrs[i] = strings.TrimPrefix(x, errMagic)
+			}
+			foundErr := func(s string) bool {
+				for _, x := range expstrs {
+					if x == s {
+						return true // matched!
+					}
+				}
+				return false // unexpected
+			}
+			foundStreamErr := func(s string) bool {
+				const nilPtr = "0x0000000000"
+
+				for _, x := range expstrs {
+					if x == s {
+						return true // matched!
+					}
+					if !strings.Contains(x, nilPtr) {
+						continue
+					}
+					if x == testMemoryAddressRegexp.ReplaceAllString(s, nilPtr) {
+						return true // matched!
+					}
+				}
+				return false // unexpected
+			}
+
+			fail := errStr != ""
+			expstr = strings.Trim(expstr, "\n")
+
+			logCache := "" // save for comparing logs in tests
+			logCacher := func(format string, v ...interface{}) {
+				logCache += fmt.Sprintf(format, v...) + "\n"
+			}
+			expFilter := func(expstr string) string {
+				parts := strings.SplitN(expstr, "\n", 2)
+				if len(parts) == 1 {
+					return ""
+				}
+				var filtered []string
+				for _, line := range strings.Split(parts[1], "\n") {
+					if !strings.HasPrefix(line, magicError) {
+						filtered = append(filtered, line)
+					}
+				}
+				return strings.Join(filtered, "\n")
+			}
 
 			t.Logf("\n\ntest #%d (%s) ----------------\npath: %s\n\n", index, name, src)
 
 			logf := func(format string, v ...interface{}) {
 				t.Logf(fmt.Sprintf("test #%d", index)+": "+format, v...)
 			}
-			mmFs := afero.NewMemMapFs()
-			afs := &afero.Afero{Fs: mmFs} // wrap so that we're implementing ioutil
-			fs := &util.Fs{Afero: afs}
+			fs := util.NewMemFs()
+
+			// implementation of the Local API (we only expect just this single one)
+			localAPI := (&local.API{
+				Prefix: fmt.Sprintf("%s/", filepath.Join(tmpdir, "local")),
+				Debug:  testing.Verbose(), // set via the -test.v flag to `go test`
+				Logf: func(format string, v ...interface{}) {
+					logf("local: api: "+format, v...)
+				},
+			}).Init()
 
 			// implementation of the World API (alternatives can be substituted in)
-			world := &etcd.World{
-				//Hostname:       hostname,
-				//Client:         etcdClient,
+			var world engine.World
+			world = &etcd.World{
+				//Hostname: hostname,
+				Client: etcdClient.NewClientFromClient(nil), // stub
 				//MetadataPrefix: /fs, // MetadataPrefix
 				//StoragePrefix:  "/storage", // StoragePrefix
 				// TODO: is this correct? (seems to work for testing)
-				StandaloneFs: fs,                // used for static deploys
-				Debug:        testing.Verbose(), // set via the -test.v flag to `go test`
+				StandaloneFs: fs, // used for static deploys
+			}
+			worldInit := &engine.WorldInit{
+				Debug: testing.Verbose(), // set via the -test.v flag to `go test`
 				Logf: func(format string, v ...interface{}) {
 					logf("world: etcd: "+format, v...)
 				},
+			}
+			if err := world.Connect(context.TODO(), worldInit); err != nil {
+				t.Errorf("world Connect failed: %+v", err)
+				return
+			}
+			defer func() {
+				err := errwrap.Wrapf(world.Cleanup(), "world Cleanup failed")
+				if err != nil {
+					t.Errorf("close error: %+v", err)
+				}
+			}()
+
+			variables := map[string]interfaces.Expr{
+				"purpleidea": &ast.ExprStr{V: "hello world!"}, // james says hi
+				// TODO: change to a func when we can change hostname dynamically!
+				"hostname": &ast.ExprStr{V: ""}, // NOTE: empty b/c not used
+			}
+			consts := ast.VarPrefixToVariablesScope(vars.ConstNamespace) // strips prefix!
+			addback := vars.ConstNamespace + interfaces.ModuleSep        // add it back...
+			variables, err = ast.MergeExprMaps(variables, consts, addback)
+			if err != nil {
+				t.Errorf("couldn't merge in consts: %+v", err)
+				return
+			}
+
+			scope := &interfaces.Scope{ // global scope
+				Variables: variables,
+				// all the built-in top-level, core functions enter here...
+				Functions: ast.FuncPrefixToFunctionsScope(""), // runs funcs.LookupPrefix
 			}
 
 			// use this variant, so that we don't copy the dir name
@@ -1283,6 +1079,13 @@ func TestAstFunc2(t *testing.T) {
 
 			reader := bytes.NewReader(output.Main)
 			xast, err := parser.LexParse(reader)
+			if err != nil {
+				// annotate parse errors with a source position
+				// byline and caret highlight (cached for matching)
+				logCache = "" // reset
+				file := &interfaces.SourceFile{FS: output.FS, Path: output.Base + output.Metadata.Main}
+				err = interfaces.HighlightParseError(err, file, logCacher)
+			}
 			if (!fail || !failLexParse) && err != nil {
 				t.Errorf("test #%d: FAIL", index)
 				t.Errorf("test #%d: lex/parse failed with: %+v", index, err)
@@ -1290,12 +1093,19 @@ func TestAstFunc2(t *testing.T) {
 			}
 			if failLexParse && err != nil {
 				s := err.Error() // convert to string
-				if s != expstr {
+				if !foundErr(s) {
 					t.Errorf("test #%d: FAIL", index)
 					t.Errorf("test #%d: expected different error", index)
 					t.Logf("test #%d: err: %s", index, s)
 					t.Logf("test #%d: exp: %s", index, expstr)
 				}
+
+				// multiline caret matching from logf
+				if s := expFilter(expstr); s != "" && !strings.Contains(logCache, s) {
+					t.Errorf("test #%d: err:\n%s", index, logCache)
+					t.Errorf("test #%d: exp:\n%s", index, s)
+				}
+
 				return // fail happened during lex parse, don't run init/interpolate!
 			}
 			if failLexParse && err == nil {
@@ -1318,22 +1128,24 @@ func TestAstFunc2(t *testing.T) {
 			}
 			importGraph.AddVertex(importVertex)
 
+			logCache = "" // reset
 			data := &interfaces.Data{
 				// TODO: add missing fields here if/when needed
-				Fs:       fs,
-				FsURI:    "memmapfs:///", // we're in standalone mode
-				Base:     output.Base,    // base dir (absolute path) the metadata file is in
-				Files:    output.Files,   // no really needed here afaict
+				Fs:       output.FS, // formerly: fs
+				FsURI:    output.FS.URI(),
+				Base:     output.Base,  // base dir (absolute path) the metadata file is in
+				Files:    output.Files, // no really needed here afaict
 				Imports:  importVertex,
 				Metadata: output.Metadata,
 				Modules:  "/" + interfaces.ModuleDirectory, // not really needed here afaict
 
 				LexParser:       parser.LexParse,
-				StrInterpolater: interpolate.InterpolateStr,
+				StrInterpolater: interpolate.StrInterpolate,
 
 				Debug: testing.Verbose(), // set via the -test.v flag to `go test`
 				Logf: func(format string, v ...interface{}) {
 					logf("ast: "+format, v...)
+					logCacher(format, v...) // cache a copy
 				},
 			}
 			// some of this might happen *after* interpolate in SetScope or Unify...
@@ -1345,7 +1157,7 @@ func TestAstFunc2(t *testing.T) {
 			}
 			if failInit && err != nil {
 				s := err.Error() // convert to string
-				if s != expstr {
+				if !foundErr(s) {
 					t.Errorf("test #%d: FAIL", index)
 					t.Errorf("test #%d: expected different error", index)
 					t.Logf("test #%d: err: %s", index, s)
@@ -1367,7 +1179,7 @@ func TestAstFunc2(t *testing.T) {
 			}
 			if failInterpolate && err != nil {
 				s := err.Error() // convert to string
-				if s != expstr {
+				if !foundErr(s) {
 					t.Errorf("test #%d: FAIL", index)
 					t.Errorf("test #%d: expected different error", index)
 					t.Logf("test #%d: err: %s", index, s)
@@ -1390,12 +1202,19 @@ func TestAstFunc2(t *testing.T) {
 			}
 			if failSetScope && err != nil {
 				s := err.Error() // convert to string
-				if s != expstr {
+				if !foundErr(s) {
 					t.Errorf("test #%d: FAIL", index)
 					t.Errorf("test #%d: expected different error", index)
 					t.Logf("test #%d: err: %s", index, s)
 					t.Logf("test #%d: exp: %s", index, expstr)
 				}
+
+				// multiline error matching from logf
+				if s := expFilter(expstr); s != "" && !strings.Contains(logCache, s) {
+					t.Errorf("test #%d: err:\n%s", index, logCache)
+					t.Errorf("test #%d: exp:\n%s", index, s)
+				}
+
 				return // fail happened during set scope, don't run unification!
 			}
 			if failSetScope && err == nil {
@@ -1404,17 +1223,51 @@ func TestAstFunc2(t *testing.T) {
 				return
 			}
 
+			if runGraphviz {
+				t.Logf("test #%d: Running graphviz after setScope...", index)
+
+				// build a graph of the AST, to make sure everything is connected properly
+				graph, err := pgraph.NewGraph("setScope")
+				if err != nil {
+					t.Errorf("test #%d: FAIL", index)
+					t.Errorf("test #%d: could not create setScope graph: %+v", index, err)
+					return
+				}
+				ast, ok := iast.(interfaces.ScopeGrapher)
+				if !ok {
+					t.Errorf("test #%d: FAIL", index)
+					t.Errorf("test #%d: can't graph scope", index)
+					return
+				}
+				ast.ScopeGraph(graph)
+
+				if err := graph.ExecGraphviz(context.TODO(), "/tmp/set-scope.dot"); err != nil {
+					t.Errorf("test #%d: FAIL", index)
+					t.Errorf("test #%d: writing graph failed: %+v", index, err)
+					return
+				}
+			}
+
+			logCache = "" // reset
 			// apply type unification
 			xlogf := func(format string, v ...interface{}) {
 				logf("unification: "+format, v...)
+				logCacher(format, v...) // cache a copy
+			}
+			solver, err := unification.LookupDefault()
+			if err != nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: solver lookup failed with: %+v", index, err)
+				return
 			}
 			unifier := &unification.Unifier{
-				AST:    iast,
-				Solver: unification.SimpleInvariantSolverLogger(xlogf),
-				Debug:  testing.Verbose(),
-				Logf:   xlogf,
+				AST:          iast,
+				Solver:       solver,
+				UnifiedState: types.NewUnifiedState(),
+				Debug:        testing.Verbose(),
+				Logf:         xlogf,
 			}
-			err = unifier.Unify()
+			err = unifier.Unify(context.TODO())
 			if (!fail || !failUnify) && err != nil {
 				t.Errorf("test #%d: FAIL", index)
 				t.Errorf("test #%d: could not unify types: %+v", index, err)
@@ -1422,12 +1275,19 @@ func TestAstFunc2(t *testing.T) {
 			}
 			if failUnify && err != nil {
 				s := err.Error() // convert to string
-				if s != expstr {
+				if !foundErr(s) {
 					t.Errorf("test #%d: FAIL", index)
 					t.Errorf("test #%d: expected different error", index)
 					t.Logf("test #%d: err: %s", index, s)
 					t.Logf("test #%d: exp: %s", index, expstr)
 				}
+
+				// multiline error matching from logf
+				if s := expFilter(expstr); s != "" && !strings.Contains(logCache, s) {
+					t.Errorf("test #%d: err:\n%s", index, logCache)
+					t.Errorf("test #%d: exp:\n%s", index, s)
+				}
+
 				return // fail happened during unification, don't run Graph!
 			}
 			if failUnify && err == nil {
@@ -1435,10 +1295,35 @@ func TestAstFunc2(t *testing.T) {
 				t.Errorf("test #%d: unification passed, expected fail", index)
 				return
 			}
+			// XXX: Should we do a kind of SetType on resources here
+			// to tell the ones with variant fields what their
+			// concrete field types are? They should only be dynamic
+			// in implementation and before unification, and static
+			// once we've unified the specific resource.
+
+			// build the env
+			//fgraph := &pgraph.Graph{Name: "functionGraph"}
+			env := interfaces.EmptyEnv()
+			// XXX: Do we need to do something like this?
+			//for k, v := range scope.Variables {
+			//	g, builtinFunc, err := v.Graph(nil)
+			//	if err != nil {
+			//		t.Errorf("test #%d: FAIL", index)
+			//		t.Errorf("test #%d: calling Graph on builtins errored: %+v", index, err)
+			//		return
+			//	}
+			//	fgraph.AddGraph(g)
+			//	env.Variables[k] = builtinFunc // XXX: Ask Sam (.Functions ???)
+			//}
+			//for k, closure := range scope.Functions {
+			//	env.Functions[k] = &interfaces.Closure{
+			//		Env: interfaces.EmptyEnv(),
+			//		Expr: closure.Expr, // XXX: Ask Sam
+			//	}
+			//}
 
 			// build the function graph
-			graph, err := iast.Graph()
-
+			fgraph, err := iast.Graph(env) // XXX: Ask Sam
 			if (!fail || !failGraph) && err != nil {
 				t.Errorf("test #%d: FAIL", index)
 				t.Errorf("test #%d: functions failed with: %+v", index, err)
@@ -1446,7 +1331,7 @@ func TestAstFunc2(t *testing.T) {
 			}
 			if failGraph && err != nil { // can't process graph if it's nil
 				s := err.Error() // convert to string
-				if s != expstr {
+				if !foundErr(s) {
 					t.Errorf("test #%d: FAIL", index)
 					t.Errorf("test #%d: expected different error", index)
 					t.Logf("test #%d: err: %s", index, s)
@@ -1460,96 +1345,198 @@ func TestAstFunc2(t *testing.T) {
 				return
 			}
 
-			if graph.NumVertices() == 0 { // no funcs to load!
-				t.Errorf("test #%d: FAIL", index)
-				t.Errorf("test #%d: function graph is empty", index)
-				return
+			if fgraph.NumVertices() == 0 { // no funcs to load!
+				//t.Errorf("test #%d: FAIL", index)
+				t.Logf("test #%d: function graph is empty", index)
+				//return // let's test the engine on empty
 			}
 
-			t.Logf("test #%d: graph: %s", index, graph)
-			for i, v := range graph.Vertices() {
+			t.Logf("test #%d: graph: %s", index, fgraph)
+			for i, v := range fgraph.Vertices() {
 				t.Logf("test #%d: vertex(%d): %+v", index, i, v)
 			}
-			for v1 := range graph.Adjacency() {
-				for v2, e := range graph.Adjacency()[v1] {
+			for v1 := range fgraph.Adjacency() {
+				for v2, e := range fgraph.Adjacency()[v1] {
 					t.Logf("test #%d: edge(%+v): %+v -> %+v", index, e, v1, v2)
 				}
 			}
 
 			if runGraphviz {
 				t.Logf("test #%d: Running graphviz...", index)
-				if err := graph.ExecGraphviz("dot", "/tmp/graphviz.dot", ""); err != nil {
+				if err := fgraph.ExecGraphviz(context.TODO(), "/tmp/graphviz.dot"); err != nil {
 					t.Errorf("test #%d: FAIL", index)
 					t.Errorf("test #%d: writing graph failed: %+v", index, err)
 					return
 				}
 			}
 
+			logCache = "" // reset
 			// run the function engine once to get some real output
-			funcs := &funcs.Engine{
-				Graph:    graph,             // not the same as the output graph!
-				Hostname: "",                // NOTE: empty b/c not used
-				World:    world,             // used partially in some tests
-				Debug:    testing.Verbose(), // set via the -test.v flag to `go test`
+			funcs := &dage.Engine{
+				Name:     "test",
+				Hostname: "",       // NOTE: empty b/c not used
+				Local:    localAPI, // used partially in some tests
+				World:    world,    // used partially in some tests
+				//Prefix:   fmt.Sprintf("%s/", filepath.Join(tmpdir, "funcs")),
+				Debug: testing.Verbose(), // set via the -test.v flag to `go test`
 				Logf: func(format string, v ...interface{}) {
 					logf("funcs: "+format, v...)
+					logCacher(format, v...) // cache a copy
 				},
-				Glitch: false, // FIXME: verify this functionality is perfect!
 			}
 
 			logf("function engine initializing...")
-			if err := funcs.Init(); err != nil {
+			if err := funcs.Setup(); err != nil {
 				t.Errorf("test #%d: FAIL", index)
 				t.Errorf("test #%d: init error with func engine: %+v", index, err)
 				return
 			}
+			//defer funcs.Cleanup()
 
-			logf("function engine validating...")
-			if err := funcs.Validate(); err != nil {
+			// XXX: can we type check things somehow?
+			//logf("function engine validating...")
+			//if err := funcs.Validate(); err != nil {
+			//	t.Errorf("test #%d: FAIL", index)
+			//	t.Errorf("test #%d: validate error with func engine: %+v", index, err)
+			//	return
+			//}
+
+			txn := funcs.Txn()
+			defer txn.Free() // remember to call Free()
+			txn.AddGraph(fgraph)
+			if err := txn.Commit(); err != nil {
 				t.Errorf("test #%d: FAIL", index)
-				t.Errorf("test #%d: validate error with func engine: %+v", index, err)
+				t.Errorf("test #%d: run error with initial commit: %+v", index, err)
 				return
 			}
+			defer txn.Reverse() // should remove everything we added
 
 			logf("function engine starting...")
-			// On failure, we expect the caller to run Close() to shutdown all of
-			// the currently initialized (and running) funcs... This is needed if
-			// we successfully ran `Run` but isn't needed only for Init/Validate.
-			if err := funcs.Run(); err != nil {
-				t.Errorf("test #%d: FAIL", index)
-				t.Errorf("test #%d: run error with func engine: %+v", index, err)
-				return
-			}
-			// TODO: cleanup before we print any test failures...
-			defer funcs.Close() // cleanup
-
-			// wait for some activity
-			logf("stream...")
-			stream := funcs.Stream()
-			select {
-			case err, ok := <-stream:
-				if !ok {
-					t.Errorf("test #%d: FAIL", index)
-					t.Errorf("test #%d: stream closed", index)
+			wg := &sync.WaitGroup{}
+			defer wg.Wait()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := funcs.Run(ctx); err != nil {
+					if err == context.Canceled { // normal test shutdown
+						return
+					}
+					// check in funcs.Err() instead.
+					//t.Errorf("test #%d: FAIL", index)
+					//t.Errorf("test #%d: run error with func engine: %+v", index, err)
+				}
+			}()
+			defer func() {
+				err := errwrap.WithoutContext(funcs.Err())
+				if err == context.Canceled { // normal test shutdown
 					return
 				}
-				if err != nil {
+				if err == nil {
+					return
+				}
+
+				if (!fail || !failStream) && err != nil {
 					t.Errorf("test #%d: FAIL", index)
 					t.Errorf("test #%d: stream errored: %+v", index, err)
 					return
 				}
+				if failStream && err != nil {
+					t.Logf("test #%d: stream errored: %+v", index, err)
+					s := err.Error() // convert to string
+					if !foundStreamErr(s) {
+						t.Errorf("test #%d: FAIL", index)
+						t.Errorf("test #%d: expected different error", index)
+						t.Logf("test #%d: err: %s", index, s)
+						t.Logf("test #%d: exp: %s", index, expstr)
+					}
 
-			case <-time.After(60 * time.Second): // blocked functions
-				t.Errorf("test #%d: FAIL", index)
-				t.Errorf("test #%d: stream timeout", index)
-				return
+					// multiline error matching from logf
+					if s := expFilter(expstr); s != "" && !strings.Contains(logCache, s) {
+						t.Errorf("test #%d: err:\n%s", index, logCache)
+						t.Errorf("test #%d: exp:\n%s", index, s)
+					}
+
+					return
+				}
+				if failStream && err == nil {
+					t.Errorf("test #%d: FAIL", index)
+					t.Errorf("test #%d: stream passed, expected fail", index)
+					return
+				}
+			}()
+
+			// Sanity checks for graph size.
+			//if count := funcs.NumVertices(); count != 0 {
+			//	t.Errorf("test #%d: FAIL", index)
+			//	t.Errorf("test #%d: expected empty graph on start, got %d vertices", index, count)
+			//}
+			//defer func() {
+			//	if count := funcs.NumVertices(); count != 0 {
+			//		t.Errorf("test #%d: FAIL", index)
+			//		t.Errorf("test #%d: expected empty graph on exit, got %d vertices", index, count)
+			//	}
+			//}()
+			defer wg.Wait()
+			defer cancel()
+
+			isEmpty := make(chan struct{})
+			if fgraph.NumVertices() == 0 { // no funcs to load!
+				close(isEmpty)
 			}
 
-			// run interpret!
-			funcs.RLock() // in case something is actually changing
-			ograph, err := interpret.Interpret(iast)
-			funcs.RUnlock()
+			// wait for some activity
+			logf("stream...")
+			tableChan := funcs.Stream()
 
+			// sometimes the <-stream seems to constantly (or for a
+			// long time?) win the races against the <-time.After(),
+			// so add some limit to how many times we need to stream
+			max := 1
+			var table interfaces.Table
+		Loop:
+			for {
+				var ok bool
+				select {
+				case table, ok = <-tableChan:
+					if !ok {
+						//t.Errorf("test #%d: FAIL", index) // check in funcs.Err() instead.
+						t.Logf("test #%d: stream closed", index)
+						return
+					}
+
+					t.Logf("test #%d: got stream event!", index)
+					max--
+					if max == 0 {
+						break Loop
+					}
+
+				case <-isEmpty:
+					break Loop
+
+				case <-time.After(10 * time.Second): // blocked functions
+					t.Errorf("test #%d: unblocking because no event was sent by the function engine for a while", index)
+					break Loop
+
+				case <-time.After(60 * time.Second): // blocked functions
+					t.Errorf("test #%d: FAIL", index)
+					t.Errorf("test #%d: stream timeout", index)
+					return
+				}
+			}
+
+			//t.Logf("test #%d: %s", index, funcs.Stats())
+
+			// run interpret!
+			interpreter := &interpret.Interpreter{
+				Debug: testing.Verbose(), // set via the -test.v flag to `go test`
+				Logf: func(format string, v ...interface{}) {
+					logf("interpret: "+format, v...)
+				},
+			}
+
+			ograph, err := interpreter.Interpret(iast, table)
 			if (!fail || !failInterpret) && err != nil {
 				t.Errorf("test #%d: FAIL", index)
 				t.Errorf("test #%d: interpret failed with: %+v", index, err)
@@ -1557,7 +1544,7 @@ func TestAstFunc2(t *testing.T) {
 			}
 			if failInterpret && err != nil { // can't process graph if it's nil
 				s := err.Error() // convert to string
-				if s != expstr {
+				if !foundErr(s) {
 					t.Errorf("test #%d: FAIL", index)
 					t.Errorf("test #%d: expected different error", index)
 					t.Logf("test #%d: err: %s", index, s)
@@ -1572,7 +1559,7 @@ func TestAstFunc2(t *testing.T) {
 			}
 
 			// add automatic edges...
-			err = autoedge.AutoEdge(ograph, testing.Verbose(), logf)
+			err = autoedge.AutoEdge(context.TODO(), ograph, testing.Verbose(), logf)
 			if (!fail || !failAutoEdge) && err != nil {
 				t.Errorf("test #%d: FAIL", index)
 				t.Errorf("test #%d: automatic edges failed with: %+v", index, err)
@@ -1580,7 +1567,7 @@ func TestAstFunc2(t *testing.T) {
 			}
 			if failAutoEdge && err != nil {
 				s := err.Error() // convert to string
-				if s != expstr {
+				if !foundErr(s) {
 					t.Errorf("test #%d: FAIL", index)
 					t.Errorf("test #%d: expected different error", index)
 					t.Logf("test #%d: err: %s", index, s)
@@ -1611,6 +1598,10 @@ func TestAstFunc2(t *testing.T) {
 			str = sortHack(str)
 			expstr = sortHack(expstr)
 			if expstr != str {
+				if overwriteTest(t, index, txtarFile, archive, str) {
+					return
+				}
+
 				t.Errorf("test #%d: FAIL\n\n", index)
 				t.Logf("test #%d:   actual (g1):\n%s\n\n", index, str)
 				t.Logf("test #%d: expected (g2):\n%s\n\n", index, expstr)
@@ -1629,6 +1620,10 @@ func TestAstFunc2(t *testing.T) {
 					t.Logf("test #%d: edge(%+v): %+v -> %+v", index, e, v1, v2)
 				}
 			}
+
+			if !t.Failed() {
+				t.Logf("test #%d: Passed!", index)
+			}
 		})
 	}
 	if testing.Short() {
@@ -1636,245 +1631,1098 @@ func TestAstFunc2(t *testing.T) {
 	}
 }
 
-// TestAstInterpret0 should only be run in limited circumstances. Read the code
-// comments below to see how it is run.
-func TestAstInterpret0(t *testing.T) {
+// TestAstFunc3 is an even more advanced version which also examines parameter
+// values. It briefly runs the function engine and captures output. Only use
+// with stable, static output. It also briefly runs the resource engine too!
+func TestAstFunc3(t *testing.T) {
+	const magicError = "# err: "
+	const magicErrorLexParse = "errLexParse: "
+	const magicErrorInit = "errInit: "
+	const magicInterpolate = "errInterpolate: "
+	const magicErrorSetScope = "errSetScope: "
+	const magicErrorUnify = "errUnify: "
+	const magicErrorGraph = "errGraph: "
+	const magicErrorInterpret = "errInterpret: "
+	const magicErrorAutoEdge = "errAutoEdge: "
+	const magicErrorValidate = "errValidate: "
+	const magicEmpty = "# empty!"
+	dir, err := util.TestDirFull()
+	if err != nil {
+		t.Errorf("could not get tests directory: %+v", err)
+		return
+	}
+	t.Logf("tests directory is: %s", dir)
+
 	type test struct { // an individual test
-		name  string
-		code  string
-		fail  bool
-		graph *pgraph.Graph
+		name string
+		path string // relative txtar path inside tests dir
 	}
 	testCases := []test{}
 
-	{
-		graph, _ := pgraph.NewGraph("g")
-		testCases = append(testCases, test{ // 0
-			"nil",
-			``,
-			false,
-			graph,
-		})
+	// build test array automatically from reading the dir
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		t.Errorf("could not read through tests directory: %+v", err)
+		return
 	}
-	{
-		testCases = append(testCases, test{
-			name: "wrong res field type",
-			code: `
-				test "t1" {
-					stringptr => 42,	# int, not str
-				}
-			`,
-			fail: true,
-		})
-	}
-	{
-		graph, _ := pgraph.NewGraph("g")
-		t1, _ := engine.NewNamedResource("test", "t1")
-		x := t1.(*resources.TestRes)
-		int64ptr := int64(42)
-		x.Int64Ptr = &int64ptr
-		str := "okay cool"
-		x.StringPtr = &str
-		int8ptr := int8(127)
-		int8ptrptr := &int8ptr
-		int8ptrptrptr := &int8ptrptr
-		x.Int8PtrPtrPtr = &int8ptrptrptr
-		graph.AddVertex(t1)
-		testCases = append(testCases, test{
-			name: "resource with three pointer fields",
-			code: `
-				test "t1" {
-					int64ptr => 42,
-					stringptr => "okay cool",
-					int8ptrptrptr => 127,	# super nested
-				}
-			`,
-			fail:  false,
-			graph: graph,
-		})
-	}
-	{
-		graph, _ := pgraph.NewGraph("g")
-		t1, _ := engine.NewNamedResource("test", "t1")
-		x := t1.(*resources.TestRes)
-		stringptr := "wow"
-		x.StringPtr = &stringptr
-		graph.AddVertex(t1)
-		testCases = append(testCases, test{
-			name: "resource with simple string pointer field",
-			code: `
-				test "t1" {
-					stringptr => "wow",
-				}
-			`,
-			graph: graph,
-		})
-	}
-	{
-		// FIXME: add a better vertexCmpFn so we can compare send/recv!
-		graph, _ := pgraph.NewGraph("g")
-		t1, _ := engine.NewNamedResource("test", "t1")
-		{
-			x := t1.(*resources.TestRes)
-			int64Ptr := int64(42)
-			x.Int64Ptr = &int64Ptr
-			graph.AddVertex(t1)
-		}
-		t2, _ := engine.NewNamedResource("test", "t2")
-		{
-			x := t2.(*resources.TestRes)
-			int64Ptr := int64(13)
-			x.Int64Ptr = &int64Ptr
-			graph.AddVertex(t2)
-		}
-		edge := &engine.Edge{
-			Name:   fmt.Sprintf("%s -> %s", t1, t2),
-			Notify: false,
-		}
-		graph.AddEdge(t1, t2, edge)
-		testCases = append(testCases, test{
-			name: "two resources and send/recv edge",
-			code: `
-			test "t1" {
-				int64ptr => 42,
-			}
-			test "t2" {
-				int64ptr => 13,
-			}
-
-			Test["t1"].hello -> Test["t2"].stringptr # send/recv
-			`,
-			graph: graph,
-		})
-	}
-	{
-		graph, _ := pgraph.NewGraph("g")
-		t1, _ := engine.NewNamedResource("test", "t1")
-		x := t1.(*resources.TestRes)
-		stringptr := "this is meta"
-		x.StringPtr = &stringptr
-		m := &engine.MetaParams{
-			Noop:    true, // overwritten
-			Retry:   -1,
-			Delay:   0,
-			Poll:    5,
-			Limit:   4.2,
-			Burst:   3,
-			Sema:    []string{"foo:1", "bar:3"},
-			Rewatch: false,
-			Realize: true,
-		}
-		x.SetMetaParams(m)
-		graph.AddVertex(t1)
-		testCases = append(testCases, test{
-			name: "resource with meta params",
-			code: `
-				test "t1" {
-					stringptr => "this is meta",
-
-					Meta => struct{
-						noop => false,
-						retry => -1,
-						delay => 0,
-						poll => 5,
-						limit => 4.2,
-						burst => 3,
-						sema => ["foo:1", "bar:3",],
-						rewatch => false,
-						realize => true,
-						reverse => true,
-						autoedge => true,
-						autogroup => true,
-					},
-					Meta:noop => true,
-					Meta:reverse => true,
-					Meta:autoedge => true,
-					Meta:autogroup => true,
-				}
-			`,
-			graph: graph,
-		})
-	}
-
-	names := []string{}
-	for index, tc := range testCases { // run all the tests
-		name, code, fail, exp := tc.name, tc.code, tc.fail, tc.graph
-
-		if name == "" {
-			name = "<sub test not named>"
-		}
-		if util.StrInList(name, names) {
-			t.Errorf("test #%d: duplicate sub test name of: %s", index, name)
+	sorted := []string{}
+	for _, f := range files {
+		if f.IsDir() {
 			continue
 		}
-		names = append(names, name)
+		if !strings.HasSuffix(f.Name(), ".txtar") {
+			continue
+		}
+
+		sorted = append(sorted, f.Name())
+	}
+	sort.Strings(sorted)
+	for _, f := range sorted {
+		// add automatic test case
+		testCases = append(testCases, test{
+			name: f,
+			path: f, // <something>.txtar
+		})
+	}
+
+	if testing.Short() {
+		t.Logf("available tests:")
+	}
+	names := []string{}
+	for index, tc := range testCases { // run all the tests
+		if tc.name == "" {
+			t.Errorf("test #%d: not named", index)
+			continue
+		}
+		if util.StrInList(tc.name, names) {
+			t.Errorf("test #%d: duplicate sub test name of: %s", index, tc.name)
+			continue
+		}
+		names = append(names, tc.name)
 
 		//if index != 3 { // hack to run a subset (useful for debugging)
-		//if tc.name != "nil" {
+		//if tc.name != "simple operators" {
 		//	continue
 		//}
 
-		t.Logf("\n\ntest #%d (%s) ----------------\n\n", index, name)
-
-		str := strings.NewReader(code)
-		xast, err := parser.LexParse(str)
-		if err != nil {
-			t.Errorf("test #%d: lex/parse failed with: %+v", index, err)
+		testName := fmt.Sprintf("test #%d (%s)", index, tc.name)
+		if testing.Short() { // make listing tests easier
+			t.Logf("%s", testName)
 			continue
 		}
-		t.Logf("test #%d: AST: %+v", index, xast)
+		t.Run(testName, func(t *testing.T) {
+			name, path := tc.name, tc.path
+			tmpdir := t.TempDir() // gets cleaned up at end, new dir for each call
+			src := tmpdir         // location of the test
+			txtarFile := dir + path
 
-		data := &interfaces.Data{
-			// TODO: add missing fields here if/when needed
-			Debug: testing.Verbose(), // set via the -test.v flag to `go test`
-			Logf: func(format string, v ...interface{}) {
-				t.Logf("ast: "+format, v...)
-			},
-		}
-		// some of this might happen *after* interpolate in SetScope or Unify...
-		if err := xast.Init(data); err != nil {
-			t.Errorf("test #%d: FAIL", index)
-			t.Errorf("test #%d: could not init and validate AST: %+v", index, err)
-			return
-		}
-
-		// these tests only work in certain cases, since this does not
-		// perform type unification, run the function graph engine, and
-		// only gives you limited results... don't expect normal code to
-		// run and produce meaningful things in this test...
-		graph, err := interpret.Interpret(xast)
-
-		if !fail && err != nil {
-			t.Errorf("test #%d: interpret failed with: %+v", index, err)
-			continue
-		}
-		if fail && err == nil {
-			t.Errorf("test #%d: interpret passed, expected fail", index)
-			continue
-		}
-
-		if fail { // can't process graph if it's nil
-			// TODO: match against expected error
-			t.Logf("test #%d: expected fail, error: %+v", index, err)
-			continue
-		}
-
-		t.Logf("test #%d: graph: %+v", index, graph)
-		// TODO: improve: https://github.com/purpleidea/mgmt/issues/199
-		if err := graph.GraphCmp(exp, vertexCmpFn, edgeCmpFn); err != nil {
-			t.Logf("test #%d:   actual (g1): %v%s", index, graph, fullPrint(graph))
-			t.Logf("test #%d: expected (g2): %v%s", index, exp, fullPrint(exp))
-			t.Errorf("test #%d: cmp error:\n%v", index, err)
-			continue
-		}
-
-		for i, v := range graph.Vertices() {
-			t.Logf("test #%d: vertex(%d): %+v", index, i, v)
-		}
-		for v1 := range graph.Adjacency() {
-			for v2, e := range graph.Adjacency()[v1] {
-				t.Logf("test #%d: edge(%+v): %+v -> %+v", index, e, v1, v2)
+			archive, err := txtar.ParseFile(txtarFile)
+			if err != nil {
+				t.Errorf("err parsing txtar(%s): %+v", txtarFile, err)
+				return
 			}
+			comment := strings.TrimSpace(string(archive.Comment))
+			if comment != "" {
+				t.Logf("comment: %s\n", comment)
+			}
+
+			// copy files out into the test temp directory
+			var testOutput []byte
+			var testConfig []byte
+			found := false
+			for _, file := range archive.Files {
+				if file.Name == "OUTPUT" {
+					testOutput = file.Data
+					found = true
+					continue
+				}
+				if file.Name == "CONFIG" {
+					testConfig = file.Data
+					continue
+				}
+
+				name := filepath.Join(tmpdir, file.Name)
+				dir := filepath.Dir(name)
+				if err := os.MkdirAll(dir, 0750); err != nil {
+					t.Errorf("err making dir(%s): %+v", dir, err)
+					return
+				}
+				if err := os.WriteFile(name, file.Data, 0600); err != nil {
+					t.Errorf("err writing file(%s): %+v", name, err)
+					return
+				}
+			}
+
+			var c ConfigProperties // add pointer to get nil if empty
+			if len(testConfig) > 0 {
+				if err := json.Unmarshal(testConfig, &c); err != nil {
+					t.Errorf("err parsing txtar(%s) config: %+v", txtarFile, err)
+					return
+				}
+			}
+			if testing.Verbose() {
+				t.Logf("config: %+v", c)
+			}
+			c.checkPrerequisites(t)
+
+			testMutex.Lock()               // global
+			count := testCounter[t.Name()] // global
+			testCounter[t.Name()]++
+			testMutex.Unlock()
+
+			if c.MaximumCount != 0 && count >= c.MaximumCount {
+				if count == c.MaximumCount { // logf once
+					t.Logf("Skipping test after count: %d", count)
+				}
+				return
+			}
+
+			if !found { // skip missing tests
+				return
+			}
+
+			expstr := string(testOutput) // expected graph
+			expstrs := []string{}
+
+			// if the graph file has a magic error string, it's a failure
+			errStr := ""
+			errMagic := ""
+			failLexParse := false
+			failInit := false
+			failInterpolate := false
+			failSetScope := false
+			failUnify := false
+			failGraph := false
+			failInterpret := false
+			failAutoEdge := false
+			failValidate := false
+			if strings.HasPrefix(expstr, magicError) {
+				expstrs = strings.Split(expstr, "\n")
+				for i := len(expstrs) - 1; i >= 0; i-- { // reverse
+					if strings.TrimSpace(expstrs[i]) == "" {
+						expstrs = append(expstrs[:i], expstrs[i+1:]...) // remove it (from the end)
+						continue
+					}
+					expstrs[i] = strings.TrimPrefix(expstrs[i], magicError) // trim the magic prefix off
+				}
+				errStr = strings.TrimPrefix(expstr, magicError)
+				expstr = errStr
+
+				if strings.HasPrefix(expstr, magicErrorLexParse) {
+					errMagic = magicErrorLexParse
+					errStr = strings.TrimPrefix(expstr, magicErrorLexParse)
+					expstr = errStr
+					failLexParse = true
+				}
+				if strings.HasPrefix(expstr, magicErrorInit) {
+					errMagic = magicErrorInit
+					errStr = strings.TrimPrefix(expstr, magicErrorInit)
+					expstr = errStr
+					failInit = true
+				}
+				if strings.HasPrefix(expstr, magicInterpolate) {
+					errMagic = magicInterpolate
+					errStr = strings.TrimPrefix(expstr, magicInterpolate)
+					expstr = errStr
+					failInterpolate = true
+				}
+				if strings.HasPrefix(expstr, magicErrorSetScope) {
+					errMagic = magicErrorSetScope
+					errStr = strings.TrimPrefix(expstr, magicErrorSetScope)
+					expstr = errStr
+					failSetScope = true
+				}
+				if strings.HasPrefix(expstr, magicErrorUnify) {
+					errMagic = magicErrorUnify
+					errStr = strings.TrimPrefix(expstr, magicErrorUnify)
+					expstr = errStr
+					failUnify = true
+				}
+				if strings.HasPrefix(expstr, magicErrorGraph) {
+					errMagic = magicErrorGraph
+					errStr = strings.TrimPrefix(expstr, magicErrorGraph)
+					expstr = errStr
+					failGraph = true
+				}
+				if strings.HasPrefix(expstr, magicErrorInterpret) {
+					errMagic = magicErrorInterpret
+					errStr = strings.TrimPrefix(expstr, magicErrorInterpret)
+					expstr = errStr
+					failInterpret = true
+				}
+				if strings.HasPrefix(expstr, magicErrorAutoEdge) {
+					errMagic = magicErrorAutoEdge
+					errStr = strings.TrimPrefix(expstr, magicErrorAutoEdge)
+					expstr = errStr
+					failAutoEdge = true
+				}
+				if strings.HasPrefix(expstr, magicErrorValidate) {
+					errMagic = magicErrorValidate
+					errStr = strings.TrimPrefix(expstr, magicErrorValidate)
+					expstr = errStr
+					failValidate = true
+				}
+			}
+			for i, x := range expstrs { // trim the magic prefix off
+				expstrs[i] = strings.TrimPrefix(x, errMagic)
+			}
+			foundErr := func(s string) bool {
+				for _, x := range expstrs {
+					if x == s {
+						return true // matched!
+					}
+				}
+				return false // unexpected
+			}
+
+			fail := errStr != ""
+			expstr = strings.Trim(expstr, "\n")
+
+			t.Logf("\n\ntest #%d (%s) ----------------\npath: %s\n\n", index, name, src)
+
+			logf := func(format string, v ...interface{}) {
+				t.Logf(fmt.Sprintf("test #%d", index)+": "+format, v...)
+			}
+			fs := util.NewMemFs()
+
+			// implementation of the Local API (we only expect just this single one)
+			localAPI := (&local.API{
+				Prefix: fmt.Sprintf("%s/", filepath.Join(tmpdir, "local")),
+				Debug:  testing.Verbose(), // set via the -test.v flag to `go test`
+				Logf: func(format string, v ...interface{}) {
+					logf("local: api: "+format, v...)
+				},
+			}).Init()
+
+			// implementation of the World API (alternatives can be substituted in)
+			var world engine.World
+			world = &etcd.World{
+				//Hostname: hostname,
+				Client: etcdClient.NewClientFromClient(nil), // stub
+				//MetadataPrefix: /fs, // MetadataPrefix
+				//StoragePrefix:  "/storage", // StoragePrefix
+				// TODO: is this correct? (seems to work for testing)
+				StandaloneFs: fs, // used for static deploys
+			}
+			worldInit := &engine.WorldInit{
+				Debug: testing.Verbose(), // set via the -test.v flag to `go test`
+				Logf: func(format string, v ...interface{}) {
+					logf("world: etcd: "+format, v...)
+				},
+			}
+			if err := world.Connect(context.TODO(), worldInit); err != nil {
+				t.Errorf("world Connect failed: %+v", err)
+				return
+			}
+			defer func() {
+				err := errwrap.Wrapf(world.Cleanup(), "world Cleanup failed")
+				if err != nil {
+					t.Errorf("close error: %+v", err)
+				}
+			}()
+
+			variables := map[string]interfaces.Expr{
+				"purpleidea": &ast.ExprStr{V: "hello world!"}, // james says hi
+				// TODO: change to a func when we can change hostname dynamically!
+				"hostname": &ast.ExprStr{V: ""}, // NOTE: empty b/c not used
+			}
+			consts := ast.VarPrefixToVariablesScope(vars.ConstNamespace) // strips prefix!
+			addback := vars.ConstNamespace + interfaces.ModuleSep        // add it back...
+			variables, err = ast.MergeExprMaps(variables, consts, addback)
+			if err != nil {
+				t.Errorf("couldn't merge in consts: %+v", err)
+				return
+			}
+
+			scope := &interfaces.Scope{ // global scope
+				Variables: variables,
+				// all the built-in top-level, core functions enter here...
+				Functions: ast.FuncPrefixToFunctionsScope(""), // runs funcs.LookupPrefix
+			}
+
+			// use this variant, so that we don't copy the dir name
+			// this is the equivalent to running `rsync -a src/ /`
+			if err := util.CopyDiskContentsToFs(fs, src, "/", false); err != nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: CopyDiskContentsToFs failed: %+v", index, err)
+				return
+			}
+
+			// this shows us what we pulled in from the test dir:
+			tree0, err := util.FsTree(fs, "/")
+			if err != nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: FsTree failed: %+v", index, err)
+				return
+			}
+			logf("tree:\n%s", tree0)
+
+			input := "/"
+			logf("input: %s", input)
+
+			output, err := inputs.ParseInput(input, fs) // raw code can be passed in
+			if err != nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: ParseInput failed: %+v", index, err)
+				return
+			}
+			for _, fn := range output.Workers {
+				if err := fn(fs); err != nil {
+					t.Errorf("test #%d: FAIL", index)
+					t.Errorf("test #%d: worker execution failed: %+v", index, err)
+					return
+				}
+			}
+			tree, err := util.FsTree(fs, "/")
+			if err != nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: FsTree failed: %+v", index, err)
+				return
+			}
+			logf("tree:\n%s", tree)
+
+			logf("main:\n%s", output.Main) // debug
+
+			reader := bytes.NewReader(output.Main)
+			xast, err := parser.LexParse(reader)
+			if err != nil {
+				// annotate parse errors with a source position byline
+				file := &interfaces.SourceFile{FS: output.FS, Path: output.Base + output.Metadata.Main}
+				err = interfaces.HighlightParseError(err, file, nil)
+			}
+			if (!fail || !failLexParse) && err != nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: lex/parse failed with: %+v", index, err)
+				return
+			}
+			if failLexParse && err != nil {
+				s := err.Error() // convert to string
+				if !foundErr(s) {
+					t.Errorf("test #%d: FAIL", index)
+					t.Errorf("test #%d: expected different error", index)
+					t.Logf("test #%d: err: %s", index, s)
+					t.Logf("test #%d: exp: %s", index, expstr)
+				}
+				return // fail happened during lex parse, don't run init/interpolate!
+			}
+			if failLexParse && err == nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: lex/parse passed, expected fail", index)
+				return
+			}
+
+			t.Logf("test #%d: AST: %+v", index, xast)
+
+			importGraph, err := pgraph.NewGraph("importGraph")
+			if err != nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: could not create graph: %+v", index, err)
+				return
+			}
+			importVertex := &pgraph.SelfVertex{
+				Name:  "",          // first node is the empty string
+				Graph: importGraph, // store a reference to ourself
+			}
+			importGraph.AddVertex(importVertex)
+
+			data := &interfaces.Data{
+				// TODO: add missing fields here if/when needed
+				Fs:       output.FS, // formerly: fs
+				FsURI:    output.FS.URI(),
+				Base:     output.Base,  // base dir (absolute path) the metadata file is in
+				Files:    output.Files, // no really needed here afaict
+				Imports:  importVertex,
+				Metadata: output.Metadata,
+				Modules:  "/" + interfaces.ModuleDirectory, // not really needed here afaict
+
+				LexParser:       parser.LexParse,
+				StrInterpolater: interpolate.StrInterpolate,
+
+				Debug: testing.Verbose(), // set via the -test.v flag to `go test`
+				Logf: func(format string, v ...interface{}) {
+					logf("ast: "+format, v...)
+				},
+			}
+			// some of this might happen *after* interpolate in SetScope or Unify...
+			err = xast.Init(data)
+			if (!fail || !failInit) && err != nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: could not init and validate AST: %+v", index, err)
+				return
+			}
+			if failInit && err != nil {
+				s := err.Error() // convert to string
+				if !foundErr(s) {
+					t.Errorf("test #%d: FAIL", index)
+					t.Errorf("test #%d: expected different error", index)
+					t.Logf("test #%d: err: %s", index, s)
+					t.Logf("test #%d: exp: %s", index, expstr)
+				}
+				return // fail happened during lex parse, don't run init/interpolate!
+			}
+			if failInit && err == nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: Init passed, expected fail", index)
+				return
+			}
+
+			iast, err := xast.Interpolate()
+			if (!fail || !failInterpolate) && err != nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: Interpolate failed with: %+v", index, err)
+				return
+			}
+			if failInterpolate && err != nil {
+				s := err.Error() // convert to string
+				if !foundErr(s) {
+					t.Errorf("test #%d: FAIL", index)
+					t.Errorf("test #%d: expected different error", index)
+					t.Logf("test #%d: err: %s", index, s)
+					t.Logf("test #%d: exp: %s", index, expstr)
+				}
+				return // fail happened during lex parse, don't run init/interpolate!
+			}
+			if failInterpolate && err == nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: Interpolate passed, expected fail", index)
+				return
+			}
+
+			// propagate the scope down through the AST...
+			err = iast.SetScope(scope)
+			if (!fail || !failSetScope) && err != nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: could not set scope: %+v", index, err)
+				return
+			}
+			if failSetScope && err != nil {
+				s := err.Error() // convert to string
+				if !foundErr(s) {
+					t.Errorf("test #%d: FAIL", index)
+					t.Errorf("test #%d: expected different error", index)
+					t.Logf("test #%d: err: %s", index, s)
+					t.Logf("test #%d: exp: %s", index, expstr)
+				}
+				return // fail happened during set scope, don't run unification!
+			}
+			if failSetScope && err == nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: set scope passed, expected fail", index)
+				return
+			}
+
+			if runGraphviz {
+				t.Logf("test #%d: Running graphviz after setScope...", index)
+
+				// build a graph of the AST, to make sure everything is connected properly
+				graph, err := pgraph.NewGraph("setScope")
+				if err != nil {
+					t.Errorf("test #%d: FAIL", index)
+					t.Errorf("test #%d: could not create setScope graph: %+v", index, err)
+					return
+				}
+				ast, ok := iast.(interfaces.ScopeGrapher)
+				if !ok {
+					t.Errorf("test #%d: FAIL", index)
+					t.Errorf("test #%d: can't graph scope", index)
+					return
+				}
+				ast.ScopeGraph(graph)
+
+				if err := graph.ExecGraphviz(context.TODO(), "/tmp/set-scope.dot"); err != nil {
+					t.Errorf("test #%d: FAIL", index)
+					t.Errorf("test #%d: writing graph failed: %+v", index, err)
+					return
+				}
+			}
+
+			// apply type unification
+			xlogf := func(format string, v ...interface{}) {
+				logf("unification: "+format, v...)
+			}
+			solver, err := unification.LookupDefault()
+			if err != nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: solver lookup failed with: %+v", index, err)
+				return
+			}
+			unifier := &unification.Unifier{
+				AST:          iast,
+				Solver:       solver,
+				UnifiedState: types.NewUnifiedState(),
+				Debug:        testing.Verbose(),
+				Logf:         xlogf,
+			}
+			err = unifier.Unify(context.TODO())
+			if (!fail || !failUnify) && err != nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: could not unify types: %+v", index, err)
+				return
+			}
+			if failUnify && err != nil {
+				s := err.Error() // convert to string
+				if !foundErr(s) {
+					t.Errorf("test #%d: FAIL", index)
+					t.Errorf("test #%d: expected different error", index)
+					t.Logf("test #%d: err: %s", index, s)
+					t.Logf("test #%d: exp: %s", index, expstr)
+				}
+				return // fail happened during unification, don't run Graph!
+			}
+			if failUnify && err == nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: unification passed, expected fail", index)
+				return
+			}
+			// XXX: Should we do a kind of SetType on resources here
+			// to tell the ones with variant fields what their
+			// concrete field types are? They should only be dynamic
+			// in implementation and before unification, and static
+			// once we've unified the specific resource.
+
+			// build the function graph
+			fgraph, err := iast.Graph(interfaces.EmptyEnv()) // XXX: Ask Sam
+			if (!fail || !failGraph) && err != nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: functions failed with: %+v", index, err)
+				return
+			}
+			if failGraph && err != nil { // can't process graph if it's nil
+				s := err.Error() // convert to string
+				if !foundErr(s) {
+					t.Errorf("test #%d: FAIL", index)
+					t.Errorf("test #%d: expected different error", index)
+					t.Logf("test #%d: err: %s", index, s)
+					t.Logf("test #%d: exp: %s", index, expstr)
+				}
+				return
+			}
+			if failGraph && err == nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: functions passed, expected fail", index)
+				return
+			}
+
+			if fgraph.NumVertices() == 0 { // no funcs to load!
+				//t.Errorf("test #%d: FAIL", index)
+				t.Logf("test #%d: function graph is empty", index)
+				//return // let's test the engine on empty
+			}
+
+			t.Logf("test #%d: graph: %s", index, fgraph)
+			for i, v := range fgraph.Vertices() {
+				t.Logf("test #%d: vertex(%d): %+v", index, i, v)
+			}
+			for v1 := range fgraph.Adjacency() {
+				for v2, e := range fgraph.Adjacency()[v1] {
+					t.Logf("test #%d: edge(%+v): %+v -> %+v", index, e, v1, v2)
+				}
+			}
+
+			if runGraphviz {
+				t.Logf("test #%d: Running graphviz...", index)
+				if err := fgraph.ExecGraphviz(context.TODO(), "/tmp/graphviz.dot"); err != nil {
+					t.Errorf("test #%d: FAIL", index)
+					t.Errorf("test #%d: writing graph failed: %+v", index, err)
+					return
+				}
+			}
+
+			// run the function engine once to get some real output
+			funcs := &dage.Engine{
+				Name:     "test",
+				Hostname: "",       // NOTE: empty b/c not used
+				Local:    localAPI, // used partially in some tests
+				World:    world,    // used partially in some tests
+				//Prefix:   fmt.Sprintf("%s/", filepath.Join(tmpdir, "funcs")),
+				Debug: testing.Verbose(), // set via the -test.v flag to `go test`
+				Logf: func(format string, v ...interface{}) {
+					logf("funcs: "+format, v...)
+				},
+			}
+
+			logf("function engine initializing...")
+			if err := funcs.Setup(); err != nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: init error with func engine: %+v", index, err)
+				return
+			}
+			//defer funcs.Cleanup()
+
+			// XXX: can we type check things somehow?
+			//logf("function engine validating...")
+			//if err := funcs.Validate(); err != nil {
+			//	t.Errorf("test #%d: FAIL", index)
+			//	t.Errorf("test #%d: validate error with func engine: %+v", index, err)
+			//	return
+			//}
+
+			txn := funcs.Txn()
+			defer txn.Free() // remember to call Free()
+			txn.AddGraph(fgraph)
+			if err := txn.Commit(); err != nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: run error with initial commit: %+v", index, err)
+				return
+			}
+			defer txn.Reverse() // should remove everything we added
+
+			logf("function engine starting...")
+			wg := &sync.WaitGroup{}
+			defer wg.Wait()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := funcs.Run(ctx); err != nil {
+					if err == context.Canceled { // normal test shutdown
+						return
+					}
+					// check in funcs.Err() instead.
+					//t.Errorf("test #%d: FAIL", index)
+					//t.Errorf("test #%d: run error with func engine: %+v", index, err)
+				}
+			}()
+			defer func() {
+				err := errwrap.WithoutContext(funcs.Err())
+				if err == context.Canceled { // normal test shutdown
+					return
+				}
+				if err == nil {
+					return
+				}
+
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: stream errored: %+v", index, err)
+				return
+
+				//if (!fail || !failStream) && err != nil {
+				//	t.Errorf("test #%d: FAIL", index)
+				//	t.Errorf("test #%d: stream errored: %+v", index, err)
+				//	return
+				//}
+				//if failStream && err != nil {
+				//	t.Logf("test #%d: stream errored: %+v", index, err)
+				//	// Stream errors often have pointers in them, so don't compare for now.
+				//	//s := err.Error() // convert to string
+				//	//if !foundErr(s) {
+				//	//	t.Errorf("test #%d: FAIL", index)
+				//	//	t.Errorf("test #%d: expected different error", index)
+				//	//	t.Logf("test #%d: err: %s", index, s)
+				//	//	t.Logf("test #%d: exp: %s", index, expstr)
+				//	//}
+				//	return
+				//}
+				//if failStream && err == nil {
+				//	t.Errorf("test #%d: FAIL", index)
+				//	t.Errorf("test #%d: stream passed, expected fail", index)
+				//	return
+				//}
+			}()
+
+			// Sanity checks for graph size.
+			//if count := funcs.NumVertices(); count != 0 {
+			//	t.Errorf("test #%d: FAIL", index)
+			//	t.Errorf("test #%d: expected empty graph on start, got %d vertices", index, count)
+			//}
+			//defer func() {
+			//	if count := funcs.NumVertices(); count != 0 {
+			//		t.Errorf("test #%d: FAIL", index)
+			//		t.Errorf("test #%d: expected empty graph on exit, got %d vertices", index, count)
+			//	}
+			//}()
+			defer wg.Wait()
+			defer cancel()
+
+			isEmpty := make(chan struct{})
+			if fgraph.NumVertices() == 0 { // no funcs to load!
+				close(isEmpty)
+			}
+
+			// wait for some activity
+			logf("stream...")
+			tableChan := funcs.Stream()
+
+			// sometimes the <-stream seems to constantly (or for a
+			// long time?) win the races against the <-time.After(),
+			// so add some limit to how many times we need to stream
+			max := 1
+			var table interfaces.Table
+		Loop:
+			for {
+				var ok bool
+				select {
+				case table, ok = <-tableChan:
+					if !ok {
+						//t.Errorf("test #%d: FAIL", index) // check in funcs.Err() instead.
+						t.Errorf("test #%d: FAIL", index) // check in funcs.Err() instead.
+						t.Logf("test #%d: stream closed", index)
+						return
+					}
+					//if err != nil {
+					//	t.Errorf("test #%d: FAIL", index)
+					//	t.Errorf("test #%d: stream errored: %+v", index, err)
+					//	return
+					//}
+					t.Logf("test #%d: got stream event!", index)
+					max--
+					if max == 0 {
+						break Loop
+					}
+
+				case <-isEmpty:
+					break Loop
+
+				case <-time.After(10 * time.Second): // blocked functions
+					t.Errorf("test #%d: unblocking because no event was sent by the function engine for a while", index)
+					break Loop
+
+				case <-time.After(60 * time.Second): // blocked functions
+					t.Errorf("test #%d: FAIL", index)
+					t.Errorf("test #%d: stream timeout", index)
+					return
+				}
+			}
+
+			//t.Logf("test #%d: %s", index, funcs.Stats())
+
+			// run interpret!
+
+			interpreter := &interpret.Interpreter{
+				Debug: testing.Verbose(), // set via the -test.v flag to `go test`
+				Logf: func(format string, v ...interface{}) {
+					logf("interpret: "+format, v...)
+				},
+			}
+
+			ograph, err := interpreter.Interpret(iast, table)
+			if (!fail || !failInterpret) && err != nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: interpret failed with: %+v", index, err)
+				return
+			}
+			if failInterpret && err != nil { // can't process graph if it's nil
+				s := err.Error() // convert to string
+				if !foundErr(s) {
+					t.Errorf("test #%d: FAIL", index)
+					t.Errorf("test #%d: expected different error", index)
+					t.Logf("test #%d: err: %s", index, s)
+					t.Logf("test #%d: exp: %s", index, expstr)
+				}
+				return
+			}
+			if failInterpret && err == nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: interpret passed, expected fail", index)
+				return
+			}
+
+			// add automatic edges...
+			// TODO: use ge.AutoEdge() instead?
+			err = autoedge.AutoEdge(context.TODO(), ograph, testing.Verbose(), logf)
+			if (!fail || !failAutoEdge) && err != nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: automatic edges failed with: %+v", index, err)
+				return
+			}
+			if failAutoEdge && err != nil {
+				s := err.Error() // convert to string
+				if !foundErr(s) {
+					t.Errorf("test #%d: FAIL", index)
+					t.Errorf("test #%d: expected different error", index)
+					t.Logf("test #%d: err: %s", index, s)
+					t.Logf("test #%d: exp: %s", index, expstr)
+				}
+				return
+			}
+			if failAutoEdge && err == nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: automatic edges passed, expected fail", index)
+				return
+			}
+
+			// TODO: perform autogrouping?
+
+			// TODO: perform reversals?
+
+			t.Logf("test #%d: graph: %+v", index, ograph)
+
+			// setup converger
+			convergerTimeout := 5
+			converged, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			stateFns := converger.StateFns{}
+			stateFns["converged-exit"] = func(ctx context.Context, isConverged bool) error {
+				if isConverged {
+					logf("converged for %d seconds, exiting!", convergerTimeout)
+					cancel() // trigger an exit!
+				}
+				return nil
+			}
+
+			converger := &converger.Coordinator{
+				Timeout:  convergerTimeout,
+				StateFns: stateFns,
+
+				Debug: testing.Verbose(),
+				Logf: func(format string, v ...interface{}) {
+					logf("converger: "+format, v...)
+				},
+			}
+			if err := converger.Init(); err != nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: can't init converger", index)
+				return
+			}
+
+			convergerCtx, convergerCancel := context.WithCancel(context.Background())
+			defer convergerCancel()
+
+			// TODO: waitgroup ?
+			go func() {
+				err := converger.Run(convergerCtx, false) // true to start paused
+				if err == nil || err == context.Canceled {
+					return
+				}
+				t.Errorf("converger run failed: %+v", err)
+			}()
+
+			// run engine a bit so that send/recv happens
+			ge := &graph.Engine{
+				Program: "testing", // TODO: name it mgmt?
+				//Version:   obj.Version,
+				Hostname:  "localhost",
+				Converger: converger,
+				Local:     localAPI,
+				World:     world,
+				Prefix:    fmt.Sprintf("%s/", filepath.Join(tmpdir, "engine")),
+				Debug:     testing.Verbose(),
+				Logf: func(format string, v ...interface{}) {
+					logf("engine: "+format, v...)
+				},
+			}
+			if err := ge.Init(); err != nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: engine Init failed with: %+v", index, err)
+				return
+			}
+			defer func() {
+				// skip errors if failValidate is true since it
+				// would cause an error here too as well...
+				if err := ge.Shutdown(); err != nil && !failValidate {
+					// TODO: cause the final exit code to be non-zero
+					t.Errorf("test #%d: FAIL", index)
+					t.Errorf("test #%d: engine Shutdown failed with: %+v", index, err)
+					return
+				}
+			}()
+
+			if err := ge.Load(ograph); err != nil { // copy in new graph
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: error copying in new graph: %+v", index, err)
+				return
+			}
+
+			err = ge.Validate() // validate the new graph
+			if (!fail || !failValidate) && err != nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: error validating the new graph: %+v", index, err)
+				return
+			}
+			if failValidate && err != nil {
+				s := err.Error() // convert to string
+				if !foundErr(s) {
+					t.Errorf("test #%d: FAIL", index)
+					t.Errorf("test #%d: expected different error", index)
+					t.Logf("test #%d: err: %s", index, s)
+					t.Logf("test #%d: exp: %s", index, expstr)
+				}
+				return
+			}
+			if failValidate && err == nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: validate passed, expected fail", index)
+				return
+			}
+
+			// TODO: apply the global metaparams to the graph
+
+			// XXX: can we change this into a ge.Apply operation?
+			// run autogroup; modifies the graph
+			if err := ge.AutoGroup(context.TODO(), &autogroup.CachedNonReachabilityGrouper{}); err != nil {
+				//ge.Abort() // delete graph
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: error running autogrouping: %+v", index, err)
+				return
+			}
+
+			if err := ge.Pause(); err != nil { // sync
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: error pausing: %+v", index, err)
+				return
+			}
+			if err := ge.Commit(context.Background()); err != nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: error running commit: %+v", index, err)
+				return
+			}
+			if err := ge.Resume(); err != nil { // sync
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: error resuming graph: %+v", index, err)
+				return
+			}
+			// We're running now, so we owe the deferred Shutdown above
+			// a pause. This runs before it, since defers are LIFO, and
+			// it only exists on the paths where we actually resumed.
+			defer func() {
+				if err := ge.Pause(); err != nil { // sync
+					t.Errorf("test #%d: FAIL", index)
+					t.Errorf("test #%d: error pausing: %+v", index, err)
+				}
+			}()
+
+			// wait for converger instead...
+			select {
+			case <-converged.Done():
+			case <-time.After(5 * time.Second): // temporary
+
+				// XXX: add this when we debug converger
+				//case <-time.After(60 * time.Second): // blocked or non-converged engine?
+				//	t.Errorf("test #%d: FAIL", index)
+				//	t.Errorf("test #%d: stream timeout", index)
+				//	return
+			}
+
+			ngraph := ge.Graph()
+
+			t.Logf("test #%d: graph: %+v", index, ngraph)
+			str := strings.Trim(ngraph.Sprint(), "\n") // text format of output graph
+
+			for _, v := range ngraph.Vertices() {
+				res, ok := v.(engine.Res)
+				if !ok {
+					t.Errorf("test #%d: FAIL\n\n", index)
+					t.Logf("test #%d: unexpected non-resource: %+v", index, v)
+					return
+				}
+
+				s, err := stringResFields(res)
+				if err != nil {
+					t.Errorf("test #%d: FAIL\n\n", index)
+					t.Logf("test #%d: can't read resource: %+v", index, err)
+					return
+				}
+				if str != "" {
+					str += "\n"
+				}
+				str += s
+			}
+
+			if expstr == magicEmpty {
+				expstr = ""
+			}
+			// XXX: something isn't consistent, and I can't figure
+			// out what, so workaround this by sorting these :(
+			sortHack := func(x string) string {
+				l := strings.Split(strings.TrimSpace(x), "\n")
+				sort.Strings(l)
+				return strings.TrimSpace(strings.Join(l, "\n"))
+			}
+			str = sortHack(str)
+			expstr = sortHack(expstr)
+			if expstr != str {
+				if overwriteTest(t, index, txtarFile, archive, str) {
+					return
+				}
+
+				t.Errorf("test #%d: FAIL\n\n", index)
+				t.Logf("test #%d:   actual (g1):\n%s\n\n", index, str)
+				t.Logf("test #%d: expected (g2):\n%s\n\n", index, expstr)
+				diff := pretty.Compare(str, expstr)
+				if diff != "" { // bonus
+					t.Logf("test #%d: diff:\n%s", index, diff)
+				}
+				return
+			}
+
+			for i, v := range ngraph.Vertices() {
+				t.Logf("test #%d: vertex(%d): %+v", index, i, v)
+			}
+			for v1 := range ngraph.Adjacency() {
+				for v2, e := range ngraph.Adjacency()[v1] {
+					t.Logf("test #%d: edge(%+v): %+v -> %+v", index, e, v1, v2)
+				}
+			}
+
+			if !t.Failed() {
+				t.Logf("test #%d: Passed!", index)
+			}
+		})
+	}
+	if testing.Short() {
+		t.Skip("skipping all tests...")
+	}
+}
+
+// overwriteTest is a hack to update existing tests if their expected output
+// changes. This should only be used when all tests pass and we edit the format
+// of the expected output in some way.
+func overwriteTest(t *testing.T, index int, txtarFile string, archive *txtar.Archive, str string) bool {
+	if !doOverwriteTest {
+		return false // skip!
+	}
+	for i, x := range archive.Files {
+		if x.Name == "OUTPUT" {
+			// Set directly, no ptr!
+			archive.Files[i].Data = []byte(str)
 		}
 	}
+	data := txtar.Format(archive)
+	if err := os.WriteFile(txtarFile, data, 0600); err != nil {
+		t.Errorf("test #%d: FAIL", index)
+		t.Errorf("test #%d: error: %+v", index, err)
+		return false
+	}
+	t.Logf("test #%d: wrote new test to: %s", index, txtarFile)
+	return true
+}
+
+// stringResFields is a helper function to store a resource graph as a text
+// format for test comparisons. This also adds a line for each vertex as well!
+func stringResFields(res engine.Res) (string, error) {
+	m, err := engineUtil.ResToParamValues(res)
+	if err != nil {
+		return "", errwrap.Wrapf(err, "can't read resource %s", res)
+	}
+	str := ""
+	keys := []string{}
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // sort for determinism
+	for _, field := range keys {
+		v := m[field]
+		str += fmt.Sprintf("Field: %s[%s].%s = %s\n", res.Kind(), res.Name(), field, v)
+	}
+
+	groupableRes, ok := res.(engine.GroupableRes)
+	if !ok {
+		return str, nil
+	}
+	for _, x := range groupableRes.GetGroup() { // grouped elements
+		s, err := stringResFields(x) // recurse
+		if err != nil {
+			return "", err
+		}
+		s += fmt.Sprintf("Vertex: %s\n", x) // add one for the res itself!
+
+		// add a prefix to each line?
+		s = strings.Trim(s, "\n") // trim trailing newlines
+		for _, f := range strings.Split(s, "\n") {
+			str += fmt.Sprintf("Group: %s: ", res) + f + "\n"
+		}
+		//str += s
+	}
+	return str, nil
 }

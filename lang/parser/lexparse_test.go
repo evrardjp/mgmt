@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,9 +13,21 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
-// +build !root
+//go:build !root
 
 package parser
 
@@ -23,18 +35,20 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/purpleidea/mgmt/lang/ast"
-	"github.com/purpleidea/mgmt/lang/funcs"
+	"github.com/purpleidea/mgmt/lang/funcs/operators"
 	"github.com/purpleidea/mgmt/lang/interfaces"
 	"github.com/purpleidea/mgmt/lang/types"
-	langutil "github.com/purpleidea/mgmt/lang/util"
+	langUtil "github.com/purpleidea/mgmt/lang/util"
 	"github.com/purpleidea/mgmt/util"
 
-	"github.com/davecgh/go-spew/spew"
+	godiff "github.com/kylelemons/godebug/diff"
 	"github.com/kylelemons/godebug/pretty"
+	"github.com/sanity-io/litter"
 )
 
 func TestLexParse0(t *testing.T) {
@@ -158,11 +172,10 @@ func TestLexParse0(t *testing.T) {
 		})
 	}
 	{
-		// TODO: skip trailing comma requirement on one-liners
 		testCases = append(testCases, test{
 			name: "two lists",
 			code: `
-			$somelist = [42, 0, -13,]
+			$somelist = [42, 0, -13]
 			$somelonglist = [
 				"hello",
 				"and",
@@ -249,8 +262,8 @@ func TestLexParse0(t *testing.T) {
 		testCases = append(testCases, test{
 			name: "some lists",
 			code: `
-			$intlist []int = [42, -0, 13,]
-			$intlistnested [][]int = [[42,], [], [100, -0,], [-13,],]
+			$intlist []int = [42, -0, 13]
+			$intlistnested [][]int = [[42], [], [100, -0], [-13]]
 			`,
 			fail: false,
 			//exp: ???, // FIXME: add the expected AST
@@ -260,7 +273,7 @@ func TestLexParse0(t *testing.T) {
 		testCases = append(testCases, test{
 			name: "maps 1",
 			code: `
-			# make sure the "str:" part doesn't match a single ident
+			# make sure the "str:" part does not match a single ident
 			$strmap map{str: int} = {
 				"key1" => 42,
 				"key2" => -13,
@@ -275,9 +288,9 @@ func TestLexParse0(t *testing.T) {
 			name: "maps 2",
 			code: `
 			$mapstrintlist map{str: []int} = {
-				"key1" => [42, 44,],
+				"key1" => [42, 44],
 				"key2" => [],
-				"key3" => [-13,],
+				"key3" => [-13],
 			}
 			`,
 			fail: false,
@@ -293,9 +306,9 @@ func TestLexParse0(t *testing.T) {
 				"key2" => -13,
 			}
 			$mapstrintlist map{str: []int} = {
-				"key1" => [42, 44,],
+				"key1" => [42, 44],
 				"key2" => [],
-				"key3" => [-13,],
+				"key3" => [-13],
 			}
 			`,
 			fail: false,
@@ -313,7 +326,7 @@ func TestLexParse0(t *testing.T) {
 			}
 			$structx2 struct{a int; b []bool; c str} = struct{
 				a => 42,
-				b => [true, false, false, true,],
+				b => [true, false, false, true],
 				c => "hello",
 			}
 			`,
@@ -337,7 +350,7 @@ func TestLexParse0(t *testing.T) {
 	// FIXME: why doesn't this overflow, and thus fail?
 	// from the docs: If s is syntactically well-formed but is more than 1/2
 	// ULP away from the largest floating point number of the given size,
-	// ParseFloat returns f = ±Inf, err.Err = ErrRange.
+	// ParseFloat returns f = +/-Inf, err.Err = ErrRange.
 	//{
 	//	testCases = append(testCases, test{
 	//		name: "overflowing float",
@@ -583,7 +596,7 @@ func TestLexParse0(t *testing.T) {
 						&ast.StmtResField{
 							Field: "int64ptr",
 							Value: &ast.ExprCall{
-								Name: funcs.OperatorFuncName,
+								Name: operators.OperatorFuncName,
 								Args: []interfaces.Expr{
 									&ast.ExprStr{
 										V: "+",
@@ -624,13 +637,13 @@ func TestLexParse0(t *testing.T) {
 						&ast.StmtResField{
 							Field: "float32",
 							Value: &ast.ExprCall{
-								Name: funcs.OperatorFuncName,
+								Name: operators.OperatorFuncName,
 								Args: []interfaces.Expr{
 									&ast.ExprStr{
 										V: "+",
 									},
 									&ast.ExprCall{
-										Name: funcs.OperatorFuncName,
+										Name: operators.OperatorFuncName,
 										Args: []interfaces.Expr{
 											&ast.ExprStr{
 												V: "+",
@@ -676,7 +689,7 @@ func TestLexParse0(t *testing.T) {
 						&ast.StmtResField{
 							Field: "int64ptr",
 							Value: &ast.ExprCall{
-								Name: funcs.OperatorFuncName,
+								Name: operators.OperatorFuncName,
 								Args: []interfaces.Expr{
 									&ast.ExprStr{
 										V: "+",
@@ -685,7 +698,7 @@ func TestLexParse0(t *testing.T) {
 										V: 4,
 									},
 									&ast.ExprCall{
-										Name: funcs.OperatorFuncName,
+										Name: operators.OperatorFuncName,
 										Args: []interfaces.Expr{
 											&ast.ExprStr{
 												V: "*",
@@ -728,13 +741,13 @@ func TestLexParse0(t *testing.T) {
 						&ast.StmtResField{
 							Field: "int64ptr",
 							Value: &ast.ExprCall{
-								Name: funcs.OperatorFuncName,
+								Name: operators.OperatorFuncName,
 								Args: []interfaces.Expr{
 									&ast.ExprStr{
 										V: "+",
 									},
 									&ast.ExprCall{
-										Name: funcs.OperatorFuncName,
+										Name: operators.OperatorFuncName,
 										Args: []interfaces.Expr{
 											&ast.ExprStr{
 												V: "*",
@@ -780,7 +793,7 @@ func TestLexParse0(t *testing.T) {
 						&ast.StmtResField{
 							Field: "int64ptr",
 							Value: &ast.ExprCall{
-								Name: funcs.OperatorFuncName,
+								Name: operators.OperatorFuncName,
 								Args: []interfaces.Expr{
 									&ast.ExprStr{
 										V: "*",
@@ -788,17 +801,19 @@ func TestLexParse0(t *testing.T) {
 									&ast.ExprInt{
 										V: 3,
 									},
-									&ast.ExprCall{
-										Name: funcs.OperatorFuncName,
-										Args: []interfaces.Expr{
-											&ast.ExprStr{
-												V: "+",
-											},
-											&ast.ExprInt{
-												V: 12,
-											},
-											&ast.ExprInt{
-												V: 4,
+									&ast.ExprParen{
+										Inner: &ast.ExprCall{
+											Name: operators.OperatorFuncName,
+											Args: []interfaces.Expr{
+												&ast.ExprStr{
+													V: "+",
+												},
+												&ast.ExprInt{
+													V: 12,
+												},
+												&ast.ExprInt{
+													V: 4,
+												},
 											},
 										},
 									},
@@ -832,13 +847,13 @@ func TestLexParse0(t *testing.T) {
 						&ast.StmtResField{
 							Field: "boolptr",
 							Value: &ast.ExprCall{
-								Name: funcs.OperatorFuncName,
+								Name: operators.OperatorFuncName,
 								Args: []interfaces.Expr{
 									&ast.ExprStr{
 										V: ">",
 									},
 									&ast.ExprCall{
-										Name: funcs.OperatorFuncName,
+										Name: operators.OperatorFuncName,
 										Args: []interfaces.Expr{
 											&ast.ExprStr{
 												V: "+",
@@ -884,7 +899,7 @@ func TestLexParse0(t *testing.T) {
 						&ast.StmtResField{
 							Field: "boolptr",
 							Value: &ast.ExprCall{
-								Name: funcs.OperatorFuncName,
+								Name: operators.OperatorFuncName,
 								Args: []interfaces.Expr{
 									&ast.ExprStr{
 										V: ">",
@@ -893,7 +908,7 @@ func TestLexParse0(t *testing.T) {
 										V: 3,
 									},
 									&ast.ExprCall{
-										Name: funcs.OperatorFuncName,
+										Name: operators.OperatorFuncName,
 										Args: []interfaces.Expr{
 											&ast.ExprStr{
 												V: "+",
@@ -936,16 +951,16 @@ func TestLexParse0(t *testing.T) {
 						&ast.StmtResField{
 							Field: "boolptr",
 							Value: &ast.ExprCall{
-								Name: funcs.OperatorFuncName,
+								Name: operators.OperatorFuncName,
 								Args: []interfaces.Expr{
 									&ast.ExprStr{
 										V: ">",
 									},
 									&ast.ExprCall{
-										Name: funcs.OperatorFuncName,
+										Name: operators.OperatorFuncName,
 										Args: []interfaces.Expr{
 											&ast.ExprStr{
-												V: "!",
+												V: "not",
 											},
 											&ast.ExprInt{
 												V: 3,
@@ -966,7 +981,7 @@ func TestLexParse0(t *testing.T) {
 			name: "order of operations with not",
 			code: `
 			test "t1" {
-				boolptr => ! 3 > 4, # should parse, but not compile
+				boolptr => not 3 > 4, # should parse, but not compile
 			}
 			`,
 			fail: false,
@@ -985,13 +1000,13 @@ func TestLexParse0(t *testing.T) {
 						&ast.StmtResField{
 							Field: "boolptr",
 							Value: &ast.ExprCall{
-								Name: funcs.OperatorFuncName,
+								Name: operators.OperatorFuncName,
 								Args: []interfaces.Expr{
 									&ast.ExprStr{
-										V: "&&",
+										V: "and",
 									},
 									&ast.ExprCall{
-										Name: funcs.OperatorFuncName,
+										Name: operators.OperatorFuncName,
 										Args: []interfaces.Expr{
 											&ast.ExprStr{
 												V: "<",
@@ -1018,7 +1033,7 @@ func TestLexParse0(t *testing.T) {
 			name: "order of operations logical",
 			code: `
 			test "t1" {
-				boolptr => 7 < 4 && true, # should be false
+				boolptr => 7 < 4 and true, # should be false
 			}
 			`,
 			fail: false,
@@ -1187,7 +1202,7 @@ func TestLexParse0(t *testing.T) {
 				Meta => struct{
 					poll => 5,
 					retry => 3,
-					sema => ["foo:1", "bar:3",],
+					sema => ["foo:1", "bar:3"],
 				},
 			}
 			`,
@@ -1300,7 +1315,7 @@ func TestLexParse0(t *testing.T) {
 					stringptr => "hello",
 				}
 			}
-			# a dotted identifier is allowed here if it's imported
+			# a dotted identifier is allowed here if it is imported
 			include pkg.c1
 			`,
 			fail: false,
@@ -1345,7 +1360,7 @@ func TestLexParse0(t *testing.T) {
 					stringptr => "hello",
 				}
 			}
-			# a dotted identifier is allowed here if it's imported
+			# a dotted identifier is allowed here if it is imported
 			include pkg.ns.c1
 			`,
 			fail: false,
@@ -1670,12 +1685,12 @@ func TestLexParse0(t *testing.T) {
 			exp:  exp,
 		})
 	}
-	{
+	if ast.AllowBareImports {
 		exp := &ast.StmtProg{
 			Body: []interfaces.Stmt{
 				&ast.StmtImport{
 					Name:  "foo1",
-					Alias: "*",
+					Alias: interfaces.BareSymbol,
 				},
 			},
 		}
@@ -1730,9 +1745,12 @@ func TestLexParse0(t *testing.T) {
 				&ast.StmtFunc{
 					Name: "f1",
 					Func: &ast.ExprFunc{
-						Args: []*interfaces.Arg{},
-						Body: &ast.ExprInt{
-							V: 42,
+						Title: "f1",
+						Args:  []*interfaces.Arg{},
+						Body: &ast.ExprBlock{
+							Inner: &ast.ExprInt{
+								V: 42,
+							},
 						},
 					},
 				},
@@ -1751,25 +1769,29 @@ func TestLexParse0(t *testing.T) {
 	}
 	{
 		fn := &ast.ExprFunc{
+			Title:  "f2",
 			Args:   []*interfaces.Arg{},
 			Return: types.TypeInt,
-			Body: &ast.ExprCall{
-				Name: funcs.OperatorFuncName,
-				Args: []interfaces.Expr{
-					&ast.ExprStr{
-						V: "+",
-					},
-					&ast.ExprInt{
-						V: 13,
-					},
-					&ast.ExprInt{
-						V: 42,
+			Body: &ast.ExprBlock{
+				Inner: &ast.ExprCall{
+					Name: operators.OperatorFuncName,
+					Args: []interfaces.Expr{
+						&ast.ExprStr{
+							V: "+",
+						},
+						&ast.ExprInt{
+							V: 13,
+						},
+						&ast.ExprInt{
+							V: 42,
+						},
 					},
 				},
 			},
 		}
 		// sometimes, the type can get set by the parser when it's known
-		if err := fn.SetType(types.NewType("func() int")); err != nil {
+		typ := types.NewType("func() int")
+		if err := fn.SetType(typ); err != nil {
 			t.Fatal("could not build type")
 		}
 		exp := &ast.StmtProg{
@@ -1777,6 +1799,7 @@ func TestLexParse0(t *testing.T) {
 				&ast.StmtFunc{
 					Name: "f2",
 					Func: fn,
+					Type: typ,
 				},
 			},
 		}
@@ -1793,6 +1816,7 @@ func TestLexParse0(t *testing.T) {
 	}
 	{
 		fn := &ast.ExprFunc{
+			Title: "f3",
 			Args: []*interfaces.Arg{
 				{
 					Name: "a",
@@ -1804,17 +1828,19 @@ func TestLexParse0(t *testing.T) {
 				},
 			},
 			Return: types.TypeInt,
-			Body: &ast.ExprCall{
-				Name: funcs.OperatorFuncName,
-				Args: []interfaces.Expr{
-					&ast.ExprStr{
-						V: "+",
-					},
-					&ast.ExprVar{
-						Name: "a",
-					},
-					&ast.ExprVar{
-						Name: "b",
+			Body: &ast.ExprBlock{
+				Inner: &ast.ExprCall{
+					Name: operators.OperatorFuncName,
+					Args: []interfaces.Expr{
+						&ast.ExprStr{
+							V: "+",
+						},
+						&ast.ExprVar{
+							Name: "a",
+						},
+						&ast.ExprVar{
+							Name: "b",
+						},
 					},
 				},
 			},
@@ -1844,6 +1870,7 @@ func TestLexParse0(t *testing.T) {
 	}
 	{
 		fn := &ast.ExprFunc{
+			Title: "f4",
 			Args: []*interfaces.Arg{
 				{
 					Name: "x",
@@ -1851,22 +1878,25 @@ func TestLexParse0(t *testing.T) {
 				},
 			},
 			Return: types.TypeStr,
-			Body: &ast.ExprCall{
-				Name: funcs.OperatorFuncName,
-				Args: []interfaces.Expr{
-					&ast.ExprStr{
-						V: "+",
-					},
-					&ast.ExprStr{
-						V: "hello",
-					},
-					&ast.ExprVar{
-						Name: "x",
+			Body: &ast.ExprBlock{
+				Inner: &ast.ExprCall{
+					Name: operators.OperatorFuncName,
+					Args: []interfaces.Expr{
+						&ast.ExprStr{
+							V: "+",
+						},
+						&ast.ExprStr{
+							V: "hello",
+						},
+						&ast.ExprVar{
+							Name: "x",
+						},
 					},
 				},
 			},
 		}
-		if err := fn.SetType(types.NewType("func(x str) str")); err != nil {
+		typ := types.NewType("func(x str) str")
+		if err := fn.SetType(typ); err != nil {
 			t.Fatal("could not build type")
 		}
 		exp := &ast.StmtProg{
@@ -1874,6 +1904,7 @@ func TestLexParse0(t *testing.T) {
 				&ast.StmtFunc{
 					Name: "f4",
 					Func: fn,
+					Type: typ,
 				},
 			},
 		}
@@ -1892,8 +1923,10 @@ func TestLexParse0(t *testing.T) {
 
 		fn := &ast.ExprFunc{
 			Args: []*interfaces.Arg{},
-			Body: &ast.ExprInt{
-				V: 42,
+			Body: &ast.ExprBlock{
+				Inner: &ast.ExprInt{
+					V: 42,
+				},
 			},
 		}
 		exp := &ast.StmtProg{
@@ -1925,17 +1958,19 @@ func TestLexParse0(t *testing.T) {
 				},
 			},
 			Return: types.TypeStr,
-			Body: &ast.ExprCall{
-				Name: funcs.OperatorFuncName,
-				Args: []interfaces.Expr{
-					&ast.ExprStr{
-						V: "+",
-					},
-					&ast.ExprStr{
-						V: "hello",
-					},
-					&ast.ExprVar{
-						Name: "x",
+			Body: &ast.ExprBlock{
+				Inner: &ast.ExprCall{
+					Name: operators.OperatorFuncName,
+					Args: []interfaces.Expr{
+						&ast.ExprStr{
+							V: "+",
+						},
+						&ast.ExprStr{
+							V: "hello",
+						},
+						&ast.ExprVar{
+							Name: "x",
+						},
 					},
 				},
 			},
@@ -1972,17 +2007,19 @@ func TestLexParse0(t *testing.T) {
 				},
 			},
 			Return: types.TypeStr,
-			Body: &ast.ExprCall{
-				Name: funcs.OperatorFuncName,
-				Args: []interfaces.Expr{
-					&ast.ExprStr{
-						V: "+",
-					},
-					&ast.ExprStr{
-						V: "hello",
-					},
-					&ast.ExprVar{
-						Name: "x",
+			Body: &ast.ExprBlock{
+				Inner: &ast.ExprCall{
+					Name: operators.OperatorFuncName,
+					Args: []interfaces.Expr{
+						&ast.ExprStr{
+							V: "+",
+						},
+						&ast.ExprStr{
+							V: "hello",
+						},
+						&ast.ExprVar{
+							Name: "x",
+						},
 					},
 				},
 			},
@@ -2030,12 +2067,17 @@ func TestLexParse0(t *testing.T) {
 					Name: "funcgen",
 					// This is the outer function...
 					Func: &ast.ExprFunc{
-						Args: []*interfaces.Arg{},
+						Title: "funcgen",
+						Args:  []*interfaces.Arg{},
 						// This is the inner function...
-						Body: &ast.ExprFunc{
-							Args: []*interfaces.Arg{},
-							Body: &ast.ExprStr{
-								V: "hello",
+						Body: &ast.ExprBlock{
+							Inner: &ast.ExprFunc{
+								Args: []*interfaces.Arg{},
+								Body: &ast.ExprBlock{
+									Inner: &ast.ExprStr{
+										V: "hello",
+									},
+								},
 							},
 						},
 					},
@@ -2073,6 +2115,83 @@ func TestLexParse0(t *testing.T) {
 			exp:  exp,
 		})
 	}
+	{
+		fn := &ast.ExprFunc{
+			Args: []*interfaces.Arg{
+				{
+					Name: "x",
+					//Type: types.TypeInt,
+				},
+			},
+			//Return: types.TypeInt,
+			Body: &ast.ExprBlock{
+				Inner: &ast.ExprCall{
+					Name: operators.OperatorFuncName,
+					Args: []interfaces.Expr{
+						&ast.ExprStr{
+							V: "*",
+						},
+						&ast.ExprVar{
+							Name: "x",
+						},
+						&ast.ExprVar{
+							Name: "x",
+						},
+					},
+				},
+			},
+		}
+		//if err := fn.SetType(types.NewType("func(x int) int")); err != nil {
+		//	t.Fatal("could not build type")
+		//}
+
+		exp := &ast.StmtProg{
+			Body: []interfaces.Stmt{
+				&ast.StmtImport{
+					Name: "iter",
+				},
+				&ast.StmtBind{
+					Ident: "fn",
+					Value: fn,
+				},
+				&ast.StmtBind{
+					Ident: "out",
+					Value: &ast.ExprCall{
+						Name: "iter.map", // does this name lex/parse correctly?
+						Args: []interfaces.Expr{
+							&ast.ExprList{
+								Elements: []interfaces.Expr{
+									&ast.ExprInt{
+										V: 1,
+									},
+									&ast.ExprInt{
+										V: 2,
+									},
+									&ast.ExprInt{
+										V: 3,
+									},
+								},
+							},
+							&ast.ExprVar{
+								Name: "fn",
+							},
+						},
+					},
+				},
+			},
+		}
+
+		testCases = append(testCases, test{
+			name: "iter.map",
+			code: `
+			import "iter"
+			$fn = func($x) { $x * $x }
+			$out = iter.map([1,2,3], $fn)
+			`,
+			fail: false,
+			exp:  exp,
+		})
+	}
 
 	if testing.Short() {
 		t.Logf("available tests:")
@@ -2105,6 +2224,9 @@ func TestLexParse0(t *testing.T) {
 
 			t.Logf("\n\ntest #%d (%s) ----------------\n\n", index, name)
 
+			if len(code) == 0 || code[len(code)-1:] != "\n" {
+				code += "\n" // must always end with a newline
+			}
 			str := strings.NewReader(code)
 			xast, err := LexParse(str)
 
@@ -2130,6 +2252,36 @@ func TestLexParse0(t *testing.T) {
 			}
 			// double check because DeepEqual is different since the func exists
 
+			lo := &litter.Options{
+				//Compact: false,
+				StripPackageNames: true,
+				HidePrivateFields: true,
+				HideZeroValues:    true,
+				FieldExclusions:   regexp.MustCompile(`^(Textarea)$`),
+				//FieldFilter       func(reflect.StructField, reflect.Value) bool
+				//HomePackage       string
+				//Separator         string
+				DisablePointerReplacement: true,
+			}
+
+			// The litter package adds pointer comments everywhere,
+			// which make it not diff correctly. Clean them here!
+			pattern := regexp.MustCompile(`\ \/\/\ p[0-9]+$`) // the p0, p1 comments...
+			clean := func(s string) string {
+				lines := []string{}
+				for _, line := range strings.Split(s, "\n") {
+					s := pattern.ReplaceAllLiteralString(line, "")
+					lines = append(lines, s)
+				}
+				return strings.Join(lines, "\n")
+			}
+
+			lo1 := clean(lo.Sdump(exp))
+			lo2 := clean(lo.Sdump(xast))
+			if lo1 == lo2 { // simple diff
+				return
+			}
+
 			// more details, for tricky cases:
 			diffable := &pretty.Config{
 				Diffable:          true,
@@ -2137,18 +2289,22 @@ func TestLexParse0(t *testing.T) {
 				//PrintStringers: false, // always false!
 				//PrintTextMarshalers: false,
 				SkipZeroFields: true,
+				//Formatter: map[reflect.Type]interface{}{
+				//	reflect.TypeOf(ast.Textarea{}): func(x ast.Textarea) string {
+				//		return ""
+				//	},
+				//},
 			}
 			diff := diffable.Compare(exp, xast)
 			if diff == "" { // bonus
 				return
 			}
+			diff = godiff.Diff(lo1, lo2) // for printing
+
 			t.Errorf("test #%d: AST did not match expected", index)
 			// TODO: consider making our own recursive print function
-			t.Logf("test #%d:   actual: \n\n%s\n", index, spew.Sdump(xast))
-			t.Logf("test #%d: expected: \n\n%s", index, spew.Sdump(exp))
-
-			t.Logf("test #%d:   actual: \n\n%s\n", index, diffable.Sprint(xast))
-			t.Logf("test #%d: expected: \n\n%s", index, diffable.Sprint(exp))
+			t.Logf("test #%d:   actual: \n\n%s\n", index, lo1)
+			t.Logf("test #%d: expected: \n\n%s", index, lo2)
 			t.Logf("test #%d: diff:\n%s", index, diff)
 		})
 	}
@@ -2165,7 +2321,7 @@ func TestLexParse1(t *testing.T) {
 	# some noop resource
 	noop "n0" {
 		foo => true,
-		bar => false	# this should be a parser error (no comma)
+		bar => false # this should be a parser error (no comma)
 	}
 	# hello
 	# world
@@ -2180,6 +2336,31 @@ func TestLexParse1(t *testing.T) {
 	} else {
 		if e.Row != 10 || e.Col != 9 {
 			t.Errorf("expected error at 10 x 9, got: %d x %d", e.Row, e.Col)
+		}
+		t.Logf("row x col: %d x %d", e.Row, e.Col)
+		t.Logf("message: %s", e.Str)
+		t.Logf("output: %+v", err)
+	}
+}
+
+func TestLexParse1b(t *testing.T) {
+	// Same as TestLexParse1, but the missing-comma field is a list expr
+	// rather than a literal.
+	code := `
+	noop "n0" {
+		foo => [1, 2, 3] # this should be a parser error (no comma)
+	}
+	` // error
+	str := strings.NewReader(code)
+	_, err := LexParse(str)
+	if e, ok := err.(*LexParseErr); ok && e.Err != ErrParseExpectingComma {
+		t.Errorf("lex/parse failure, got: %+v", e)
+	} else if err == nil {
+		t.Errorf("lex/parse success, expected error")
+	} else {
+		//t.Logf("output: %+v", err)
+		if e.Row != 2 || e.Col != 9 {
+			t.Errorf("expected error at 2 x 9, got: %d x %d", e.Row, e.Col)
 		}
 		t.Logf("row x col: %d x %d", e.Row, e.Col)
 		t.Logf("message: %s", e.Str)
@@ -2208,6 +2389,54 @@ func TestLexParse2(t *testing.T) {
 		t.Logf("row x col: %d x %d", e.Row, e.Col)
 		t.Logf("message: %s", e.Str)
 		t.Logf("output: %+v", err)
+	}
+}
+
+func TestLexParseWithComments1(t *testing.T) {
+	code := `# start of file comment
+$x = 42 # trailing comment
+if true {
+	# indented comment
+}
+#no space comment
+` // has comments in different places
+	str := strings.NewReader(code)
+	stmt, comments, err := LexParseWithComments(str)
+	if err != nil {
+		t.Fatalf("lex/parse failure: %+v", err)
+	}
+	if stmt == nil {
+		t.Fatalf("lex/parse missing AST")
+	}
+	expected := []*interfaces.Comment{
+		{Value: " start of file comment", Row: 0, Col: 0},
+		{Value: " trailing comment", Row: 1, Col: 8},
+		{Value: " indented comment", Row: 3, Col: 1},
+		{Value: "no space comment", Row: 5, Col: 0},
+	}
+	if a, b := len(comments), len(expected); a != b {
+		t.Fatalf("unexpected number of comments: got %d, expected %d", a, b)
+	}
+	for i, comment := range comments {
+		if !reflect.DeepEqual(comment, expected[i]) {
+			t.Errorf("unexpected comment #%d: got %+v, expected %+v", i, comment, expected[i])
+		}
+	}
+}
+
+func TestLexParseWithComments2(t *testing.T) {
+	code := `$x = 42
+` // no comments at all
+	str := strings.NewReader(code)
+	stmt, comments, err := LexParseWithComments(str)
+	if err != nil {
+		t.Fatalf("lex/parse failure: %+v", err)
+	}
+	if stmt == nil {
+		t.Fatalf("lex/parse missing AST")
+	}
+	if len(comments) != 0 {
+		t.Fatalf("unexpected comments: %+v", comments)
 	}
 }
 
@@ -2241,7 +2470,9 @@ func TestLexParseWithOffsets1(t *testing.T) {
 	str2 := strings.NewReader(code2)
 	str3 := strings.NewReader(code3)
 	// TODO: this is currently in number of lines instead of bytes
+	//nolint:gosec // G115: test-controlled non-negative offset
 	o1 := uint64(len(strings.Split(code1, "\n")) - 1)
+	//nolint:gosec // G115: test-controlled non-negative offset
 	o2 := uint64(len(strings.Split(code2, "\n")) - 1)
 	//o1 := uint64(len(code1))
 	//o2 := uint64(len(code2))
@@ -2413,6 +2644,22 @@ func TestImportParsing0(t *testing.T) {
 		path:    "foo/",
 	})
 	testCases = append(testCases, test{
+		name:     "foo/bar/",
+		alias:    "bar",
+		isSystem: false,
+		isLocal:  true,
+		isFile:   false,
+		path:     "foo/bar/",
+	})
+	testCases = append(testCases, test{
+		name:     "foo/bar/baz/",
+		alias:    "baz",
+		isSystem: false,
+		isLocal:  true,
+		isFile:   false,
+		path:     "foo/bar/baz/",
+	})
+	testCases = append(testCases, test{
 		// import foo.mcl # import a file next to me
 		name:     "foo.mcl",
 		alias:    "foo",
@@ -2477,7 +2724,7 @@ func TestImportParsing0(t *testing.T) {
 		fail: true, // don't allow double root slash
 	})
 
-	t.Logf("ModuleMagicPrefix: %s", langutil.ModuleMagicPrefix)
+	t.Logf("ModuleMagicPrefix: %s", langUtil.ModuleMagicPrefix)
 	names := []string{}
 	for index, tc := range testCases { // run all the tests
 		if util.StrInList(tc.name, names) {
@@ -2488,7 +2735,7 @@ func TestImportParsing0(t *testing.T) {
 		t.Run(fmt.Sprintf("test #%d (%s)", index, tc.name), func(t *testing.T) {
 			name, fail, alias, isSystem, isLocal, isFile, path, url := tc.name, tc.fail, tc.alias, tc.isSystem, tc.isLocal, tc.isFile, tc.path, tc.url
 
-			output, err := langutil.ParseImportName(name)
+			output, err := langUtil.ParseImportName(name)
 			if !fail && err != nil {
 				t.Errorf("test #%d: FAIL", index)
 				t.Errorf("test #%d: ParseImportName failed with: %+v", index, err)

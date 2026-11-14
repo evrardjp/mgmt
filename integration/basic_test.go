@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,15 +13,26 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
-// +build !root
+//go:build !root
 
 package integration
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"sort"
@@ -136,7 +147,7 @@ func TestInstance1(t *testing.T) {
 			sort.Strings(files) // loop in a deterministic order
 			for _, f := range files {
 				filename := path.Join(d, RootDirectory, f)
-				b, err := ioutil.ReadFile(filename)
+				b, err := os.ReadFile(filename)
 				if err != nil {
 					t.Errorf("could not read file: `%s`", filename)
 					continue
@@ -158,6 +169,7 @@ func TestCluster1(t *testing.T) {
 		name   string
 		code   string // mcl code
 		fail   bool
+		etcd   bool // standalone etcd?
 		hosts  []string
 		expect map[string]map[string]string // hostname, file, contents
 	}
@@ -167,7 +179,7 @@ func TestCluster1(t *testing.T) {
 		code := util.Code(`
 		import "sys"
 		$root = sys.getenv("MGMT_TEST_ROOT")
-		$host = sys.hostname()
+		$host = $hostname #sys.hostname()
 
 		file "${root}/mgmt-hostname" {
 			content => "i am ${host}\n",
@@ -178,6 +190,7 @@ func TestCluster1(t *testing.T) {
 			name:  "simple pair",
 			code:  code,
 			fail:  false,
+			etcd:  true,
 			hosts: []string{"h1", "h2"},
 			expect: map[string]map[string]string{
 				"h1": {
@@ -193,7 +206,7 @@ func TestCluster1(t *testing.T) {
 		code := util.Code(`
 		import "sys"
 		$root = sys.getenv("MGMT_TEST_ROOT")
-		$host = sys.hostname()
+		$host = $hostname #sys.hostname()
 
 		file "${root}/mgmt-hostname" {
 			content => "i am ${host}\n",
@@ -204,6 +217,7 @@ func TestCluster1(t *testing.T) {
 			name:  "hello world",
 			code:  code,
 			fail:  false,
+			etcd:  true,
 			hosts: []string{"h1", "h2", "h3"},
 			expect: map[string]map[string]string{
 				"h1": {
@@ -221,9 +235,10 @@ func TestCluster1(t *testing.T) {
 
 	for index, tc := range testCases { // run all the tests
 		t.Run(fmt.Sprintf("test #%d (%s)", index, tc.name), func(t *testing.T) {
-			code, fail, hosts, expect := tc.code, tc.fail, tc.hosts, tc.expect
+			code, fail, etcd, hosts, expect := tc.code, tc.fail, tc.etcd, tc.hosts, tc.expect
 
 			c := Cluster{
+				Etcd:      etcd,
 				Hostnames: hosts,
 				Preserve:  true,
 				Debug:     false, // TODO: set to true if not too wordy
@@ -270,7 +285,7 @@ func TestCluster1(t *testing.T) {
 				sort.Strings(files) // loop in a deterministic order
 				for _, f := range files {
 					filename := path.Join(d, RootDirectory, f)
-					b, err := ioutil.ReadFile(filename)
+					b, err := os.ReadFile(filename)
 					if err != nil {
 						t.Errorf("could not read file: `%s`", filename)
 						continue

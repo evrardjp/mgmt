@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,13 +13,28 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 // Package util contains a collection of miscellaneous utility functions.
 package util
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/gob"
 	"fmt"
 	"path"
 	"sort"
@@ -27,12 +42,16 @@ import (
 	"time"
 
 	"github.com/godbus/dbus/v5"
+	"github.com/purpleidea/mgmt/util/errwrap"
 )
 
 // NumToAlpha returns a lower case string of letters representing a number. If
 // you specify 0, you'll get `a`, 25 gives you `z`, and 26 gives you `aa` and so
 // on...
 func NumToAlpha(idx int) string {
+	if idx < 0 {
+		return "" // don't error or produce junk
+	}
 	var mod = idx % 26
 	var div = idx / 26
 	if div > 0 {
@@ -272,6 +291,87 @@ loop:
 		break
 	}
 	return result
+}
+
+// SafePathClean does path.Clean, but it preserves any trailing slash if it was
+// present in the initial path.
+func SafePathClean(s string) string {
+	if s == "/" {
+		return "/"
+	}
+	hasSlash := strings.HasSuffix(s, "/")
+	clean := path.Clean(s) // removes trailing slashes
+	if hasSlash {          // add it back if it was taken off
+		clean = clean + "/"
+	}
+	return clean
+}
+
+// SegmentedPathSplit splits an absolute path into chunks including their slash.
+// This is similar to the PathSplit function, but the slashes are not lost here!
+// TODO: There is likely a more efficient implementation of this function.
+func SegmentedPathSplit(p string) []string {
+	out := []string{}
+	sponge := ""
+	for i := 0; i < len(p); i++ {
+		sponge = sponge + string(p[i])
+		if string(p[i]) == "/" {
+			out = append(out, sponge) // found one!
+			sponge = ""               // reset
+		}
+	}
+	if sponge != "" {
+		out = append(out, sponge) // the last piece
+	}
+
+	return out
+}
+
+// CommonPathPrefix returns the longest common prefix directory out of all the
+// input paths! This is always a directory and thus ends with a slash, unless
+// all of the paths are identical and are files, or if only one path is given in
+// which case that is returned, or unless no paths are given in which case the
+// empty string is returned. If any of your input paths are not absolute, and as
+// such do not begin with a slash, then the behaviour is undefined.
+func CommonPathPrefix(paths ...string) string {
+	// XXX: I am not a good algorithmist, there is probably a more efficient
+	// way to write this algorithm. Patches are welcome!
+	if len(paths) == 0 {
+		return ""
+	}
+	if len(paths) == 1 {
+		return paths[0]
+	}
+
+	sps := make([][]string, 0)
+	for _, x := range paths {
+		if !strings.HasPrefix(x, "/") {
+			// TODO: panic? error?
+			return "" // undefined behaviour!
+		}
+		//x = SafePathClean(x) // TODO: Should we "safe clean" each path?
+		sp := SegmentedPathSplit(x) // compute once in advance
+		sps = append(sps, sp)
+	}
+
+	z := sps[0] // SegmentedPathSplit(paths[0]) // arbitrarily choose the first one
+	ix := 0
+	ret := ""
+	for {
+		for i := range paths {
+			sp := sps[i]       // SegmentedPathSplit(paths[i])
+			if len(sp) <= ix { // one path is longer
+				return ret
+			}
+
+			if sp[ix] != z[ix] { // the chunk differs!
+				return ret
+			}
+		}
+
+		ret = ret + z[ix] // append what we've got so far!
+		ix++
+	}
 }
 
 // PathPrefixDelta returns the delta of the path prefix, which tells you how
@@ -530,12 +630,12 @@ func SystemBusPrivateUsable() (conn *dbus.Conn, err error) {
 		return nil, err
 	}
 	if err = conn.Auth(nil); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		conn = nil
 		return
 	}
 	if err = conn.Hello(); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		conn = nil
 	}
 	return conn, nil // success
@@ -549,12 +649,12 @@ func SessionBusPrivateUsable() (conn *dbus.Conn, err error) {
 		return nil, err
 	}
 	if err = conn.Auth(nil); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		conn = nil
 		return
 	}
 	if err = conn.Hello(); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		conn = nil
 	}
 	return conn, nil // success
@@ -678,4 +778,34 @@ func SortMapStringValuesByUInt64Keys(m map[uint64]string) []string {
 	}
 
 	return result
+}
+
+// ValueToB64 encodes a value to a base64 encoded string (after serialization).
+func ValueToB64(value interface{}) (string, error) {
+	b := bytes.Buffer{}
+	e := gob.NewEncoder(&b)
+	if err := e.Encode(&value); err != nil { // pass with &
+		return "", errwrap.Wrapf(err, "gob failed to encode")
+	}
+	return base64.StdEncoding.EncodeToString(b.Bytes()), nil
+}
+
+// B64ToValue decodes a value from a base64 encoded string (after
+// deserialization).
+func B64ToValue(str string) (interface{}, error) {
+	var output interface{}
+	bb, err := base64.StdEncoding.DecodeString(str)
+	if err != nil {
+		return nil, errwrap.Wrapf(err, "base64 failed to decode")
+	}
+	b := bytes.NewBuffer(bb)
+	d := gob.NewDecoder(b)
+	if err := d.Decode(&output); err != nil { // pass with &
+		return nil, errwrap.Wrapf(err, "gob failed to decode")
+	}
+	value, ok := output.(interface{})
+	if !ok {
+		return nil, fmt.Errorf("output `%v` is not a value", output)
+	}
+	return value, nil
 }

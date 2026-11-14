@@ -1,0 +1,11 @@
+-- CONFIG --
+{
+	"nofmt": true
+}
+-- main.mcl --
+$m = {"w" => 1, , "o" => 2}
+
+$value = $m["w"]
+test "${value}" {}
+-- OUTPUT --
+# err: errLexParse: parser: `syntax error: unexpected COMMA`: /main.mcl @ 1:17-1:18

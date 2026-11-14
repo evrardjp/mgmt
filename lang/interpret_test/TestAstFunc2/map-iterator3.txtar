@@ -1,0 +1,17 @@
+-- main.mcl --
+import "golang"
+import "iter"
+
+$fn = func($x) { # type changes from str to int
+	len($x)
+}
+
+$ins = ["a", "bb", "ccc", "dddd", "eeeee"]
+
+$out = iter.map($ins, $fn)
+
+$t = golang.template("out: {{ . }}", $out)
+
+test "${t}" {}
+-- OUTPUT --
+Vertex: test[out: [1 2 3 4 5]]

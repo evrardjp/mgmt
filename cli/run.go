@@ -1,0 +1,247 @@
+// Mgmt
+// Copyright (C) James Shubin and the project contributors
+// Written by James Shubin <james@shubin.ca> and the project contributors
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
+
+package cli
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	cliUtil "github.com/purpleidea/mgmt/cli/util"
+	etcdfs "github.com/purpleidea/mgmt/etcd/fs"
+	"github.com/purpleidea/mgmt/gapi"
+	"github.com/purpleidea/mgmt/lib"
+	"github.com/purpleidea/mgmt/util"
+	"github.com/purpleidea/mgmt/util/errwrap"
+	. "github.com/purpleidea/mgmt/util/gettext"
+	"github.com/purpleidea/mgmt/util/signals"
+
+	"github.com/google/uuid"
+)
+
+// sigtermGraceTimeout is how long each rung of the exit sequence gets when a
+// service manager signalled us instead of a user at a terminal. A user presses
+// ^C again when we're taking too long, but systemd signals exactly once and
+// then waits on a stopwatch of its own (TimeoutStopSec, which defaults to 90
+// seconds) before it sends an unstoppable SIGKILL. So nothing would ever
+// escalate us, and we'd be killed mid-operation instead of exiting cleanly. Two
+// of these puts us on the last rung after 30 seconds, which leaves plenty of
+// that budget for the shutdown which follows.
+const sigtermGraceTimeout = 15 * time.Second
+
+// RunArgs is the CLI parsing structure and type of the parsed result. This
+// particular one contains all the common flags for the `run` subcommand which
+// all frontends can use.
+type RunArgs struct {
+	lib.Config // embedded config (can't be a pointer) https://github.com/alexflint/go-arg/issues/240
+
+	RunEmpty *cliUtil.EmptyArgs `arg:"subcommand:empty" help:"run empty payload"`
+	RunLang  *cliUtil.LangArgs  `arg:"subcommand:lang" help:"run lang (mcl) payload"`
+	RunYaml  *cliUtil.YamlArgs  `arg:"subcommand:yaml" help:"run yaml graph payload"`
+}
+
+// Run executes the correct subcommand. It errors if there's ever an error. It
+// returns true if we did activate one of the subcommands. It returns false if
+// we did not. This information is used so that the top-level parser can return
+// usage or help information if no subcommand activates. This particular Run is
+// the run for the main `run` subcommand. This always requires a frontend to
+// start the engine, but if you don't want a graph, you can use the `empty`
+// frontend. The engine backend is agnostic to which frontend is running, in
+// fact, you can deploy with multiple different frontends, one after another, on
+// the same engine.
+func (obj *RunArgs) Run(ctx context.Context, data *cliUtil.Data) (bool, error) {
+	var name string
+	var args interface{}
+	if cmd := obj.RunEmpty; cmd != nil {
+		name = cliUtil.LookupSubcommand(obj, cmd) // "empty"
+		args = cmd
+	}
+	if cmd := obj.RunLang; cmd != nil {
+		name = cliUtil.LookupSubcommand(obj, cmd) // "lang"
+		args = cmd
+	}
+	if cmd := obj.RunYaml; cmd != nil {
+		name = cliUtil.LookupSubcommand(obj, cmd) // "yaml"
+		args = cmd
+	}
+	// XXX: workaround https://github.com/alexflint/go-arg/issues/239
+	lists := [][]string{
+		obj.Seeds,
+		obj.ClientURLs,
+		obj.ServerURLs,
+		obj.AdvertiseClientURLs,
+		obj.AdvertiseServerURLs,
+	}
+	gapiNames := gapi.Names() // list of registered names
+	for _, list := range lists {
+		if l := len(list); name == "" && l > 1 {
+			elem := list[l-2] // second to last element
+			if util.StrInList(elem, gapiNames) {
+				return false, cliUtil.CliParseError(cliUtil.MissingEquals) // consistent errors
+			}
+		}
+	}
+
+	fn, exists := gapi.RegisteredGAPIs[name]
+	if !exists {
+		return false, nil // did not activate
+	}
+	gapiObj := fn()
+
+	main := &lib.Main{}
+	main.Config = &obj.Config // pass in all the parsed data
+
+	main.Program, main.Version = data.Program, data.Version
+	main.Debug, main.Logf = data.Flags.Debug, data.Flags.Logf // no prefix
+	Logf := func(format string, v ...interface{}) {
+		data.Flags.Logf("main: "+format, v...)
+	}
+
+	cliUtil.Hello(main.Program, main.Version, data.Flags) // say hello!
+	defer Logf(G("goodbye!"))
+
+	// TODO: using a uuid is meant as a temporary measure, i hate them
+	uniqueid := uuid.New() // panic's if it can't generate one :P
+	metadata := lib.MetadataPrefix + fmt.Sprintf("/deploy/%s", uniqueid)
+
+	// Create a memory backed temporary filesystem for storing runtime data.
+	// The files are staged here, and the URI points to where they will get
+	// copied to in the cluster fs, so that our initial deploy is a true
+	// deploy, which is identical to what the `deploy` command produces, and
+	// which any other cluster member can therefore find and run as well.
+	standaloneFs := util.NewMemFs()
+	standaloneFs.Scheme = etcdfs.Scheme
+	standaloneFs.Path = metadata
+	main.DeployFs = standaloneFs
+
+	info := &gapi.Info{
+		Args: args,
+		Flags: &gapi.Flags{
+			Hostname: obj.Hostname,
+			Noop:     obj.Noop,
+			Sema:     obj.Sema,
+			//Update: obj.Update,
+
+			NoAutoEdges: obj.NoAutoEdges,
+			NoAutoGroup: obj.NoAutoGroup,
+		},
+
+		Fs:    standaloneFs,
+		Debug: data.Flags.Debug,
+		Logf: func(format string, v ...interface{}) {
+			data.Flags.Logf("cli: "+format, v...)
+		},
+	}
+
+	deploy, err := gapiObj.Cli(info)
+	if err != nil {
+		return false, cliUtil.CliParseError(err) // consistent errors
+	}
+
+	if cmd := obj.RunLang; cmd != nil && cmd.CheckOnly && deploy == nil {
+		return true, nil // we end early
+	}
+	if cmd := obj.RunLang; cmd != nil && cmd.OnlyDownload && deploy == nil {
+		return true, nil // we end early
+	}
+	main.Deploy = deploy
+	if main.Deploy == nil {
+		// nobody activated, but we'll still watch the etcd deploy chan,
+		// and if there is deployed code that's ready to run, we'll run!
+		data.Flags.Logf("main: no frontend selected (no GAPI activated)")
+	}
+
+	if err := main.Validate(); err != nil {
+		return false, err
+	}
+
+	if err := main.Init(); err != nil {
+		return false, err
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// install the exit signal handler
+	ladder := &signals.Ladder{
+		Rungs: []*signals.Rung{
+			{
+				Func: func() {
+					cancel()
+					//main.Exit(nil)
+				},
+			},
+			{
+				Name: "soft interrupt",
+				Func: func() {
+					cancel()
+					main.SoftInterrupt()
+				},
+			},
+			{
+				Name: "hard interrupt",
+				Func: func() {
+					cancel()
+					main.HardInterrupt()
+				},
+			},
+		},
+		GraceTimeout: sigtermGraceTimeout,
+		Logf:         data.Flags.Logf,
+	}
+	// The handler has to outlive the context that it cancels. If it stopped
+	// when that context was done, then the first signal would end it, and
+	// none of the escalation could ever run. This stops when Run returns,
+	// which is the only thing that should stop us listening.
+	defer ladder.Start()()
+
+	reterr := main.Run(ctx)
+	if reterr != nil {
+		// log the error message returned
+		if data.Flags.Debug {
+			data.Flags.Logf("main: %+v", reterr)
+		}
+	}
+
+	if err := main.Cleanup(); err != nil {
+		if data.Flags.Debug {
+			data.Flags.Logf("main: Cleanup: %+v", err)
+		}
+		if reterr == nil {
+			return false, err
+		}
+		reterr = errwrap.Append(reterr, err)
+	}
+
+	if reterr != nil {
+		return false, reterr
+	}
+	return true, nil
+}

@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,19 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 // Package graph contains the actual implementation of the resource graph engine
 // that runs the graph of resources in real-time. This package has the algorithm
@@ -21,15 +33,19 @@
 package graph
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path"
 	"sync"
+	"sync/atomic"
 
 	"github.com/purpleidea/mgmt/converger"
 	"github.com/purpleidea/mgmt/engine"
+	"github.com/purpleidea/mgmt/engine/local"
 	engineUtil "github.com/purpleidea/mgmt/engine/util"
 	"github.com/purpleidea/mgmt/pgraph"
+	"github.com/purpleidea/mgmt/util"
 	"github.com/purpleidea/mgmt/util/errwrap"
 	"github.com/purpleidea/mgmt/util/semaphore"
 )
@@ -40,34 +56,75 @@ const (
 	StateDir = "state"
 )
 
-// Engine encapsulates a generic graph and manages its operations.
+// Engine encapsulates a generic graph and manages its operations. The engine
+// starts off running (unpaused) but with an empty graph. It then cycles through
+// being paused, gets vertices added, and then (unpause) resuming. The vertices
+// have state which includes the running Worker (Watch for Res) and those start
+// paused, which resume and start up after Commit. Getting the architectural
+// dance right and knowing what starts paused vs running was tricky, but I think
+// it's correct now.
 type Engine struct {
 	Program  string
 	Version  string
 	Hostname string
-	World    engine.World
+
+	// Break off separate logical pieces into chunks where possible.
+	Converger *converger.Coordinator
+	Exporter  *Exporter
+
+	Local *local.API
+	World engine.World
+	// TODO: remove Cancel from here since it's part of Local now?
+	Cancel context.CancelCauseFunc
 
 	// Prefix is a unique directory prefix which can be used. It should be
 	// created if needed.
-	Prefix    string
-	Converger *converger.Coordinator
-
-	Debug bool
-	Logf  func(format string, v ...interface{})
+	Prefix string
+	Debug  bool
+	Logf   func(format string, v ...interface{})
 
 	graph     *pgraph.Graph
 	nextGraph *pgraph.Graph
 	state     map[pgraph.Vertex]*State
+	tlock     *sync.RWMutex                     // lock around state map
 	waits     map[pgraph.Vertex]*sync.WaitGroup // wg for the Worker func
 	wlock     *sync.Mutex                       // lock around waits map
+
+	mlock *sync.Mutex                            // metas lock
+	metas map[engine.ResPtrUID]*engine.MetaState // meta state
 
 	slock *sync.Mutex // semaphore lock
 	semas map[string]*semaphore.Semaphore
 
+	// senders is every resource in the graph which something could receive
+	// from, indexed by kind and name. The graph sync maintains it the same
+	// way it maintains state, so it is only written while we're paused.
+	senders map[string]engine.SendableRes
+
+	// realizeSet is the set of vertices whose pending work a graph swap
+	// must wait for before it pauses them: every realize resource plus all
+	// of their transitive prerequisites. It only depends on the committed
+	// graph topology and metaparams, so Commit computes it once and Pause
+	// reads it, rather than rebuilding it on every swap. Like senders, it
+	// is only written while we're paused. A nil set is the common case,
+	// where no resource uses the realize metaparam. See realizeWaitSet and
+	// Pause.
+	realizeSet map[pgraph.Vertex]struct{}
+
+	bgState map[string]*bgState // background state for each resource kind
+
 	wg *sync.WaitGroup // wg for the whole engine (only used for close)
 
 	paused    bool // are we paused?
-	fastPause bool
+	fastPause *atomic.Bool
+	// interrupt is closed when the user asks us to stop waiting. It is a
+	// channel rather than a flag, because a Worker which is withholding a
+	// pause for a realize resource needs something to wake it up.
+	interrupt     chan struct{}
+	interruptOnce *sync.Once
+	isClosing     bool // are we shutting down?
+
+	errMutex *sync.Mutex // wraps the *state workerErr (one mutex for all)
 }
 
 // Init initializes the internal structures and starts this the graph running.
@@ -89,20 +146,47 @@ func (obj *Engine) Init() error {
 	if obj.Prefix == "" || obj.Prefix == "/" {
 		return fmt.Errorf("the prefix of `%s` is invalid", obj.Prefix)
 	}
-	if err := os.MkdirAll(obj.Prefix, 0770); err != nil {
+	// 0775 since we want children to be able to read this!
+	//nolint:gosec // G301: children must be able to read this prefix
+	if err := os.MkdirAll(obj.Prefix, 0775); err != nil {
 		return errwrap.Wrapf(err, "can't create prefix")
 	}
 
 	obj.state = make(map[pgraph.Vertex]*State)
+	obj.tlock = &sync.RWMutex{}
 	obj.waits = make(map[pgraph.Vertex]*sync.WaitGroup)
 	obj.wlock = &sync.Mutex{}
+
+	obj.mlock = &sync.Mutex{}
+	obj.metas = make(map[engine.ResPtrUID]*engine.MetaState) // don't include .Hidden res
 
 	obj.slock = &sync.Mutex{}
 	obj.semas = make(map[string]*semaphore.Semaphore)
 
+	obj.senders = make(map[string]engine.SendableRes)
+
+	obj.bgState = make(map[string]*bgState)
+
 	obj.wg = &sync.WaitGroup{}
 
-	obj.paused = true // start off true, so we can Resume after first Commit
+	//obj.paused = false // start off running (but empty)
+	obj.fastPause = &atomic.Bool{}
+	obj.interrupt = make(chan struct{})
+	obj.interruptOnce = &sync.Once{}
+
+	obj.errMutex = &sync.Mutex{}
+
+	obj.Exporter = &Exporter{
+		World: obj.World,
+		Debug: obj.Debug,
+		Logf: func(format string, v ...interface{}) {
+			// TODO: is this a sane prefix to use here?
+			obj.Logf("export: "+format, v...)
+		},
+	}
+	if err := obj.Exporter.Init(); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -138,7 +222,7 @@ func (obj *Engine) Validate() error {
 		}
 
 		if err := engine.Validate(res); err != nil {
-			return errwrap.Wrapf(err, "the Res did not Validate")
+			return fmt.Errorf("%s did not Validate: %v", res, err)
 		}
 	}
 	return nil
@@ -154,8 +238,33 @@ func (obj *Engine) Apply(fn func(*pgraph.Graph) error) error {
 // Commit runs a graph sync and swaps the loaded graph with the current one. If
 // it errors, then the running graph wasn't changed. It is recommended that you
 // pause the engine before running this, and resume it after you're done.
-func (obj *Engine) Commit() error {
+func (obj *Engine) Commit(ctx context.Context) error {
+	// It would be safer to lock this, but it would be slower and mask bugs.
+	//obj.mutex.Lock()
+	//defer obj.mutex.Unlock()
+
 	// TODO: Does this hurt performance or graph changes ?
+
+	backgroundKinds := make(map[string]int)
+
+	activeMetas := make(map[engine.ResPtrUID]struct{})
+	for vertex := range obj.state {
+		res, ok := vertex.(engine.Res)
+		if !ok { // should not happen, previously validated
+			return fmt.Errorf("not a Res")
+		}
+		// Skip this if Hidden since we can have a hidden res that has
+		// the same kind+name as a regular res, and this would conflict.
+		if res.MetaParams().Hidden {
+			continue
+		}
+
+		if _, ok := res.(engine.BackgroundRes); ok {
+			backgroundKinds[res.Kind()]++
+		}
+
+		activeMetas[engine.PtrUID(res)] = struct{}{} // add
+	}
 
 	start := []func() error{} // functions to run after graphsync to start...
 	vertexAddFn := func(vertex pgraph.Vertex) error {
@@ -174,12 +283,20 @@ func (obj *Engine) Commit() error {
 			return fmt.Errorf("the Res state already exists")
 		}
 
+		obj.addSenders(res)
+
+		// Skip this if Hidden since we can have a hidden res that has
+		// the same kind+name as a regular res, and this would conflict.
+		if !res.MetaParams().Hidden {
+			activeMetas[engine.PtrUID(res)] = struct{}{} // add
+		}
+
 		if obj.Debug {
 			obj.Logf("Validate(%s)", res)
 		}
 		err := engine.Validate(res)
 		if obj.Debug {
-			obj.Logf("Validate(%s): Return(%+v)", res, err)
+			obj.Logf("Validate(%s): Return(%s)", res, engineUtil.CleanError(err))
 		}
 		if err != nil {
 			return errwrap.Wrapf(err, "the Res did not Validate")
@@ -189,31 +306,46 @@ func (obj *Engine) Commit() error {
 		statePrefix := fmt.Sprintf("%s/", path.Join(obj.statePrefix(), pathUID))
 
 		// don't create this unless it *will* be used
-		//if err := os.MkdirAll(statePrefix, 0770); err != nil {
+		//if err := os.MkdirAll(statePrefix, 0775); err != nil {
 		//	return errwrap.Wrapf(err, "can't create state prefix")
 		//}
 
 		obj.waits[vertex] = &sync.WaitGroup{}
-		obj.state[vertex] = &State{
-			Graph:  obj.graph, // Update if we swap the graph!
+		state := &State{
+			// XXX: We are building a new node but it's getting the
+			// old graph right away? We do set it at the end of the
+			// commit, maybe make it nil right now and avoid that?
+			//Graph: obj.graph,
+			Graph:  nil, // Update if we swap the graph!
 			Vertex: vertex,
 
 			Program:  obj.Program,
 			Version:  obj.Version,
 			Hostname: obj.Hostname,
 
-			World:  obj.World,
-			Prefix: statePrefix,
-			//Converger: obj.Converger,
+			Converger: obj.Converger,
+			Local:     obj.Local,
+			World:     obj.World,
+			Prefix:    statePrefix,
 
 			Debug: obj.Debug,
 			Logf: func(format string, v ...interface{}) {
-				obj.Logf(res.String()+": "+format, v...)
+				obj.Logf("%s: %s", res, fmt.Sprintf(format, v...))
 			},
+
+			//paused: true, // start paused (set in Init)
 		}
-		if err := obj.state[vertex].Init(); err != nil {
+		if err := state.Init(ctx); err != nil {
 			return errwrap.Wrapf(err, "the Res did not Init")
 		}
+
+		// Only add it to the map once it's initialized, since the
+		// interrupt methods can read this map at any time, and they
+		// expect every state in here to be usable. The lock is needed
+		// for the same reason, since they run in another goroutine.
+		obj.tlock.Lock()
+		obj.state[vertex] = state
+		obj.tlock.Unlock()
 
 		fn := func() error {
 			// start the Worker
@@ -232,11 +364,25 @@ func (obj *Engine) Commit() error {
 					obj.wlock.Unlock()
 				}()
 
-				obj.Logf("Worker(%s)", v)
-				// contains the Watch and CheckApply loops
+				if obj.Debug {
+					obj.Logf("%s: Working...", v)
+				}
+				// This contains the Watch and CheckApply loops!
+				// When we start the Worker, Watch and then
+				// CheckApply would start running immediately,
+				// even though we're still in Commit and didn't
+				// Resume from Pause yet! This is *not* what we
+				// want. Watch can run but CheckApply must wait,
+				// so Worker makes sure that it starts paused...
 				err := obj.Worker(v)
-				obj.Logf("Worker(%s): Exited(%+v)", v, err)
+				if s := engineUtil.CleanError(err); err != nil {
+					obj.Logf("%s: Error: %s", v, s)
+				} else if obj.Debug {
+					obj.Logf("%s: Exited...", v)
+				}
+				obj.errMutex.Lock()
 				obj.state[v].workerErr = err // store the error
+				obj.errMutex.Unlock()
 				// If the Rewatch metaparam is true, then this will get
 				// restarted if we do a graph cmp swap. This is why the
 				// graph cmp function runs the removes before the adds.
@@ -250,20 +396,45 @@ func (obj *Engine) Commit() error {
 
 	free := []func() error{} // functions to run after graphsync to reset...
 	vertexRemoveFn := func(vertex pgraph.Vertex) error {
+		res, ok := vertex.(engine.Res)
+		if !ok { // should not happen, previously validated
+			return fmt.Errorf("not a Res")
+		}
+
+		// Skip this if Hidden since we can have a hidden res that has
+		// the same kind+name as a regular res, and this would conflict.
+		if !res.MetaParams().Hidden {
+			delete(activeMetas, engine.PtrUID(res))
+		}
+
+		// GraphSync runs every remove before any add, so a resource
+		// which is being replaced deletes itself here and the incoming
+		// one puts itself back below.
+		obj.deleteSenders(res)
+
 		// wait for exit before starting new graph!
-		close(obj.state[vertex].removeDone) // causes doneChan to close
-		obj.state[vertex].Resume()          // unblock from resume
-		obj.waits[vertex].Wait()            // sync
+		close(obj.state[vertex].removeDone)   // causes doneCtx to cancel
+		close(obj.state[vertex].resumeSignal) // unblock (it only closes here)
+
+		// add a watchdog to catch slow exiting or blocked resources
+		watchdogFn := func(msg string) {
+			obj.Logf("res: %s: %s", res, msg)
+		}
+		cancel := util.WatchdogFn(watchdogFn)
+		obj.waits[vertex].Wait() // sync
+		cancel()
 
 		// close the state and resource
 		// FIXME: will this mess up the sync and block the engine?
-		if err := obj.state[vertex].Close(); err != nil {
-			return errwrap.Wrapf(err, "the Res did not Close")
+		if err := obj.state[vertex].Cleanup(); err != nil {
+			return errwrap.Wrapf(err, "the Res did not Cleanup")
 		}
 
 		// delete to free up memory from old graphs
 		fn := func() error {
+			obj.tlock.Lock()
 			delete(obj.state, vertex)
+			obj.tlock.Unlock()
 			delete(obj.waits, vertex)
 			return nil
 		}
@@ -291,12 +462,15 @@ func (obj *Engine) Commit() error {
 		s1, ok1 := obj.state[v1]
 		s2, ok2 := obj.state[v2]
 		x1, x2 := false, false
+		// no need to have different mutexes for each state atm
+		obj.errMutex.Lock()
 		if ok1 {
 			x1 = s1.workerErr != nil && swap1
 		}
 		if ok2 {
 			x2 = s2.workerErr != nil && swap2
 		}
+		obj.errMutex.Unlock()
 
 		if x1 || x2 {
 			// We swap, even if they're the same, so that we reload!
@@ -314,6 +488,45 @@ func (obj *Engine) Commit() error {
 	if err := obj.graph.GraphSync(obj.nextGraph, vertexCmpFn, vertexAddFn, vertexRemoveFn, engine.EdgeCmpFn); err != nil {
 		return errwrap.Wrapf(err, "error running graph sync")
 	}
+
+	// This happens after GraphSync when vertexRemoveFn and vertexAddFn are
+	// done running. Those two modified the activeMetas map. It's important
+	// that vertexRemoveFn runs before vertexAddFn, but GraphSync guarantees
+	// that, and it would be kind of illogical to not run things that way.
+	metaGC := make(map[engine.ResPtrUID]struct{}) // which metas should we garbage collect?
+	obj.mlock.Lock()
+	for ptrUID := range obj.metas {
+		if _, exists := activeMetas[ptrUID]; !exists {
+			metaGC[ptrUID] = struct{}{}
+		}
+	}
+	for ptrUID := range metaGC {
+		delete(obj.metas, ptrUID) // otherwise, this could grow forever
+	}
+	obj.mlock.Unlock()
+
+	// Run StartBackground here before the Watch() for each resource starts.
+	// That Watch starts in the start loop below... We want the background
+	// up first since Watch might want to use something from the Background.
+	for _, vertex := range obj.graph.Vertices() { // TODO: sorted order?
+		res, ok := vertex.(engine.Res)
+		if !ok { // should not happen, previously validated
+			return fmt.Errorf("not a Res")
+		}
+
+		// don't start background if it's not supported or it's hidden!
+		if _, ok := res.(engine.BackgroundRes); !ok || res.MetaParams().Hidden {
+			continue
+		}
+		kind := res.Kind()
+
+		if err := obj.StartBackground(ctx, kind); err != nil {
+			obj.Logf("background(%s) start error: %v", kind, err)
+			return errwrap.Wrapf(err, "error starting background")
+		}
+		delete(backgroundKinds, kind) // don't need to start it anymore
+	}
+
 	// We run these afterwards, so that we don't unnecessarily start anyone
 	// if GraphSync failed in some way. Otherwise we'd have to do clean up!
 	for _, fn := range start {
@@ -334,8 +547,18 @@ func (obj *Engine) Commit() error {
 	// the changes that we'd made to the previously primary graph. This is
 	// because this function is meant to atomically swap the graphs safely.
 
-	// Update all the `State` structs with the new Graph pointer.
+	// Update all the `State` structs with the new Graph pointer. We also
+	// make a list of any res with realize so we don't scan again for it.
+	realizeSeeds := []pgraph.Vertex{}
 	for _, vertex := range obj.graph.Vertices() {
+		res, ok := vertex.(engine.Res)
+		if !ok { // should not happen, previously validated
+			return fmt.Errorf("not a Res")
+		}
+		if res.MetaParams().Realize {
+			realizeSeeds = append(realizeSeeds, vertex)
+		}
+
 		state, exists := obj.state[vertex]
 		if !exists {
 			continue
@@ -343,15 +566,39 @@ func (obj *Engine) Commit() error {
 		state.Graph = obj.graph // update pointer to graph
 	}
 
+	// Precompute the realize wait set once, now that the new graph is here.
+	// This is nil, unless a realize resource exists somewhere in the graph.
+	obj.realizeSet = obj.realizeWaitSet(realizeSeeds)
+
+	// Stop anything remaining here since they're not in the resource graph.
+	// The Watch functions of this kind must be done running by the time we
+	// run this cleanup! This prevents race conditions between the two...
+	for kind := range backgroundKinds {
+		if err := obj.StopBackground(kind); err != nil {
+			// TODO: should we shutdown the engine?
+			obj.Logf("background(%s) stop error: %v", kind, err)
+			// XXX: collect all stop errors and return them together?
+			return errwrap.Wrapf(err, "error stopping background")
+		}
+	}
+
 	return nil
 }
 
-// Resume runs the currently active graph. It also un-pauses the graph if it was
-// paused. Very little that is interesting should happen here. It all happens in
-// the Commit method. After Commit, new things are already started, but we still
-// need to Resume any pre-existing resources.
+// Resume un-pauses the active graph. Very little that is interesting should
+// happen here. It all happens in the Commit method. During Commit, the Worker
+// method starts which in turn causes Watch to start, however the main body of
+// the Worker starts in a paused mode. It waits for the resume signal before it
+// lets CheckApply run for the first time. No CheckApply methods may run when we
+// are paused. This also needs to Resume any pre-existing resources. Do not call
+// this concurrently with the Pause method.
 func (obj *Engine) Resume() error {
+	// It would be safer to lock this, but it would be slower and mask bugs.
+	//obj.mutex.Lock()
+	//defer obj.mutex.Unlock()
+
 	if !obj.paused {
+		// programming error
 		return fmt.Errorf("already resumed")
 	}
 
@@ -363,35 +610,212 @@ func (obj *Engine) Resume() error {
 	reversed := pgraph.Reverse(topoSort)
 
 	for _, vertex := range reversed {
+		// The very first resume is skipped as those resources are
+		// already running! We could do that by checking here, but it is
+		// more convenient to just have a state struct field (paused) to
+		// track things for this instead. As a bonus, it helps us know
+		// if a resource is paused or not if we print for debugging.
+
 		//obj.state[vertex].starter = (indegree[vertex] == 0)
-		obj.state[vertex].Resume() // doesn't error
+		if err := obj.state[vertex].Resume(); err != nil && err != engine.ErrClosed {
+			return err
+		}
+		// This always works because if a resource errored while it was
+		// paused, then we're in the paused state and we can still exit
+		// from there. If a resource errors when we're trying to Pause
+		// then it will only succeed without error if the resource ACKs.
 	}
 	// we wait for everyone to start before exiting!
 	obj.paused = false
 	return nil
 }
 
-// SetFastPause puts the graph into fast pause mode. This is usually done via
-// the argument to the Pause command, but this method can be used if a pause was
-// already started, and you'd like subsequent parts to pause quickly. Once in
-// fast pause mode for a given pause action, you cannot switch to regular pause.
-// This is because once you've started a fast pause, some dependencies might
-// have been skipped when fast pausing, and future resources might have missed a
-// poke. In general this is only called when you're trying to hurry up the exit.
-// XXX: Not implemented
-func (obj *Engine) SetFastPause() {
-	obj.fastPause = true
+// SetFastPause puts the graph into fast pause mode. Once in fast pause mode for
+// a given pause action, you cannot switch to regular pause. This is because
+// once you've started a fast pause, some dependencies might have been skipped
+// when fast pausing, and future resources might have missed a poke. In general
+// this is only called when you're trying to hurry up the exit.
+// XXX: consider moving this into SoftInterrupt and nuking it from the API.
+func (obj *Engine) SetFastPause(b bool) {
+	obj.fastPause.Store(b)
+}
+
+// SoftInterrupt cancels the context of every Process which is currently
+// running, and stops any new ones from starting. It is usually run on the
+// second ^C, once a pause has been requested and is taking longer than the user
+// is willing to wait for. A pause can only complete between two Process runs,
+// so without this the exit is at the mercy of whichever CheckApply happens to
+// be in flight, and the context that one received is not otherwise cancelled
+// until after that same pause has finished. Every resource is required to
+// return promptly when its context is cancelled, so this is enough for all of
+// the well behaved ones. See the Interrupt method for those which aren't, or
+// which block on something a context can't reach. This also flips the fast
+// pause to true which should hopefully prevent poke's from propagating.
+//
+// This is a one-way latch, since it is only ever used on the way out.
+func (obj *Engine) SoftInterrupt() {
+	// XXX: Should these two be used here at all? Can we save them for below?
+	obj.fastPause.Store(true) // stop any pending poke's from running
+	obj.setInterrupt()        // no new Process runs from here on
+
+	obj.tlock.RLock()
+	defer obj.tlock.RUnlock()
+	for _, state := range obj.state {
+		state.cancelProcess() // nil-safe if none is running
+	}
+}
+
+// Interrupt asks every resource which supports it to unblock whatever long
+// running operation it might be in the middle of. It is the last resort before
+// a kill -9, and it is usually run on the third ^C, after SoftInterrupt already
+// cancelled the contexts and something still hasn't let go. It only helps for
+// resources which block on something their context can't reach, such as a child
+// process, so most resources don't implement it. It may leave those which do in
+// a partial or unknown state, which is why it's the final rung and not an
+// earlier one. This never blocks: a resource which can't be interrupted returns
+// an error, which we log and step past.
+func (obj *Engine) HardInterrupt() error {
+	obj.fastPause.Store(true) // in case we got here without the above
+	obj.setInterrupt()        // in case we got here without the above
+
+	obj.tlock.RLock()
+	defer obj.tlock.RUnlock()
+
+	var reterr error
+	for vertex, state := range obj.state {
+		// in case we got here without the above
+		state.cancelProcess() // nil-safe if none is running
+
+		res, ok := vertex.(engine.Res)
+		if !ok {
+			continue
+		}
+		if err := obj.interruptRes(res); err != nil {
+			reterr = errwrap.Append(reterr, err)
+		}
+	}
+
+	return reterr
+}
+
+// setInterrupt records that the user asked us to stop waiting. It's safe to
+// call more than once.
+func (obj *Engine) setInterrupt() {
+	obj.interruptOnce.Do(func() {
+		close(obj.interrupt)
+	})
+}
+
+// interrupted reports whether the user asked us to stop waiting.
+func (obj *Engine) interrupted() bool {
+	select {
+	case <-obj.interrupt:
+		return true
+	default:
+		return false
+	}
+}
+
+// interruptRes runs Interrupt recursively into autogrouped resources. We
+// recurse, because a grouped resource since a parent may not be interruptible
+// while its children are.
+func (obj *Engine) interruptRes(res engine.Res) error {
+	var reterr error
+	if interruptibleRes, ok := res.(engine.InterruptibleRes); ok {
+		if err := interruptibleRes.Interrupt(); err != nil {
+			obj.Logf("%s: could not interrupt: %s", res, engineUtil.CleanError(err))
+			reterr = errwrap.Append(reterr, err)
+		}
+	}
+
+	groupableRes, ok := res.(engine.GroupableRes)
+	if !ok {
+		return reterr
+	}
+	for _, x := range groupableRes.GetGroup() { // grouped elements
+		if err := obj.interruptRes(x); err != nil { // recurse
+			reterr = errwrap.Append(reterr, err)
+		}
+	}
+
+	return reterr
+}
+
+// realizeWaitSet returns the set of vertices whose runnable work a graph swap
+// must wait for before it pauses them. This is every resource with the realize
+// metaparam, plus all of their transitive prerequisites, since a realize
+// resource can only run correctly once its prerequisites have run. Because we
+// pause in topological order, waiting for each of these in turn realizes a
+// prerequisite before the resource which depends on it, so there is never a
+// blocked backpoke and never a deadlock.
+//
+// To avoid running this excessively, we compute the seeds during the existing
+// graph walk after GraphSync, and we cache the result in obj.realizeSet so that
+// it's ready when Pause needs to read it. A nil result is very common and cheap
+// and occurs when there aren't any realize metaparams being used.
+func (obj *Engine) realizeWaitSet(seeds []pgraph.Vertex) map[pgraph.Vertex]struct{} {
+	if len(seeds) == 0 {
+		return nil // nobody uses the realize metaparam, so no waiting
+	}
+
+	set := make(map[pgraph.Vertex]struct{})
+	// The keys of revadjmap[v] are the prerequisites of v, walked directly
+	// to avoid allocating a slice per node like IncomingGraphVertices does.
+	revadjmap := obj.graph.ReverseAdjacency()
+	// walk up to add each realize resource and all of its prerequisites
+	stack := append([]pgraph.Vertex{}, seeds...)
+	for len(stack) > 0 {
+		v := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if _, exists := set[v]; exists {
+			continue // already visited, don't re-walk
+		}
+		set[v] = struct{}{}
+		// IncomingGraphVertices are the prerequisites of v
+		//stack = append(stack, obj.graph.IncomingGraphVertices(v)...) // slow
+		for prereq := range revadjmap[v] { // fast
+			stack = append(stack, prereq)
+		}
+	}
+	return set
+}
+
+// waitRealized implements the realize metaparam. Before we pause a resource in
+// the realize set (see realizeWaitSet) we wait until it has no pending work
+// which it could run, so that the graph swap waits for that work. Since the set
+// includes every prerequisite of a realize resource, and we pause in
+// topological order, each prerequisite is realized (it is run) before we pause
+// it, so that we're good by the time we reach the resource which depends on
+// this. That resource is then unblocked and can run correctly too, which is why
+// there is no deadlock. A prerequisite which runs async loses its async
+// behaviour here, since we wait for its CheckApply to finish before pausing it.
+func (obj *Engine) waitRealized(state *State) {
+	if obj.fastPause.Load() {
+		return
+	}
+	select {
+	case <-state.realizedChan():
+	case <-state.doneCtx.Done(): // it's exiting
+	case <-obj.interrupt: // the user asked us to stop waiting
+	}
 }
 
 // Pause the active, running graph.
-func (obj *Engine) Pause(fastPause bool) error {
+func (obj *Engine) Pause() error {
+	// It would be safer to lock this, but it would be slower and mask bugs.
+	//obj.mutex.Lock()
+	//defer obj.mutex.Unlock()
+
 	if obj.paused {
+		// programming error
 		return fmt.Errorf("already paused")
 	}
 
-	obj.fastPause = fastPause
 	topoSort, _ := obj.graph.TopologicalSort()
 	for _, vertex := range topoSort { // squeeze out the events...
+		if _, ok := obj.realizeSet[vertex]; ok {
+			obj.waitRealized(obj.state[vertex]) // realize waits here
+		}
 		// The Event is sent to an unbuffered channel, so this event is
 		// synchronous, and as a result it blocks until it is received.
 		if err := obj.state[vertex].Pause(); err != nil && err != engine.ErrClosed {
@@ -402,13 +826,22 @@ func (obj *Engine) Pause(fastPause bool) error {
 	obj.paused = true
 
 	// we are now completely paused...
-	obj.fastPause = false // reset
 	return nil
 }
 
-// Close triggers a shutdown. Engine must be already paused before this is run.
-func (obj *Engine) Close() error {
+// Shutdown the engine. Engine must be already paused before this is run. It is
+// actually just a Load of an empty graph and a Commit. It waits for all the
+// resources to exit before returning.
+func (obj *Engine) Shutdown() error {
+	obj.isClosing = true
 	emptyGraph, reterr := pgraph.NewGraph("empty")
+
+	// In case we're being called inappropriately, error, but keep doing it.
+	if !obj.paused && len(obj.state) > 0 {
+		// programming error
+		err := fmt.Errorf("the engine must be paused before it is shut down")
+		reterr = errwrap.Append(reterr, err)
+	}
 
 	// this is a graph switch (graph sync) that switches to an empty graph!
 	if err := obj.Load(emptyGraph); err != nil { // copy in empty graph
@@ -416,12 +849,29 @@ func (obj *Engine) Close() error {
 	}
 	// FIXME: Do we want to run commit if Load failed? Does this even work?
 	// the commit will cause the graph sync to shut things down cleverly...
-	if err := obj.Commit(); err != nil {
+	// Don't cancel this context, because we want to shut down cleanly!
+	if err := obj.Commit(context.Background()); err != nil {
+		reterr = errwrap.Append(reterr, err)
+	}
+
+	// check to make sure all the background functions are done running!
+	if d := len(obj.bgState); d > 0 {
+		// programming error
+		err := fmt.Errorf("%d background functions didn't exit", d)
 		reterr = errwrap.Append(reterr, err)
 	}
 
 	obj.wg.Wait() // for now, this doesn't need to be a separate Wait() method
 	return reterr
+}
+
+// IsClosing tells the caller if a Shutdown() was run. This is helpful so that
+// the graph can behave slightly differently when receiving the final empty
+// graph. This is because it's empty because we passed one to unload everything,
+// not because the user actually removed all resources. We may want to preserve
+// the exported state for example, and not purge it.
+func (obj *Engine) IsClosing() bool {
+	return obj.isClosing
 }
 
 // Graph returns the running graph.

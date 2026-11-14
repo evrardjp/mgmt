@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,12 +13,25 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package engine
 
 import (
 	"fmt"
+	"sync/atomic"
 )
 
 // Edge is a struct that represents a graph's edge.
@@ -26,7 +39,10 @@ type Edge struct {
 	Name   string
 	Notify bool // should we send a refresh notification along this edge?
 
-	refresh bool // is there a notify pending for the dest vertex ?
+	// XXX: If we could find a more elegant way to handle ownership reads
+	// and writes in the parallel resource engine, we may not need atomics
+	// here. Consider both this one and the isStateOK atomic if possible.
+	refresh atomic.Bool // is there a notify pending for the dest vertex ?
 }
 
 // String is a required method of the Edge interface that we must fulfill.
@@ -51,10 +67,10 @@ func (obj *Edge) Cmp(edge *Edge) error {
 
 // Refresh returns the pending refresh status of this edge.
 func (obj *Edge) Refresh() bool {
-	return obj.refresh
+	return obj.refresh.Load()
 }
 
 // SetRefresh sets the pending refresh status of this edge.
 func (obj *Edge) SetRefresh(b bool) {
-	obj.refresh = b
+	obj.refresh.Store(b)
 }

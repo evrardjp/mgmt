@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,23 +13,35 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
-// +build !noaugeas
+//go:build !noaugeas
 
 package resources
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
 
 	"github.com/purpleidea/mgmt/engine"
+	"github.com/purpleidea/mgmt/engine/resources/augeas"
 	"github.com/purpleidea/mgmt/engine/traits"
-	"github.com/purpleidea/mgmt/recwatch"
 	"github.com/purpleidea/mgmt/util/errwrap"
-
-	"honnef.co/go/augeas"
+	"github.com/purpleidea/mgmt/util/recwatch"
 )
 
 const (
@@ -49,24 +61,22 @@ type AugeasRes struct {
 	init *engine.Init
 
 	// File is the path to the file targeted by this resource.
-	File string `yaml:"file"`
+	File string `lang:"file" yaml:"file"`
 
-	// Lens is the lens used by this resource. If specified, mgmt
-	// will lower the augeas overhead by only loading that lens.
-	Lens string `yaml:"lens"`
+	// Lens is the lens used by this resource. If specified, mgmt will lower
+	// the augeas overhead by only loading that lens.
+	Lens string `lang:"lens" yaml:"lens"`
 
-	// Sets is a list of changes that will be applied to the file, in the form of
-	// ["path", "value"]. mgmt will run augeas.Get() before augeas.Set(), to
-	// prevent changing the file when it is not needed.
-	Sets []*AugeasSet `yaml:"sets"`
-
-	recWatcher *recwatch.RecWatcher // used to watch the changed files
+	// Sets is a list of changes that will be applied to the file, in the
+	// form of ["path", "value"]. mgmt will run augeas.Get() before
+	// augeas.Set(), to prevent changing the file when it is not needed.
+	Sets []*AugeasSet `lang:"sets" yaml:"sets"`
 }
 
 // AugeasSet represents a key/value pair of settings to be applied.
 type AugeasSet struct {
-	Path  string `yaml:"path"`  // The relative path to the value to be changed.
-	Value string `yaml:"value"` // The value to be set on the given Path.
+	Path  string `lang:"path" yaml:"path"`   // The relative path to the value to be changed.
+	Value string `lang:"value" yaml:"value"` // The value to be set on the given Path.
 }
 
 // Cmp compares this set with another one.
@@ -114,60 +124,71 @@ func (obj *AugeasRes) Validate() error {
 func (obj *AugeasRes) Init(init *engine.Init) error {
 	obj.init = init // save for later
 
+	// The library might be loaded at runtime, so check that we can use it
+	// now, and fail early with a useful error, instead of in CheckApply.
+	if err := augeas.Available(); err != nil {
+		// TODO: print the possible pkg to install on this distro
+		return errwrap.Wrapf(err, "can't use augeas, is it installed?")
+	}
+
 	return nil
 }
 
-// Close is run by the engine to clean up after the resource is done.
-func (obj *AugeasRes) Close() error {
+// Cleanup is run by the engine to clean up after the resource is done.
+func (obj *AugeasRes) Cleanup() error {
 	return nil
 }
 
 // Watch is the primary listener for this resource and it outputs events. This
 // was taken from the File resource.
 // FIXME: DRY - This is taken from the file resource
-func (obj *AugeasRes) Watch() error {
-	var err error
-	obj.recWatcher, err = recwatch.NewRecWatcher(obj.File, false)
+func (obj *AugeasRes) Watch(ctx context.Context) error {
+	recWatcher, err := recwatch.NewRecWatcher(ctx, obj.File, false)
 	if err != nil {
 		return err
 	}
-	defer obj.recWatcher.Close()
+	defer recWatcher.Cleanup()
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
-	var send = false // send event?
 	for {
 		if obj.init.Debug {
-			obj.init.Logf("Watching: %s", obj.File) // attempting to watch...
+			obj.init.Logf("watching: %s", obj.File) // attempting to watch...
 		}
 
 		select {
-		case event, ok := <-obj.recWatcher.Events():
+		case event, ok := <-recWatcher.Events():
+			if ctx.Err() != nil {
+				return ctx.Err() // engine is shutting us down
+			}
 			if !ok { // channel shutdown
 				return nil
 			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
+			}
 			if err := event.Error; err != nil {
-				return errwrap.Wrapf(err, "Unknown %s watcher error", obj)
+				return err
 			}
 			if obj.init.Debug { // don't access event.Body if event.Error isn't nil
-				obj.init.Logf("Event(%s): %v", event.Body.Name, event.Body.Op)
+				obj.init.Logf("event(%s): %v", event.Body.Name, event.Body.Op)
 			}
-			send = true
 
-		case <-obj.init.Done: // closed by the engine to signal shutdown
-			return nil
+		case <-ctx.Done(): // closed by the engine to signal shutdown
+			return ctx.Err()
 		}
 
-		// do all our event sending all together to avoid duplicate msgs
-		if send {
-			send = false
-			obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
 		}
 	}
 }
 
 // checkApplySet runs CheckApply for one element of the AugeasRes.Set
-func (obj *AugeasRes) checkApplySet(apply bool, ag *augeas.Augeas, set *AugeasSet) (bool, error) {
+func (obj *AugeasRes) checkApplySet(ctx context.Context, apply bool, ag *augeas.Augeas, set *AugeasSet) (bool, error) {
 	fullpath := fmt.Sprintf("/files/%v/%v", obj.File, set.Path)
 
 	// We do not check for errors because errors are also thrown when
@@ -185,15 +206,14 @@ func (obj *AugeasRes) checkApplySet(apply bool, ag *augeas.Augeas, set *AugeasSe
 	}
 
 	if err := ag.Set(fullpath, set.Value); err != nil {
-		return false, errwrap.Wrapf(err, "augeas: error while setting value")
+		return false, errwrap.Wrapf(err, "error while setting value")
 	}
 
 	return false, nil
 }
 
 // CheckApply method for Augeas resource.
-func (obj *AugeasRes) CheckApply(apply bool) (bool, error) {
-	obj.init.Logf("CheckApply: %s", obj.File)
+func (obj *AugeasRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 	// By default we do not set any option to augeas, we use the defaults.
 	opts := augeas.None
 	if obj.Lens != "" {
@@ -207,7 +227,7 @@ func (obj *AugeasRes) CheckApply(apply bool) (bool, error) {
 	// Initiate augeas
 	ag, err := augeas.New("/", "", opts)
 	if err != nil {
-		return false, errwrap.Wrapf(err, "augeas: error while initializing")
+		return false, errwrap.Wrapf(err, "error while initializing")
 	}
 	defer ag.Close()
 
@@ -217,20 +237,20 @@ func (obj *AugeasRes) CheckApply(apply bool) (bool, error) {
 		// We do not pick Mgmt as in the future there might be an Mgmt lens.
 		// https://github.com/hercules-team/augeas/wiki/Loading-specific-files
 		if err = ag.Set(fmt.Sprintf("/augeas/load/%s/lens", NS), obj.Lens); err != nil {
-			return false, errwrap.Wrapf(err, "augeas: error while initializing lens")
+			return false, errwrap.Wrapf(err, "error while initializing lens")
 		}
 		if err = ag.Set(fmt.Sprintf("/augeas/load/%s/incl", NS), obj.File); err != nil {
-			return false, errwrap.Wrapf(err, "augeas: error while initializing incl")
+			return false, errwrap.Wrapf(err, "error while initializing incl")
 		}
 		if err = ag.Load(); err != nil {
-			return false, errwrap.Wrapf(err, "augeas: error while loading")
+			return false, errwrap.Wrapf(err, "error while loading")
 		}
 	}
 
 	checkOK := true
 	for _, set := range obj.Sets {
-		if setCheckOK, err := obj.checkApplySet(apply, &ag, set); err != nil {
-			return false, errwrap.Wrapf(err, "augeas: error during CheckApply of one Set")
+		if setCheckOK, err := obj.checkApplySet(ctx, apply, ag, set); err != nil {
+			return false, errwrap.Wrapf(err, "error during CheckApply of one Set")
 		} else if !setCheckOK {
 			checkOK = false
 		}
@@ -243,14 +263,14 @@ func (obj *AugeasRes) CheckApply(apply bool) (bool, error) {
 
 	obj.init.Logf("changes needed, saving")
 	if err = ag.Save(); err != nil {
-		return false, errwrap.Wrapf(err, "augeas: error while saving augeas values")
+		return false, errwrap.Wrapf(err, "error while saving augeas values")
 	}
 
 	// FIXME: Workaround for https://github.com/dominikh/go-augeas/issues/13
 	// To be fixed upstream.
 	if obj.File != "" {
 		if _, err := os.Stat(obj.File); os.IsNotExist(err) {
-			return false, errwrap.Wrapf(err, "augeas: error: file does not exist")
+			return false, errwrap.Wrapf(err, "file does not exist")
 		}
 	}
 

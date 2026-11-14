@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,9 +13,21 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
-// +build !root
+//go:build !root
 
 package util
 
@@ -166,4 +178,108 @@ func ExampleSubscribedSignal() {
 	// done sending ack
 	// done sending signal
 	// exiting...
+}
+
+func ExampleBoundedReadSemaphore() {
+	fmt.Printf("hello\n")
+	defer fmt.Printf("goodbye\n")
+
+	wg := &sync.WaitGroup{}
+	defer wg.Wait()
+
+	ch := make(chan struct{}) // close signal
+
+	brs := NewBoundedReadSemaphore()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		brs.Lock()
+		defer brs.Unlock()
+		time.Sleep(100 * time.Millisecond) // delay for consistent print
+
+		fmt.Printf("#1 is in the locked zone\n")
+		time.Sleep(1 * time.Second)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		brs.Lock()
+		defer brs.Unlock()
+		time.Sleep(200 * time.Millisecond) // delay for consistent print
+
+		fmt.Printf("#2 is in the locked zone\n")
+		time.Sleep(2 * time.Second)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		brs.Lock()
+		defer brs.Unlock()
+		time.Sleep(300 * time.Millisecond) // delay for consistent print
+
+		fmt.Printf("#3 is in the locked zone\n")
+		time.Sleep(3 * time.Second)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(ch) // exit signal
+		max := 2        // configure me
+		for {
+			if max == 0 {
+				break
+			}
+			max--
+			time.Sleep(4 * time.Second)
+			brs.Lock()
+			time.Sleep(100 * time.Millisecond) // delay for consistent print
+			fmt.Printf("#4 is in the locked zone\n")
+
+			brs.Unlock()
+			time.Sleep(100 * time.Millisecond) // delay for consistent print
+			fmt.Printf("#4 is in the unlocked zone\n")
+		}
+	}()
+
+Loop:
+	for {
+		select {
+		case <-ch: // exit signal
+			break Loop
+
+		case <-brs.Start(): // An empty value is received to start the locking.
+			fmt.Printf("shared mutex start\n")
+		}
+
+		// subsequent Lock's that happen when at least one Lock is
+		// already held are permitted...
+		time.Sleep(1 * time.Second)
+
+		// something happens here
+
+		select {
+		case <-brs.End(): // An empty values is received when the last Unlock happens.
+			fmt.Printf("shared mutex end\n")
+		}
+	}
+
+	// Output: hello
+	// shared mutex start
+	// #1 is in the locked zone
+	// #2 is in the locked zone
+	// #3 is in the locked zone
+	// shared mutex end
+	// shared mutex start
+	// #4 is in the locked zone
+	// shared mutex end
+	// #4 is in the unlocked zone
+	// shared mutex start
+	// #4 is in the locked zone
+	// shared mutex end
+	// #4 is in the unlocked zone
+	// goodbye
 }

@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,9 +13,21 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
-// +build !root
+//go:build !root
 
 package pgraph
 
@@ -42,7 +54,7 @@ func TestAddEdgeGraph1(t *testing.T) {
 
 	g.AddGraph(sub)
 
-	// expected (can re-use the same vertices)
+	// expected (can reuse the same vertices)
 	expected := &Graph{}
 	expected.AddEdge(v1, v3, e1)
 	expected.AddEdge(v2, v3, e2)
@@ -52,7 +64,7 @@ func TestAddEdgeGraph1(t *testing.T) {
 	//expected.AddEdge(v3, v5, NE("v3,v5"))
 
 	if s := runGraphCmp(t, g, expected); s != "" {
-		t.Errorf("%s", s)
+		t.Error(s)
 	}
 }
 
@@ -75,7 +87,7 @@ func TestAddEdgeVertexGraph1(t *testing.T) {
 
 	g.AddEdgeVertexGraph(v3, sub, edgeGenFn)
 
-	// expected (can re-use the same vertices)
+	// expected (can reuse the same vertices)
 	expected := &Graph{}
 	expected.AddEdge(v1, v3, e1)
 	expected.AddEdge(v2, v3, e2)
@@ -85,7 +97,7 @@ func TestAddEdgeVertexGraph1(t *testing.T) {
 	expected.AddEdge(v3, v5, NE("v3,v5"))
 
 	if s := runGraphCmp(t, g, expected); s != "" {
-		t.Errorf("%s", s)
+		t.Error(s)
 	}
 }
 
@@ -108,7 +120,7 @@ func TestAddEdgeGraphVertex1(t *testing.T) {
 
 	g.AddEdgeGraphVertex(sub, v3, edgeGenFn)
 
-	// expected (can re-use the same vertices)
+	// expected (can reuse the same vertices)
 	expected := &Graph{}
 	expected.AddEdge(v1, v3, e1)
 	expected.AddEdge(v2, v3, e2)
@@ -118,7 +130,7 @@ func TestAddEdgeGraphVertex1(t *testing.T) {
 	expected.AddEdge(v5, v3, NE("v5,v3"))
 
 	if s := runGraphCmp(t, g, expected); s != "" {
-		t.Errorf("%s", s)
+		t.Error(s)
 	}
 }
 
@@ -141,7 +153,7 @@ func TestAddEdgeVertexGraphLight1(t *testing.T) {
 
 	g.AddEdgeVertexGraphLight(v3, sub, edgeGenFn)
 
-	// expected (can re-use the same vertices)
+	// expected (can reuse the same vertices)
 	expected := &Graph{}
 	expected.AddEdge(v1, v3, e1)
 	expected.AddEdge(v2, v3, e2)
@@ -151,7 +163,7 @@ func TestAddEdgeVertexGraphLight1(t *testing.T) {
 	//expected.AddEdge(v3, v5, NE("v3,v5")) // not needed with light
 
 	if s := runGraphCmp(t, g, expected); s != "" {
-		t.Errorf("%s", s)
+		t.Error(s)
 	}
 }
 
@@ -174,7 +186,7 @@ func TestAddEdgeGraphVertexLight1(t *testing.T) {
 
 	g.AddEdgeGraphVertexLight(sub, v3, edgeGenFn)
 
-	// expected (can re-use the same vertices)
+	// expected (can reuse the same vertices)
 	expected := &Graph{}
 	expected.AddEdge(v1, v3, e1)
 	expected.AddEdge(v2, v3, e2)
@@ -184,6 +196,6 @@ func TestAddEdgeGraphVertexLight1(t *testing.T) {
 	expected.AddEdge(v5, v3, NE("v5,v3"))
 
 	if s := runGraphCmp(t, g, expected); s != "" {
-		t.Errorf("%s", s)
+		t.Error(s)
 	}
 }

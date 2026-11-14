@@ -1,0 +1,20 @@
+-- CONFIG --
+{
+	"nofmt": true
+}
+-- main.mcl --
+import "fmt"
+# unfortunately, for now `in` is a reserved keyword, see:
+# https://github.com/purpleidea/mgmt/issues/728
+$map = 55
+$fn = func($in) { # in is a special keyword
+	13
+}
+test fmt.printf("%d", $fn(0)) {}
+func fn($in) { # in is a special keyword
+	42 + $map
+}
+test fmt.printf("%d", $fn(0)) {}
+test fmt.printf("%d", fn(0)) {}
+-- OUTPUT --
+# err: errLexParse: parser: `syntax error: unexpected IN, expecting MAP_IDENTIFIER or IDENTIFIER or COLLECT_IDENTIFIER`: /main.mcl @ 5:13-5:14

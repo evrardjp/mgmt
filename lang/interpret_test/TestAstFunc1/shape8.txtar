@@ -1,0 +1,38 @@
+-- main.mcl --
+$gt = func($one, $two) {
+	$one > $two
+}
+
+$lambda1 = func($x) {
+	$x + "!"
+}
+$lambda2 = func($x) {
+	$x + "?"
+}
+
+$lambda = if $gt(10, 0) { # must be a const, otherwise this is a dynamic graph
+	$lambda1
+} else {
+	$lambda2
+}
+
+test [$lambda("hello")] {}
+-- OUTPUT --
+Edge: _operator -> exprif # condition
+Edge: call -> callSubgraphOutput # dummy
+Edge: callSubgraphOutput -> composite: []str # 0
+Edge: const: int(0) -> _operator # b
+Edge: const: int(10) -> _operator # a
+Edge: const: str(">") -> _operator # op
+Edge: exprIfSubgraphOutput -> call # fn
+Edge: exprif -> exprIfSubgraphOutput # dummy
+Vertex: _operator
+Vertex: call
+Vertex: callSubgraphOutput
+Vertex: composite: []str
+Vertex: const: int(0)
+Vertex: const: int(10)
+Vertex: const: str(">")
+Vertex: const: str("hello")
+Vertex: exprIfSubgraphOutput
+Vertex: exprif

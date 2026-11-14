@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,21 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
+
+//go:build !noconsul
 
 package resources
 
@@ -25,7 +39,6 @@ import (
 
 	"github.com/purpleidea/mgmt/engine"
 	"github.com/purpleidea/mgmt/engine/traits"
-	"github.com/purpleidea/mgmt/util"
 	"github.com/purpleidea/mgmt/util/errwrap"
 
 	"github.com/hashicorp/consul/api"
@@ -108,8 +121,8 @@ func (obj *ConsulKVRes) Init(init *engine.Init) error {
 	return errwrap.Wrapf(err, "could not create Consul client")
 }
 
-// Close is run by the engine to clean up after the resource is done.
-func (obj *ConsulKVRes) Close() error {
+// Cleanup is run by the engine to clean up after the resource is done.
+func (obj *ConsulKVRes) Cleanup() error {
 	if obj.config != nil && obj.config.Transport != nil {
 		obj.config.Transport.CloseIdleConnections()
 	}
@@ -117,12 +130,14 @@ func (obj *ConsulKVRes) Close() error {
 }
 
 // Watch is the listener and main loop for this resource and it outputs events.
-func (obj *ConsulKVRes) Watch() error {
+func (obj *ConsulKVRes) Watch(ctx context.Context) error {
 	wg := &sync.WaitGroup{}
 	defer wg.Wait()
 
+	innerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	ch := make(chan error)
-	exit := make(chan struct{})
 
 	kv := obj.client.KV()
 
@@ -132,9 +147,7 @@ func (obj *ConsulKVRes) Watch() error {
 		defer wg.Done()
 
 		opts := &api.QueryOptions{RequireConsistent: true}
-		ctx, cancel := util.ContextWithCloser(context.Background(), exit)
-		defer cancel()
-		opts = opts.WithContext(ctx)
+		opts = opts.WithContext(innerCtx)
 
 		for {
 			_, meta, err := kv.Get(obj.key, opts)
@@ -154,7 +167,12 @@ func (obj *ConsulKVRes) Watch() error {
 				}
 
 				if !obj.once {
-					obj.init.Running()
+					if err := obj.init.Event(ctx); err != nil {
+						select {
+						case ch <- err:
+						case <-ctx.Done(): // signal for shutdown request
+						}
+					}
 					obj.once = true
 					continue
 				}
@@ -162,16 +180,15 @@ func (obj *ConsulKVRes) Watch() error {
 				// Unexpected situation, bug in consul API...
 				select {
 				case ch <- fmt.Errorf("unexpected behaviour in Consul API"):
-				case <-obj.init.Done: // signal for shutdown request
+				case <-ctx.Done(): // signal for shutdown request
 				}
 
-			case <-obj.init.Done: // signal for shutdown request
+			case <-ctx.Done(): // signal for shutdown request
 			}
 			return
 		}
 	}()
 
-	defer close(exit)
 	for {
 		select {
 		case err, ok := <-ch:
@@ -184,10 +201,12 @@ func (obj *ConsulKVRes) Watch() error {
 			if obj.init.Debug {
 				obj.init.Logf("event!")
 			}
-			obj.init.Event()
+			if err := obj.init.Event(ctx); err != nil {
+				return err
+			}
 
-		case <-obj.init.Done: // signal for shutdown request
-			return nil
+		case <-ctx.Done(): // signal for shutdown request
+			return ctx.Err()
 		}
 	}
 }
@@ -195,7 +214,8 @@ func (obj *ConsulKVRes) Watch() error {
 // CheckApply is run to check the state and, if apply is true, to apply the
 // necessary changes to reach the desired state. This is run before Watch and
 // again if Watch finds a change occurring to the state.
-func (obj *ConsulKVRes) CheckApply(apply bool) (bool, error) {
+func (obj *ConsulKVRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
+	// XXX: use ctx for get and put
 	if obj.init.Debug {
 		obj.init.Logf("consul key: %s", obj.key)
 	}

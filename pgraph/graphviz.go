@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,28 +13,113 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package pgraph // TODO: this should be a subpackage
 
 import (
+	"context"
 	"fmt"
 	"html"
-	"io/ioutil"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
+	"strings"
 	"syscall"
+
+	"github.com/purpleidea/mgmt/util/errwrap"
 )
 
 const (
+	// graphvizDefaultFilter is the default program to run when none are
+	// specified.
+	graphvizDefaultFilter = "dot"
+
 	ptrLabels     = true
 	ptrLabelsSize = 10
 )
 
-// Graphviz outputs the graph in graphviz format.
+// Graphvizable is a simple interface to handle the common signature for this
+// useful graphviz exec method that is used in debugging. Expect that this
+// signature might change if the authors find a different variant more useful.
+type Graphvizable interface {
+
+	// ExecGraphviz runs graphviz and stores the result at this absolute
+	// path. It (awkwardly) can be used by someone expecting either a
+	// filename, or a directory. The filename scenario should be used if you
+	// are expecting a single .dot output file. The directory scenario
+	// should be used if you are expecting a series of .dot graphs.
+	// Directories must end with a trailing slash. A filename passed will
+	// get this location overwritten if there is something already there. If
+	// the string is empty, it might create a file in a temporary directory
+	// somewhere.
+	ExecGraphviz(ctx context.Context, filename string) error
+}
+
+// Graphviz adds some visualization features for pgraph.
+type Graphviz struct {
+	// Name is the display name of the graph. If specified it overrides an
+	// amalgamation of any graph names shown.
+	Name string
+
+	// Graphs is a collection of graphs to print together and the associated
+	// options that should be used to format them during display.
+	Graphs map[*Graph]*GraphvizOpts
+
+	// Filter is the graphviz program to run. The default is "dot".
+	Filter string
+
+	// Filename is the output location for the graph.
+	Filename string
+
+	// Hostname is used as a suffix to the filename when specified.
+	Hostname string
+}
+
+// graphs returns a list of the graphs in a probably deterministic order.
+func (obj *Graphviz) graphs() []*Graph {
+	graphs := []*Graph{}
+	for g := range obj.Graphs {
+		graphs = append(graphs, g)
+	}
+
+	sort.Slice(graphs, func(i, j int) bool { return graphs[i].GetName() < graphs[j].GetName() })
+
+	return graphs
+}
+
+// name returns a unique name for the combination of graphs.
+func (obj *Graphviz) name() string {
+	if obj.Name != "" {
+		return obj.Name
+	}
+	names := []string{}
+	//for g := range obj.Graphs {
+	//	names = append(names, g.GetName())
+	//}
+	//sort.Strings(names) // deterministic
+	for _, g := range obj.graphs() { // deterministic
+		names = append(names, g.GetName())
+	}
+	return strings.Join(names, "|") // arbitrary join character
+}
+
+// Text outputs the graph in graphviz format.
 // https://en.wikipedia.org/wiki/DOT_%28graph_description_language%29
-func (g *Graph) Graphviz() (out string) {
+func (obj *Graphviz) Text() string {
 	//digraph g {
 	//	label="hello world";
 	//	node [shape=box];
@@ -47,23 +132,123 @@ func (g *Graph) Graphviz() (out string) {
 	//	B -> C [label=g];
 	//	D -> E [label=h];
 	//}
-	out += fmt.Sprintf("digraph \"%s\" {\n", g.GetName())
-	out += fmt.Sprintf("\tlabel=\"%s\";\n", g.GetName())
-	//out += "\tnode [shape=box];\n"
+
 	str := ""
-	// XXX: add determinism to this loop
-	for i := range g.Adjacency() { // reverse paths
+	name := obj.name()
+	str += fmt.Sprintf("digraph \"%s\" {\n", name)
+	str += fmt.Sprintf("\tlabel=\"%s\";\n", name)
+	//if obj.filter() == "dot" || true {
+	str += fmt.Sprintf("\tnewrank=true;\n")
+	//}
+
+	//str += "\tnode [shape=box];\n"
+
+	for _, g := range obj.graphs() { // deterministic
+		str += g.graphvizBody(obj.Graphs[g])
+	}
+
+	str += "}\n"
+
+	return str
+}
+
+// Exec writes out the graphviz data and runs the correct graphviz filter
+// command.
+func (obj *Graphviz) Exec(ctx context.Context) error {
+	filter := ""
+	switch obj.Filter {
+	case "":
+		filter = graphvizDefaultFilter
+
+	case "dot", "neato", "twopi", "circo", "fdp", "sfdp", "patchwork", "osage":
+		filter = obj.Filter
+
+	default:
+		return fmt.Errorf("invalid graphviz filter selected")
+	}
+
+	if obj.Filename == "" {
+		return fmt.Errorf("no filename given")
+	}
+
+	filename := obj.Filename
+	if obj.Hostname != "" {
+		filename = fmt.Sprintf("%s@%s", obj.Filename, obj.Hostname)
+	}
+
+	// run as a normal user if possible when run with sudo
+	uid, err1 := strconv.Atoi(os.Getenv("SUDO_UID"))
+	gid, err2 := strconv.Atoi(os.Getenv("SUDO_GID"))
+
+	if err := os.WriteFile(filename, []byte(obj.Text()), 0600); err != nil {
+		return errwrap.Wrapf(err, "error writing to filename")
+	}
+
+	if err1 == nil && err2 == nil && uid >= 0 && gid >= 0 {
+		if err := os.Chown(filename, uid, gid); err != nil {
+			return errwrap.Wrapf(err, "error changing file owner")
+		}
+	}
+
+	path, err := exec.LookPath(filter)
+	if err != nil {
+		return errwrap.Wrapf(err, "the Graphviz filter is missing")
+	}
+
+	out := fmt.Sprintf("%s.png", filename)
+	cmd := exec.CommandContext(ctx, path, "-Tpng", fmt.Sprintf("-o%s", out), filename)
+
+	if err1 == nil && err2 == nil && uid >= 0 && gid >= 0 {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+		cmd.SysProcAttr.Credential = &syscall.Credential{
+			Uid: uint32(uid), //nolint:gosec // G115: guarded non-negative above
+			Gid: uint32(gid), //nolint:gosec // G115: guarded non-negative above
+		}
+	}
+
+	if _, err := cmd.Output(); err != nil {
+		return errwrap.Wrapf(err, "error writing to image")
+	}
+	return nil
+
+}
+
+// GraphvizOpts specifies some formatting for each graph.
+type GraphvizOpts struct {
+	// Style represents the node style string.
+	Style string
+
+	// Font represents the node font to use.
+	// TODO: implement me
+	Font string
+}
+
+func (obj *Graph) graphvizBody(opts *GraphvizOpts) string {
+	str := ""
+	style := ""
+	if opts != nil {
+		style = opts.Style
+	}
+
+	// all in deterministic order
+	for _, i := range obj.VerticesSorted() { // reverse paths
 		v1 := html.EscapeString(i.String()) // 1st vertex
 		if ptrLabels {
 			text := fmt.Sprintf("%p", i)
 			small := fmt.Sprintf("<FONT POINT-SIZE=\"%d\">%s</FONT>", ptrLabelsSize, text)
-			out += fmt.Sprintf("\t\"%p\" [label=<%s<BR />%s>];\n", i, v1, small)
+			str += fmt.Sprintf("\t\"%p\" [label=<%s<BR />%s>];\n", i, v1, small)
 		} else {
-			out += fmt.Sprintf("\t\"%p\" [label=<%s>];\n", i, v1)
+			str += fmt.Sprintf("\t\"%p\" [label=<%s>];\n", i, v1)
 		}
 
-		for j := range g.Adjacency()[i] {
-			k := g.Adjacency()[i][j]
+		vs := []Vertex{}
+		for j := range obj.adjacency[i] {
+			vs = append(vs, j)
+		}
+		VertexSlice(vs).Sort() // deterministic order
+
+		for _, j := range vs {
+			k := obj.adjacency[i][j]
 			//v2 := html.EscapeString(j.String()) // 2nd vertex
 			e := html.EscapeString(k.String()) // edge
 			// use str for clearer output ordering
@@ -75,67 +260,42 @@ func (g *Graph) Graphviz() (out string) {
 				small := fmt.Sprintf("<FONT POINT-SIZE=\"%d\">%s</FONT>", ptrLabelsSize, text)
 				str += fmt.Sprintf("\t\"%p\" -> \"%p\" [label=<%s<BR />%s>];\n", i, j, e, small)
 			} else {
-				str += fmt.Sprintf("\t\"%p\" -> \"%p\" [label=<%s>];\n", i, j, e)
+				if style != "" {
+					str += fmt.Sprintf("\t\"%p\" -> \"%p\" [label=<%s>,style=%s];\n", i, j, e, style)
+				} else {
+					str += fmt.Sprintf("\t\"%p\" -> \"%p\" [label=<%s>];\n", i, j, e)
+				}
 			}
 			//}
 		}
 	}
-	out += str
-	out += "}\n"
-	return
+
+	return str
+}
+
+// Graphviz outputs the graph in graphviz format.
+// https://en.wikipedia.org/wiki/DOT_%28graph_description_language%29
+func (obj *Graph) Graphviz() string {
+	gv := &Graphviz{
+		Graphs: map[*Graph]*GraphvizOpts{
+			obj: nil,
+		},
+	}
+
+	return gv.Text()
 }
 
 // ExecGraphviz writes out the graphviz data and runs the correct graphviz
 // filter command.
-func (g *Graph) ExecGraphviz(program, filename, hostname string) error {
+func (obj *Graph) ExecGraphviz(ctx context.Context, filename string) error {
+	gv := &Graphviz{
+		Graphs: map[*Graph]*GraphvizOpts{
+			obj: nil,
+		},
 
-	switch program {
-	case "dot", "neato", "twopi", "circo", "fdp":
-	default:
-		return fmt.Errorf("invalid graphviz program selected")
+		//Filter:  filter,
+		Filename: filename,
+		//Hostname: hostname,
 	}
-
-	if filename == "" {
-		return fmt.Errorf("no filename given")
-	}
-
-	if hostname != "" {
-		filename = fmt.Sprintf("%s@%s", filename, hostname)
-	}
-
-	// run as a normal user if possible when run with sudo
-	uid, err1 := strconv.Atoi(os.Getenv("SUDO_UID"))
-	gid, err2 := strconv.Atoi(os.Getenv("SUDO_GID"))
-
-	err := ioutil.WriteFile(filename, []byte(g.Graphviz()), 0644)
-	if err != nil {
-		return fmt.Errorf("error writing to filename")
-	}
-
-	if err1 == nil && err2 == nil {
-		if err := os.Chown(filename, uid, gid); err != nil {
-			return fmt.Errorf("error changing file owner")
-		}
-	}
-
-	path, err := exec.LookPath(program)
-	if err != nil {
-		return fmt.Errorf("the Graphviz program is missing")
-	}
-
-	out := fmt.Sprintf("%s.png", filename)
-	cmd := exec.Command(path, "-Tpng", fmt.Sprintf("-o%s", out), filename)
-
-	if err1 == nil && err2 == nil {
-		cmd.SysProcAttr = &syscall.SysProcAttr{}
-		cmd.SysProcAttr.Credential = &syscall.Credential{
-			Uid: uint32(uid),
-			Gid: uint32(gid),
-		}
-	}
-	_, err = cmd.Output()
-	if err != nil {
-		return fmt.Errorf("error writing to image")
-	}
-	return nil
+	return gv.Exec(ctx)
 }

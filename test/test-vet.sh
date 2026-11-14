@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # vet a few random things
 
 echo running "$0"
@@ -19,7 +19,10 @@ function parser-indentation() {
 	if grep $'\t|' "$1"; then	# indent the pipe too
 		return 1
 	fi
-	if grep ' |' "$1"; then	# indent the pipe too (no spaces!)
+	# indent the pipe too (no spaces!)
+	# skip over any lines with leading comments
+	# the $ before the \t magically makes grep match the tab somehow...
+	if grep ' |' "$1" | grep -v '^['$'\t'']*// '; then
 		return 1
 	fi
 	if grep '^ ' "$1"; then	# format with tabs, no leading spaces
@@ -39,7 +42,7 @@ function parser-conflicts() {
 }
 
 # loop through individual *.y files
-for file in `find . -maxdepth 9 -type f -name '*.y' -not -path './old/*' -not -path './tmp/*' -not -path './vendor/*'`; do
+for file in `find . -maxdepth 9 \( -type f -o -type l \) -name '*.y' -not -path './old/*' -not -path './tmp/*' -not -path './vendor/*'`; do
 	run-test parser-indentation "$file"
 	run-test parser-conflicts "$file"
 done

@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,19 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package resources
 
@@ -24,14 +36,13 @@ import (
 	"os/user"
 	"path"
 	"strings"
-	"time"
 
 	"github.com/purpleidea/mgmt/engine"
 	"github.com/purpleidea/mgmt/engine/traits"
 	engineUtil "github.com/purpleidea/mgmt/engine/util"
-	"github.com/purpleidea/mgmt/recwatch"
 	"github.com/purpleidea/mgmt/util"
 	"github.com/purpleidea/mgmt/util/errwrap"
+	"github.com/purpleidea/mgmt/util/recwatch"
 
 	sdbus "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/coreos/go-systemd/v22/unit"
@@ -52,29 +63,28 @@ const (
 	// 'man systemd-timer', and whose format is a time span as defined in
 	// 'man systemd-time'.
 	OnBootSec = "OnBootSec"
-	// OnStartupSec is a systemd-timer trigger, whose behaviour is defined in
-	// 'man systemd-timer', and whose format is a time span as defined in
+	// OnStartupSec is a systemd-timer trigger, whose behaviour is defined
+	// in 'man systemd-timer', and whose format is a time span as defined in
 	// 'man systemd-time'.
 	OnStartupSec = "OnStartupSec"
-	// OnUnitActiveSec is a systemd-timer trigger, whose behaviour is defined
-	// in 'man systemd-timer', and whose format is a time span as defined in
-	// 'man systemd-time'.
+	// OnUnitActiveSec is a systemd-timer trigger, whose behaviour is
+	// defined in 'man systemd-timer', and whose format is a time span as
+	// defined in 'man systemd-time'.
 	OnUnitActiveSec = "OnUnitActiveSec"
-	// OnUnitInactiveSec is a systemd-timer trigger, whose behaviour is defined
-	// in 'man systemd-timer', and whose format is a time span as defined in
-	// 'man systemd-time'.
+	// OnUnitInactiveSec is a systemd-timer trigger, whose behaviour is
+	// defined in 'man systemd-timer', and whose format is a time span as
+	// defined in 'man systemd-time'.
 	OnUnitInactiveSec = "OnUnitInactiveSec"
-
-	// ctxTimeout is the delay, in seconds, before the calls to restart or stop
-	// the systemd unit will error due to timeout.
-	ctxTimeout = 30
 )
 
 func init() {
 	engine.RegisterResource("cron", func() engine.Res { return &CronRes{} })
 }
 
+var _ engine.EdgeableRes = &CronRes{} // compile time check
+
 // CronRes is a systemd-timer cron resource.
+// TODO: If we want to have an actual `crond` resource, name it LegacyCron.
 type CronRes struct {
 	traits.Base
 	traits.Edgeable
@@ -86,55 +96,71 @@ type CronRes struct {
 	// Unit is the name of the systemd service unit. It is only necessary to
 	// set if you want to specify a service with a different name than the
 	// resource.
-	Unit string `yaml:"unit"`
+	Unit string `lang:"unit" yaml:"unit"`
+
 	// State must be 'exists' or 'absent'.
-	State string `yaml:"state"`
+	State string `lang:"state" yaml:"state"`
+
+	// Startup specifies what should happen on startup. Values can be:
+	// enabled, disabled, and undefined (empty string). We default to
+	// enabled.
+	Startup string `lang:"startup" yaml:"startup"`
 
 	// Session, if true, creates the timer as the current user, rather than
-	// root. The service it points to must also be a user unit. It defaults to
-	// false.
-	Session bool `yaml:"session"`
+	// root. The service it points to must also be a user unit. It defaults
+	// to false.
+	Session bool `lang:"session" yaml:"session"`
 
 	// Trigger is the type of timer. Valid types are 'OnCalendar',
 	// 'OnActiveSec'. 'OnBootSec'. 'OnStartupSec'. 'OnUnitActiveSec', and
 	// 'OnUnitInactiveSec'. For more information see 'man systemd.timer'.
-	Trigger string `yaml:"trigger"`
+	Trigger string `lang:"trigger" yaml:"trigger"`
+
 	// Time must be used with all triggers. For 'OnCalendar', it must be in
 	// the format defined in 'man systemd-time' under the heading 'Calendar
 	// Events'. For all other triggers, time should be a valid time span as
 	// defined in 'man systemd-time'
-	Time string `yaml:"time"`
+	Time string `lang:"time" yaml:"time"`
 
 	// AccuracySec is the accuracy of the timer in systemd-time time span
 	// format. It defaults to one minute.
-	AccuracySec string `yaml:"accuracysec"`
+	AccuracySec string `lang:"accuracysec" yaml:"accuracysec"`
+
 	// RandomizedDelaySec delays the timer by a randomly selected, evenly
-	// distributed amount of time between 0 and the specified time value. The
-	// value must be a valid systemd-time time span.
-	RandomizedDelaySec string `yaml:"randomizeddelaysec"`
+	// distributed amount of time between 0 and the specified time value.
+	// The value must be a valid systemd-time time span.
+	RandomizedDelaySec string `lang:"randomizeddelaysec" yaml:"randomizeddelaysec"`
 
 	// Persistent, if true, means the time when the service unit was last
 	// triggered is stored on disk. When the timer is activated, the service
-	// unit is triggered immediately if it would have been triggered at least
-	// once during the time when the timer was inactive. It defaults to false.
-	Persistent bool `yaml:"persistent"`
-	// WakeSystem, if true, will cause the system to resume from suspend,
-	// should it be suspended and if the system supports this. It defaults to
-	// false.
-	WakeSystem bool `yaml:"wakesystem"`
-	// RemainAfterElapse, if true, means an elapsed timer will stay loaded, and
-	// its state remains queriable. If false, an elapsed timer unit that cannot
-	// elapse anymore is unloaded. It defaults to true.
-	RemainAfterElapse bool `yaml:"remainafterelapse"`
+	// unit is triggered immediately if it would have been triggered at
+	// least once during the time when the timer was inactive. It defaults
+	// to false.
+	Persistent bool `lang:"persistent" yaml:"persistent"`
 
-	file       *FileRes             // nested file resource
-	recWatcher *recwatch.RecWatcher // recwatcher for nested file
+	// WakeSystem, if true, will cause the system to resume from suspend,
+	// should it be suspended and if the system supports this. It defaults
+	// to false.
+	WakeSystem bool `lang:"wakesystem" yaml:"wakesystem"`
+
+	// RemainAfterElapse, if true, means an elapsed timer will stay loaded,
+	// and its state remains queryable. If false, an elapsed timer unit that
+	// cannot elapse anymore is unloaded. It defaults to true.
+	RemainAfterElapse bool `lang:"remainafterelapse" yaml:"remainafterelapse"`
+
+	// Description is the systemd unit description for the timer. If nil
+	// (omitted), it defaults to "timer generated by mgmt". If set to the
+	// empty string, no description is added.
+	Description *string `lang:"description" yaml:"description"`
+
+	file *FileRes // nested file resource
 }
 
 // Default returns some sensible defaults for this resource.
 func (obj *CronRes) Default() engine.Res {
 	return &CronRes{
 		State:             "exists",
+		Startup:           "enabled",
 		RemainAfterElapse: true,
 	}
 }
@@ -157,7 +183,10 @@ func (obj *CronRes) makeComposite() (*FileRes, error) {
 	}
 	file.State = obj.State
 	if obj.State != "absent" {
-		s := obj.unitFileContents()
+		s, err := obj.unitFileContents()
+		if err != nil {
+			return nil, errwrap.Wrapf(err, "error building unit file contents")
+		}
 		file.Content = &s
 	}
 	return file, nil
@@ -168,6 +197,9 @@ func (obj *CronRes) Validate() error {
 	// validate state
 	if obj.State != "absent" && obj.State != "exists" {
 		return fmt.Errorf("state must be 'absent' or 'exists'")
+	}
+	if obj.Startup != "enabled" && obj.Startup != "disabled" && obj.Startup != "" {
+		return fmt.Errorf("startup must be either `enabled` or `disabled` or undefined")
 	}
 
 	// validate trigger
@@ -195,7 +227,7 @@ func (obj *CronRes) Validate() error {
 		return errwrap.Wrapf(err, "makeComposite failed in validate")
 	}
 	if err := file.Validate(); err != nil { // composite resource
-		return errwrap.Wrapf(err, "validate failed for embedded file: %s", obj.file)
+		return errwrap.Wrapf(err, "validate failed for embedded file: %s", file)
 	}
 	return nil
 }
@@ -212,16 +244,16 @@ func (obj *CronRes) Init(init *engine.Init) error {
 	return obj.file.Init(init)
 }
 
-// Close is run by the engine to clean up after the resource is done.
-func (obj *CronRes) Close() error {
+// Cleanup is run by the engine to clean up after the resource is done.
+func (obj *CronRes) Cleanup() error {
 	if obj.file != nil {
-		return obj.file.Close()
+		return obj.file.Cleanup()
 	}
 	return nil
 }
 
 // Watch for state changes and sends a message to the bus if there is a change.
-func (obj *CronRes) Watch() error {
+func (obj *CronRes) Watch(ctx context.Context) error {
 	var bus *dbus.Conn
 	var err error
 
@@ -245,12 +277,12 @@ func (obj *CronRes) Watch() error {
 	args := []string{}
 	args = append(args, "type='signal'")
 	args = append(args, "interface='org.freedesktop.systemd1.Manager'")
-	args = append(args, "eavesdrop='true'")
+	//args = append(args, "eavesdrop='true'") // XXX: not allowed anymore?
 	args = append(args, fmt.Sprintf("arg2='%s.timer'", obj.Name()))
 
-	// match dbus messsages
+	// match dbus messages
 	if call := bus.BusObject().Call(engineUtil.DBusAddMatch, 0, strings.Join(args, ",")); call.Err != nil {
-		return err
+		return call.Err
 	}
 	defer bus.BusObject().Call(engineUtil.DBusRemoveMatch, 0, args) // ignore the error
 
@@ -265,15 +297,16 @@ func (obj *CronRes) Watch() error {
 		return errwrap.Wrapf(err, "error generating unit file path")
 	}
 	// recwatcher for the systemd-timer unit file
-	obj.recWatcher, err = recwatch.NewRecWatcher(p, false)
+	recWatcher, err := recwatch.NewRecWatcher(ctx, p, false)
 	if err != nil {
 		return err
 	}
-	defer obj.recWatcher.Close()
+	defer recWatcher.Cleanup()
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
-	var send = false // send event?
 	for {
 		select {
 		case event := <-dbusChan:
@@ -281,28 +314,32 @@ func (obj *CronRes) Watch() error {
 			if obj.init.Debug {
 				obj.init.Logf("%+v", event)
 			}
-			send = true
 
-		case event, ok := <-obj.recWatcher.Events():
+		case event, ok := <-recWatcher.Events():
 			// process unit file recwatch events
+			if ctx.Err() != nil {
+				return ctx.Err() // engine is shutting us down
+			}
 			if !ok { // channel shutdown
 				return nil
 			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
+			}
 			if err := event.Error; err != nil {
-				return errwrap.Wrapf(err, "Unknown %s watcher error", obj)
+				return err
 			}
 			if obj.init.Debug {
-				obj.init.Logf("Event(%s): %v", event.Body.Name, event.Body.Op)
+				obj.init.Logf("event(%s): %v", event.Body.Name, event.Body.Op)
 			}
-			send = true
 
-		case <-obj.init.Done: // closed by the engine to signal shutdown
-			return nil
+		case <-ctx.Done(): // closed by the engine to signal shutdown
+			return ctx.Err()
 		}
-		// do all our event sending all together to avoid duplicate msgs
-		if send {
-			send = false
-			obj.init.Event() // notify engine of an event (this can block)
+
+		if err := obj.init.Event(ctx); err != nil {
+			return err
 		}
 	}
 }
@@ -310,16 +347,16 @@ func (obj *CronRes) Watch() error {
 // CheckApply is run to check the state and, if apply is true, to apply the
 // necessary changes to reach the desired state. This is run before Watch and
 // again if Watch finds a change occurring to the state.
-func (obj *CronRes) CheckApply(apply bool) (bool, error) {
+func (obj *CronRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 	checkOK := true
 	// use the embedded file resource to apply the correct state
-	if c, err := obj.file.CheckApply(apply); err != nil {
+	if c, err := obj.file.CheckApply(ctx, apply); err != nil {
 		return false, errwrap.Wrapf(err, "nested file failed")
 	} else if !c {
 		checkOK = false
 	}
 	// check timer state and apply the defined state if needed
-	if c, err := obj.unitCheckApply(apply); err != nil {
+	if c, err := obj.unitCheckApply(ctx, apply); err != nil {
 		return false, errwrap.Wrapf(err, "unitCheckApply error")
 	} else if !c {
 		checkOK = false
@@ -329,7 +366,7 @@ func (obj *CronRes) CheckApply(apply bool) (bool, error) {
 
 // unitCheckApply checks the state of the systemd-timer unit and, if apply is
 // true, applies the defined state.
-func (obj *CronRes) unitCheckApply(apply bool) (bool, error) {
+func (obj *CronRes) unitCheckApply(ctx context.Context, apply bool) (bool, error) {
 	var conn *sdbus.Conn
 	var godbusConn *dbus.Conn
 	var err error
@@ -371,13 +408,9 @@ func (obj *CronRes) unitCheckApply(apply bool) (bool, error) {
 	}
 
 	// systemctl daemon-reload
-	if err := conn.Reload(); err != nil {
+	if err := conn.ReloadContext(ctx); err != nil {
 		return false, errwrap.Wrapf(err, "error reloading daemon")
 	}
-
-	// context for stopping/restarting the unit
-	ctx, cancel := context.WithTimeout(context.Background(), ctxTimeout*time.Second)
-	defer cancel()
 
 	// godbus connection for stopping/restarting the unit
 	if obj.Session {
@@ -389,6 +422,18 @@ func (obj *CronRes) unitCheckApply(apply bool) (bool, error) {
 		return false, errwrap.Wrapf(err, "error making godbus connection")
 	}
 	defer godbusConn.Close()
+
+	// We probably always want to enable this...
+	svc := fmt.Sprintf("%s.timer", obj.Name()) // systemd name
+	files := []string{svc}                     // the svc represented in a list
+	if obj.Startup == "enabled" {
+		_, _, err = conn.EnableUnitFilesContext(ctx, files, false, true)
+	} else if obj.Startup == "disabled" {
+		_, err = conn.DisableUnitFilesContext(ctx, files, false)
+	}
+	if err != nil {
+		return false, errwrap.Wrapf(err, "unable to change startup status")
+	}
 
 	// stop or restart the unit
 	if obj.State == "absent" {
@@ -406,6 +451,12 @@ func (obj *CronRes) Cmp(r engine.Res) error {
 
 	if obj.State != res.State {
 		return fmt.Errorf("state differs: %s vs %s", obj.State, res.State)
+	}
+	if obj.Startup != res.Startup {
+		return fmt.Errorf("the Startup differs")
+	}
+	if obj.Session != res.Session {
+		return fmt.Errorf("session differs: %t vs %t", obj.Session, res.Session)
 	}
 	if obj.Trigger != res.Trigger {
 		return fmt.Errorf("trigger differs: %s vs %s", obj.Trigger, res.Trigger)
@@ -431,7 +482,21 @@ func (obj *CronRes) Cmp(r engine.Res) error {
 	if obj.RemainAfterElapse != res.RemainAfterElapse {
 		return fmt.Errorf("remainafterelapse differs: %t vs %t", obj.RemainAfterElapse, res.RemainAfterElapse)
 	}
-	return obj.file.Cmp(r)
+	if err := engineUtil.StrPtrCmp(obj.Description, res.Description); err != nil {
+		return errwrap.Wrapf(err, "the Description differs")
+	}
+
+	// Compare the nested file resources. We build them here, because the
+	// stored ones only exist after Init, and Cmp can be called before that.
+	file1, err := obj.makeComposite()
+	if err != nil {
+		return errwrap.Wrapf(err, "makeComposite failed in cmp")
+	}
+	file2, err := res.makeComposite()
+	if err != nil {
+		return errwrap.Wrapf(err, "makeComposite failed in cmp")
+	}
+	return file1.Cmp(file2)
 }
 
 // CronUID is a unique resource identifier.
@@ -462,7 +527,7 @@ func (obj *CronUID) IFF(uid engine.ResUID) bool {
 }
 
 // AutoEdges returns the AutoEdge interface.
-func (obj *CronRes) AutoEdges() (engine.AutoEdge, error) {
+func (obj *CronRes) AutoEdges(ctx context.Context) (engine.AutoEdge, error) {
 	return nil, nil
 }
 
@@ -525,11 +590,16 @@ func (obj *CronRes) UnitFilePath() (string, error) {
 
 // unitFileContents returns the contents of the unit file representing the
 // CronRes struct.
-func (obj *CronRes) unitFileContents() string {
+func (obj *CronRes) unitFileContents() (string, error) {
 	u := []*unit.UnitOption{}
 
 	// [Unit]
-	u = append(u, &unit.UnitOption{Section: "Unit", Name: "Description", Value: "timer generated by mgmt"})
+	switch {
+	case obj.Description == nil:
+		u = append(u, &unit.UnitOption{Section: "Unit", Name: "Description", Value: "timer generated by mgmt"})
+	case *obj.Description != "":
+		u = append(u, &unit.UnitOption{Section: "Unit", Name: "Description", Value: *obj.Description})
+	}
 	// [Timer]
 	u = append(u, &unit.UnitOption{Section: "Timer", Name: obj.Trigger, Value: obj.Time})
 	if obj.AccuracySec != "" {
@@ -554,6 +624,8 @@ func (obj *CronRes) unitFileContents() string {
 	u = append(u, &unit.UnitOption{Section: "Install", Name: "WantedBy", Value: "timers.target"})
 
 	buf := new(bytes.Buffer)
-	buf.ReadFrom(unit.Serialize(u))
-	return buf.String()
+	if _, err := buf.ReadFrom(unit.Serialize(u)); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
 }

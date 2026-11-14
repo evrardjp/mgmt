@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,9 +13,21 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
-// +build !root
+//go:build !root
 
 package fs_test // named this way to make it easier for examples
 
@@ -76,7 +88,7 @@ func runEtcd() (func() error, error) {
 func TestFs1(t *testing.T) {
 	stopEtcd, err := runEtcd()
 	if err != nil {
-		t.Errorf("setup error: %+v", err)
+		t.Fatalf("setup error: %+v", err)
 	}
 	defer stopEtcd() // ignore the error
 
@@ -196,7 +208,7 @@ func TestFs1(t *testing.T) {
 func TestFs2(t *testing.T) {
 	stopEtcd, err := runEtcd()
 	if err != nil {
-		t.Errorf("setup error: %+v", err)
+		t.Fatalf("setup error: %+v", err)
 	}
 	defer stopEtcd() // ignore the error
 
@@ -255,7 +267,7 @@ func TestFs2(t *testing.T) {
 func TestFs3(t *testing.T) {
 	stopEtcd, err := runEtcd()
 	if err != nil {
-		t.Errorf("setup error: %+v", err)
+		t.Fatalf("setup error: %+v", err)
 	}
 	defer stopEtcd() // ignore the error
 
@@ -385,8 +397,7 @@ func TestEtcdCopyFs0(t *testing.T) {
 	for _, tt := range tests {
 		stopEtcd, err := runEtcd()
 		if err != nil {
-			t.Errorf("setup error: %+v", err)
-			return
+			t.Fatalf("setup error: %+v", err)
 		}
 		defer stopEtcd() // ignore the error
 
@@ -432,6 +443,90 @@ func TestEtcdCopyFs0(t *testing.T) {
 		if _, err := memFs.Stat(tt.check); err != nil {
 			t.Errorf("stat error: %+v", err)
 			return
+		}
+	}
+}
+
+// TestFsDeferMetadata writes a small tree of files with DeferMetadata set,
+// calls Flush at the end, and verifies a freshly-mounted Fs sees everything.
+// Without Flush the same tree must be invisible to a fresh mount, since the
+// superblock write is held back until Flush is called.
+func TestFsDeferMetadata(t *testing.T) {
+	stopEtcd, err := runEtcd()
+	if err != nil {
+		t.Fatalf("setup error: %+v", err)
+	}
+	defer stopEtcd() // ignore the error
+
+	logf := func(format string, v ...interface{}) {
+		t.Logf("test: etcd: fs: "+format, v...)
+	}
+	etcdClient := client.NewClientFromSeedsNamespace(
+		[]string{"localhost:2379"}, // endpoints
+		ns,
+	)
+	if err := etcdClient.Init(); err != nil {
+		t.Errorf("client connection error: %+v", err)
+		return
+	}
+	defer etcdClient.Close()
+
+	etcdFs := &etcdfs.Fs{
+		Client:        etcdClient,
+		Metadata:      superblock,
+		DataPrefix:    etcdfs.DefaultDataPrefix,
+		DeferMetadata: true,
+		Logf:          logf,
+	}
+
+	if err := etcdFs.MkdirAll("/a/b/c", umask); err != nil {
+		t.Errorf("mkdirall error: %+v", err)
+		return
+	}
+	files := map[string]string{
+		"/a/x":     "alpha\n",
+		"/a/b/y":   "beta\n",
+		"/a/b/c/z": "gamma\n",
+	}
+	for p, contents := range files {
+		if err := etcdFs.WriteFile(p, []byte(contents), umask); err != nil {
+			t.Errorf("writefile %s error: %+v", p, err)
+			return
+		}
+	}
+
+	// Before Flush: a fresh mount must not see anything (the superblock
+	// has never been written for this metadata key).
+	pre := &etcdfs.Fs{
+		Client:     etcdClient,
+		Metadata:   superblock,
+		DataPrefix: etcdfs.DefaultDataPrefix,
+		Logf:       logf,
+	}
+	if _, err := pre.Stat("/a"); err == nil {
+		t.Errorf("pre-flush: /a should not yet be visible")
+	}
+
+	if err := etcdFs.Flush(); err != nil {
+		t.Errorf("flush error: %+v", err)
+		return
+	}
+
+	// After Flush: a fresh mount must see the whole tree.
+	post := &etcdfs.Fs{
+		Client:     etcdClient,
+		Metadata:   superblock,
+		DataPrefix: etcdfs.DefaultDataPrefix,
+		Logf:       logf,
+	}
+	for p, want := range files {
+		got, err := post.ReadFile(p)
+		if err != nil {
+			t.Errorf("post-flush readfile %s: %+v", p, err)
+			continue
+		}
+		if string(got) != want {
+			t.Errorf("post-flush readfile %s: got %q, want %q", p, string(got), want)
 		}
 	}
 }

@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,19 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package resources
 
@@ -22,11 +34,9 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
-	"time"
 
 	"github.com/purpleidea/mgmt/engine"
 	"github.com/purpleidea/mgmt/engine/traits"
-	"github.com/purpleidea/mgmt/util"
 	"github.com/purpleidea/mgmt/util/errwrap"
 )
 
@@ -45,10 +55,6 @@ const (
 	SkipCmpStyleString
 )
 
-const (
-	kvCheckApplyTimeout = 5 * time.Second
-)
-
 // KVRes is a resource which writes a key/value pair into cluster wide storage.
 // It will ensure that the key is set to the requested value. The one exception
 // is that if you use the SkipLessThan parameter, then it will only replace the
@@ -57,22 +63,39 @@ const (
 // which have monotonically increasing state values that represent progression.
 // The one exception is that when this resource receives a refresh signal, then
 // it will set the value to be the exact one if they are not identical already.
+// It supports flipping the state if you ask for it to be reversible.
 type KVRes struct {
 	traits.Base // add the base methods without re-implementation
 	//traits.Groupable // TODO: it could be useful to group our writes and watches!
 	traits.Refreshable
 	traits.Recvable
+	traits.Reversible
 
 	init *engine.Init
 
 	// Key represents the key to set. If it is not specified, the Name value
 	// is used instead.
 	Key string `lang:"key" yaml:"key"`
+
 	// Value represents the string value to set. If this value is nil or,
 	// undefined, then this will delete that key.
 	Value *string `lang:"value" yaml:"value"`
+
+	// Mapped specifies that we will store the value in a map with each
+	// hostname as part of the key. This is very useful for exchanging
+	// values when running this resource on multiple nodes simultaneously.
+	// To read/write/watch a single, global key, this value should be false.
+	// Note that resources may fight if more than one uses this. The `world`
+	// functions like `kvlookup`, require this to be true, since they're
+	// pulling values out of a pool that each node sets. The `world`
+	// functions like `getval`, require this to be false, since they're
+	// pulling values directly out of the same namespace that is shared by
+	// all nodes.
+	Mapped bool `lang:"mapped" yaml:"mapped"`
+
 	// SkipLessThan causes the value to be updated as long as it is greater.
 	SkipLessThan bool `lang:"skiplessthan" yaml:"skiplessthan"`
+
 	// SkipCmpStyle is the type of compare function used when determining if
 	// the value is greater when using the SkipLessThan parameter.
 	SkipCmpStyle KVResSkipCmpStyle `lang:"skipcmpstyle" yaml:"skipcmpstyle"`
@@ -89,6 +112,48 @@ func (obj *KVRes) getKey() string {
 		return obj.Key
 	}
 	return obj.Name()
+}
+
+func (obj *KVRes) kvWatch(ctx context.Context, key string) (chan error, error) {
+	if obj.Mapped {
+		return obj.init.World.StrMapWatch(ctx, key)
+	}
+	return obj.init.World.StrWatch(ctx, key)
+}
+
+func (obj *KVRes) kvGet(ctx context.Context, key string) (string, bool, error) {
+	if obj.Mapped {
+		hostname := obj.init.Hostname // me
+		keyMap, err := obj.init.World.StrMapGet(ctx, obj.getKey())
+		if err != nil {
+			return "", false, err
+		}
+		val, exists := keyMap[hostname]
+		return val, exists, nil
+	}
+
+	val, err := obj.init.World.StrGet(ctx, key)
+	if err != nil && obj.init.World.StrIsNotExist(err) {
+		return "", false, nil // val doesn't exist
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return val, true, nil
+}
+
+func (obj *KVRes) kvSet(ctx context.Context, key, val string) error {
+	if obj.Mapped {
+		return obj.init.World.StrMapSet(ctx, key, val)
+	}
+	return obj.init.World.StrSet(ctx, key, val)
+}
+
+func (obj *KVRes) kvDel(ctx context.Context, key string) error {
+	if obj.Mapped {
+		return obj.init.World.StrMapDel(ctx, key)
+	}
+	return obj.init.World.StrDel(ctx, key)
 }
 
 // Default returns some sensible defaults for this resource.
@@ -124,30 +189,31 @@ func (obj *KVRes) Init(init *engine.Init) error {
 	return nil
 }
 
-// Close is run by the engine to clean up after the resource is done.
-func (obj *KVRes) Close() error {
+// Cleanup is run by the engine to clean up after the resource is done.
+func (obj *KVRes) Cleanup() error {
 	return nil
 }
 
 // Watch is the primary listener for this resource and it outputs events.
-func (obj *KVRes) Watch() error {
-	// FIXME: add timeout to context
-	// The obj.init.Done channel is closed by the engine to signal shutdown.
-	ctx, cancel := util.ContextWithCloser(context.Background(), obj.init.Done)
+func (obj *KVRes) Watch(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	ch, err := obj.init.World.StrMapWatch(ctx, obj.getKey()) // get possible events!
+	ch, err := obj.kvWatch(ctx, obj.getKey()) // get possible events!
 	if err != nil {
+		return errwrap.Wrapf(err, "error during watch")
+	}
+
+	if err := obj.init.Event(ctx); err != nil {
 		return err
 	}
 
-	obj.init.Running() // when started, notify engine that we're running
-
-	var send = false // send event?
 	for {
 		select {
-		// NOTE: this part is very similar to the file resource code
 		case err, ok := <-ch:
+			if ctx.Err() != nil {
+				return ctx.Err() // engine is shutting us down
+			}
 			if !ok { // channel shutdown
 				return nil
 			}
@@ -157,16 +223,13 @@ func (obj *KVRes) Watch() error {
 			if obj.init.Debug {
 				obj.init.Logf("event!")
 			}
-			send = true
 
-		case <-obj.init.Done: // closed by the engine to signal shutdown
-			return nil
+		case <-ctx.Done(): // closed by the engine to signal shutdown
+			return ctx.Err()
 		}
 
-		// do all our event sending all together to avoid duplicate msgs
-		if send {
-			send = false
-			obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
 		}
 	}
 }
@@ -209,13 +272,11 @@ func (obj *KVRes) lessThanCheck(value string) (bool, error) {
 	return false, nil
 }
 
-// CheckApply method for Password resource. Does nothing, returns happy!
-func (obj *KVRes) CheckApply(apply bool) (bool, error) {
-	obj.init.Logf("CheckApply(%t)", apply)
-
+// CheckApply method for resource. Does nothing, returns happy!
+func (obj *KVRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 	wg := &sync.WaitGroup{}
 	defer wg.Wait() // this must be above the defer cancel() call
-	ctx, cancel := context.WithTimeout(context.Background(), kvCheckApplyTimeout)
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	wg.Add(1)
 	go func() {
@@ -228,18 +289,20 @@ func (obj *KVRes) CheckApply(apply bool) (bool, error) {
 		}
 	}()
 
-	if val, exists := obj.init.Recv()["Value"]; exists && val.Changed {
+	if val, exists := obj.init.Recv()["value"]; exists && val.Changed {
 		// if we received on Value, and it changed, wooo, nothing to do.
-		obj.init.Logf("CheckApply: `Value` was updated!")
+		if obj.Value == nil {
+			obj.init.Logf("nil `value` was received!")
+		} else {
+			obj.init.Logf("`value` (%s) was received!", *obj.Value)
+		}
 	}
 
-	hostname := obj.init.Hostname // me
-	keyMap, err := obj.init.World.StrMapGet(ctx, obj.getKey())
+	value, exists, err := obj.kvGet(ctx, obj.getKey())
 	if err != nil {
-		return false, errwrap.Wrapf(err, "check error during StrGet")
+		return false, errwrap.Wrapf(err, "error during kv get")
 	}
-
-	if value, ok := keyMap[hostname]; ok && obj.Value != nil {
+	if exists && obj.Value != nil {
 		if value == *obj.Value {
 			return true, nil
 		}
@@ -250,21 +313,28 @@ func (obj *KVRes) CheckApply(apply bool) (bool, error) {
 			return true, nil
 		}
 
-	} else if !ok && obj.Value == nil {
+	} else if !exists && obj.Value == nil {
 		return true, nil // nothing to delete, we're good!
 
-	} else if ok && obj.Value == nil { // delete
-		err := obj.init.World.StrMapDel(ctx, obj.getKey())
-		return false, errwrap.Wrapf(err, "apply error during StrDel")
+	} else if exists && obj.Value == nil { // delete
+		if !apply {
+			return false, nil
+		}
+		if err := obj.kvDel(ctx, obj.getKey()); err != nil {
+			return false, errwrap.Wrapf(err, "error during del")
+		}
+		obj.init.Logf("`value` was deleted!")
+		return false, nil
 	}
 
 	if !apply {
 		return false, nil
 	}
 
-	if err := obj.init.World.StrMapSet(ctx, obj.getKey(), *obj.Value); err != nil {
-		return false, errwrap.Wrapf(err, "apply error during StrSet")
+	if err := obj.kvSet(ctx, obj.getKey(), *obj.Value); err != nil {
+		return false, errwrap.Wrapf(err, "error during set")
 	}
+	obj.init.Logf("`value` was changed!")
 
 	return false, nil
 }
@@ -288,6 +358,9 @@ func (obj *KVRes) Cmp(r engine.Res) error {
 			return fmt.Errorf("the contents of Value differs")
 		}
 	}
+	if obj.Mapped != res.Mapped {
+		return fmt.Errorf("the Mapped param differs")
+	}
 	if obj.SkipLessThan != res.SkipLessThan {
 		return fmt.Errorf("the SkipLessThan param differs")
 	}
@@ -302,6 +375,61 @@ func (obj *KVRes) Cmp(r engine.Res) error {
 func (obj *KVRes) Interrupt() error {
 	close(obj.interruptChan)
 	return nil
+}
+
+// Copy copies the resource. Don't call it directly, use engine.ResCopy instead.
+// TODO: should this copy internal state?
+func (obj *KVRes) Copy() engine.CopyableRes {
+	var value *string
+	if obj.Value != nil { // copy the content, not the pointer...
+		s := *obj.Value
+		value = &s
+	}
+	return &KVRes{
+		Key:          obj.Key,
+		Value:        value,
+		Mapped:       obj.Mapped,
+		SkipLessThan: obj.SkipLessThan,
+		SkipCmpStyle: obj.SkipCmpStyle,
+	}
+}
+
+// Reversed returns the "reverse" or "reciprocal" resource. This is used to
+// "clean" up after a previously defined resource has been removed.
+func (obj *KVRes) Reversed(ctx context.Context) (engine.ReversibleRes, error) {
+	cp, err := engine.ResCopy(obj)
+	if err != nil {
+		return nil, errwrap.Wrapf(err, "could not copy")
+	}
+	rev, ok := cp.(engine.ReversibleRes)
+	if !ok {
+		return nil, fmt.Errorf("not reversible")
+	}
+	rev.ReversibleMeta().Disabled = true // the reverse shouldn't run again
+
+	res, ok := cp.(*KVRes)
+	if !ok {
+		return nil, fmt.Errorf("copied res was not our kind")
+	}
+
+	// If we're setting a value, the reverse deletes the key. If we're
+	// deleting the key, the reverse restores the value which is stored now.
+	res.Value = nil
+	if obj.Value == nil {
+		value, exists, err := obj.kvGet(ctx, obj.getKey())
+		if err != nil {
+			return nil, errwrap.Wrapf(err, "could not get value for reversal storage")
+		}
+		if exists {
+			res.Value = &value
+		}
+	}
+
+	// The restored value must be set exactly, even if it's less than what
+	// is stored at the time.
+	res.SkipLessThan = false
+
+	return res, nil
 }
 
 // KVUID is the UID struct for KVRes.

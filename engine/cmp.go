@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,19 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package engine
 
@@ -106,6 +118,7 @@ func ResCmp(r1, r2 Res) error {
 			for k := range ix {
 				// compare sub resources
 				if err := ResCmp(ix[k], jx[k]); err != nil {
+					//fmt.Printf("bad Cmp: %+v <> %+v for: %+v <> %+v err: %+v\n", r1, r2, ix[k], jx[k], err)
 					return err
 				}
 			}
@@ -121,14 +134,29 @@ func ResCmp(r1, r2 Res) error {
 		v1 := r1r.Recv()
 		v2 := r2r.Recv()
 
+		// XXX: Our Send/Recv in the lib/main.go doesn't seem to be
+		// pulling this in, so this always compares differently. We can
+		// comment it out for now, since it's not too consequential.
+		// XXX: Find out what the issue is and fix it for here and send.
+		// XXX: The below errors are commented out until this is fixed.
 		if (v1 == nil) != (v2 == nil) { // xor
-			return fmt.Errorf("recv params differ")
+			//return fmt.Errorf("recv params differ")
 		}
 		if v1 != nil && v2 != nil {
-			// TODO: until we hit this code path, don't allow
-			// comparing anything that has this set to non-zero
-			if len(v1) != 0 || len(v2) != 0 {
-				return fmt.Errorf("recv params exist")
+			if len(v1) != len(v2) {
+				//return fmt.Errorf("recv param lengths differ")
+			}
+			for key, send1 := range v1 { // map[string]*engine.Send
+				send2, exists := v2[key]
+				if !exists {
+					//return fmt.Errorf("recv param key %s doesn't exist", key)
+				}
+				if (send1 == nil) != (send2 == nil) { // xor
+					//return fmt.Errorf("recv param key %s send differs", key)
+				}
+				if send1 != nil && send2 != nil && send1.Key != send2.Key {
+					//return fmt.Errorf("recv param key %s send key differs (%v != %v)", key, send1.Key, send2.Key)
+				}
 			}
 		}
 	}
@@ -142,13 +170,17 @@ func ResCmp(r1, r2 Res) error {
 		s1 := r1s.Sent()
 		s2 := r2s.Sent()
 
+		// XXX: Our Send/Recv in the lib/main.go doesn't seem to be
+		// pulling this in, so this always compares differently. We can
+		// comment it out for now, since it's not too consequential.
+		// XXX: Find out what the issue is and fix it for here and recv.
+		// XXX: The below errors are commented out until this is fixed.
 		if (s1 == nil) != (s2 == nil) { // xor
-			return fmt.Errorf("send params differ")
+			//return fmt.Errorf("send params differ")
 		}
 		if s1 != nil && s2 != nil {
-			// TODO: until we hit this code path, don't allow
-			// adapting anything that has this set to non-nil
-			return fmt.Errorf("send params exist")
+			// TODO: reflect.DeepEqual?
+			//return fmt.Errorf("send params exist")
 		}
 	}
 
@@ -261,14 +293,29 @@ func AdaptCmp(r1, r2 CompatibleRes) error {
 		v1 := r1r.Recv()
 		v2 := r2r.Recv()
 
+		// XXX: Our Send/Recv in the lib/main.go doesn't seem to be
+		// pulling this in, so this always compares differently. We can
+		// comment it out for now, since it's not too consequential.
+		// XXX: Find out what the issue is and fix it for here and send.
+		// XXX: The below errors are commented out until this is fixed.
 		if (v1 == nil) != (v2 == nil) { // xor
-			return fmt.Errorf("recv params differ")
+			//return fmt.Errorf("recv params differ")
 		}
 		if v1 != nil && v2 != nil {
-			// TODO: until we hit this code path, don't allow
-			// adapting anything that has this set to non-zero
-			if len(v1) != 0 || len(v2) != 0 {
-				return fmt.Errorf("recv params exist")
+			if len(v1) != len(v2) {
+				//return fmt.Errorf("recv param lengths differ")
+			}
+			for key, send1 := range v1 { // map[string]*engine.Send
+				send2, exists := v2[key]
+				if !exists {
+					//return fmt.Errorf("recv param key %s doesn't exist", key)
+				}
+				if (send1 == nil) != (send2 == nil) { // xor
+					//return fmt.Errorf("recv param key %s send differs", key)
+				}
+				if send1 != nil && send2 != nil && send1.Key != send2.Key {
+					//return fmt.Errorf("recv param key %s send key differs (%v != %v)", key, send1.Key, send2.Key)
+				}
 			}
 		}
 	}
@@ -282,13 +329,17 @@ func AdaptCmp(r1, r2 CompatibleRes) error {
 		s1 := r1s.Sent()
 		s2 := r2s.Sent()
 
+		// XXX: Our Send/Recv in the lib/main.go doesn't seem to be
+		// pulling this in, so this always compares differently. We can
+		// comment it out for now, since it's not too consequential.
+		// XXX: Find out what the issue is and fix it for here and recv.
+		// XXX: The below errors are commented out until this is fixed.
 		if (s1 == nil) != (s2 == nil) { // xor
-			return fmt.Errorf("send params differ")
+			//return fmt.Errorf("send params differ")
 		}
 		if s1 != nil && s2 != nil {
-			// TODO: until we hit this code path, don't allow
-			// adapting anything that has this set to non-nil
-			return fmt.Errorf("send params exist")
+			// TODO: reflect.DeepEqual?
+			//return fmt.Errorf("send params exist")
 		}
 	}
 
@@ -320,9 +371,11 @@ func VertexCmpFn(v1, v2 pgraph.Vertex) (bool, error) {
 		return false, fmt.Errorf("v2 is not a Res")
 	}
 
-	if ResCmp(r1, r2) != nil {
+	if err := ResCmp(r1, r2); err != nil {
+		//fmt.Printf("bad Cmp: %p %+v <> %p %+v err: %+v\n", r1, r1, r2, r2, err)
 		return false, nil
 	}
+	//fmt.Printf("ok Cmp: %p %+v <> %p %+v\n", r1, r1, r2, r2)
 
 	return true, nil
 }
@@ -340,4 +393,43 @@ func EdgeCmpFn(e1, e2 pgraph.Edge) (bool, error) {
 		return false, fmt.Errorf("e2 is not an Edge")
 	}
 	return edge1.Cmp(edge2) == nil, nil
+}
+
+// ResGraphMapper compares two graphs, and gives us a mapping from new to old
+// based on the resource kind and name only. This allows us to know which
+// previous resource might have data to pass on to the new version in the next
+// generation.
+func ResGraphMapper(oldGraph, newGraph *pgraph.Graph) (map[RecvableRes]RecvableRes, error) {
+	type key struct {
+		kind string
+		name string
+	}
+
+	oldNodes := oldGraph.Adjacency()
+	// NOTE: len(oldNodes) is almost always too big, but reduces allocations.
+	oldIndex := make(map[key]RecvableRes, len(oldNodes))
+	for v := range oldNodes {
+		r, ok := v.(RecvableRes)
+		if !ok {
+			continue
+		}
+		oldIndex[key{kind: r.Kind(), name: r.Name()}] = r
+	}
+
+	// NOTE: len(oldNodes) is a more accurate, smaller guess than len(newNodes).
+	mapper := make(map[RecvableRes]RecvableRes, len(oldNodes)) // new -> old based on name and kind only?
+	newNodes := newGraph.Adjacency()
+	for v := range newNodes {
+		r, ok := v.(RecvableRes)
+		if !ok {
+			continue
+		}
+		key := key{kind: r.Kind(), name: r.Name()}
+		res, exists := oldIndex[key]
+		if !exists {
+			continue
+		}
+		mapper[r] = res
+	}
+	return mapper, nil
 }

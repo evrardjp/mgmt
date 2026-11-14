@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,11 +13,24 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package engine
 
 import (
+	"context"
 	"fmt"
 )
 
@@ -42,7 +55,7 @@ type EdgeableRes interface {
 	// AutoEdges returns a struct that implements the AutoEdge interface.
 	// This interface can be used to generate automatic edges to other
 	// resources.
-	AutoEdges() (AutoEdge, error)
+	AutoEdges(ctx context.Context) (AutoEdge, error)
 }
 
 // AutoEdgeMeta provides some parameters specific to automatic edges.
@@ -79,6 +92,19 @@ type ResUID interface {
 	IFF(ResUID) bool
 
 	IsReversed() bool // true means this resource happens before the generator
+}
+
+// ResUIDHashable is an optional extension of the ResUID interface. A UID which
+// implements it, promises that for any two UID's of the same concrete type,
+// UIDHash() returns equal strings if and only if IFF() would match them. This
+// allows the autoedge matching to find candidates with a hash lookup instead of
+// a linear scan. Only implement this if your IFF method is a pure equality
+// comparison of some value, such as a path.
+type ResUIDHashable interface {
+	ResUID
+
+	// UIDHash returns the matching identity of this UID as a string.
+	UIDHash() string
 }
 
 // The BaseUID struct is used to provide a unique resource identifier.

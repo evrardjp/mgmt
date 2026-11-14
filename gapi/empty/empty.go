@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,18 +13,31 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package empty
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
+	cliUtil "github.com/purpleidea/mgmt/cli/util"
 	"github.com/purpleidea/mgmt/gapi"
 	"github.com/purpleidea/mgmt/pgraph"
-
-	"github.com/urfave/cli/v2"
+	"github.com/purpleidea/mgmt/util/errwrap"
 )
 
 const (
@@ -38,26 +51,41 @@ func init() {
 
 // GAPI implements the main lang GAPI interface.
 type GAPI struct {
+	// Wait should be true if we don't use any existing (stale) deploys.
+	// This means that if you start an empty GAPI, then it will immediately
+	// try to look for and run any existing deploys that have been stored in
+	// the cluster that it has connected to. If this is true, then it will
+	// only start on the next deploy. To be honest, we should probably never
+	// wait, but this was accidentally how it was initially implemented, so
+	// we'll change the default and add this in as a flag for now. We may
+	// remove this in the future unless someone has a good reason for
+	// needing it.
+	Wait bool
+
 	data        *gapi.Data
 	initialized bool
-	closeChan   chan struct{}
+	cancel      func()          // shuts down the Next goroutine
 	wg          *sync.WaitGroup // sync group for tunnel go routines
+	err         error
+	errMutex    *sync.Mutex // guards err
 }
 
-// CliFlags returns a list of flags used by the specified subcommand.
-func (obj *GAPI) CliFlags(command string) []cli.Flag {
-	return []cli.Flag{}
-}
+// Cli takes an *Info struct, and returns our deploy if activated, and if there
+// are any validation problems, you should return an error. If there is no
+// deploy, then you should return a nil deploy and a nil error.
+func (obj *GAPI) Cli(info *gapi.Info) (*gapi.Deploy, error) {
+	args, ok := info.Args.(*cliUtil.EmptyArgs)
+	if !ok {
+		// programming error
+		return nil, fmt.Errorf("could not convert to our struct")
+	}
 
-// Cli takes a cli.Context, and returns our GAPI if activated. All arguments
-// should take the prefix of the registered name. On activation, if there are
-// any validation problems, you should return an error. If this was not
-// activated, then you should return a nil GAPI and a nil error.
-func (obj *GAPI) Cli(*gapi.CliInfo) (*gapi.Deploy, error) {
 	return &gapi.Deploy{
 		Name: Name,
 		//Noop: false,
-		GAPI: &GAPI{},
+		GAPI: &GAPI{
+			Wait: args.Wait,
+		},
 	}, nil
 }
 
@@ -67,70 +95,93 @@ func (obj *GAPI) Init(data *gapi.Data) error {
 		return fmt.Errorf("already initialized")
 	}
 	obj.data = data // store for later
-	obj.closeChan = make(chan struct{})
 	obj.wg = &sync.WaitGroup{}
+	obj.errMutex = &sync.Mutex{}
 	obj.initialized = true
 	return nil
 }
 
-// Graph returns a current Graph.
-func (obj *GAPI) Graph() (*pgraph.Graph, error) {
-	if !obj.initialized {
-		return nil, fmt.Errorf("%s: GAPI is not initialized", Name)
+// Info returns some data about the GAPI implementation.
+func (obj *GAPI) Info() *gapi.InfoResult {
+	return &gapi.InfoResult{
+		URI: "",
 	}
-
-	obj.data.Logf("generating empty graph...")
-	g, err := pgraph.NewGraph("empty")
-	if err != nil {
-		return nil, err
-	}
-
-	return g, nil
 }
 
 // Next returns nil errors every time there could be a new graph.
-func (obj *GAPI) Next() chan gapi.Next {
+func (obj *GAPI) Next(ctx context.Context) chan gapi.Next {
 	ch := make(chan gapi.Next)
+	// Wrap the incoming context so that Cleanup can shut us down on our own
+	// (eg: when a new deploy replaces us) without cancelling our parent.
+	ctx, obj.cancel = context.WithCancel(ctx)
 	obj.wg.Add(1)
 	go func() {
 		defer obj.wg.Done()
 		defer close(ch) // this will run before the obj.wg.Done()
 		if !obj.initialized {
+			err := fmt.Errorf("%s: GAPI is not initialized", Name)
 			next := gapi.Next{
-				Err:  fmt.Errorf("%s: GAPI is not initialized", Name),
+				Err:  err,
 				Exit: true, // exit, b/c programming error?
 			}
 			select {
 			case ch <- next:
-			case <-obj.closeChan:
+			case <-ctx.Done():
+				obj.errAppend(ctx.Err())
+				return
 			}
+			obj.errAppend(err)
+			return
+		}
+
+		obj.data.Logf("generating empty graph...")
+		g, err := pgraph.NewGraph("empty")
+		if err != nil {
+			obj.errAppend(err)
 			return
 		}
 
 		// send only one event
 		next := gapi.Next{
-			Exit: false,
-			Err:  nil,
+			Graph: g,
+			Exit:  false,
+			Err:   nil,
 		}
 		select {
 		case ch <- next: // trigger a run (send a msg)
 			// pass
 
 		// unblock if we exit while waiting to send!
-		case <-obj.closeChan:
+		case <-ctx.Done():
+			obj.errAppend(ctx.Err())
 			return
 		}
 	}()
 	return ch
 }
 
-// Close shuts down the lang GAPI.
-func (obj *GAPI) Close() error {
-	if !obj.initialized {
-		return fmt.Errorf("%s: GAPI is not initialized", Name)
+// Cleanup shuts the GAPI down and waits for it to finish before it returns. It
+// cancels the context we wrapped in Next and blocks until the Next goroutine
+// has exited. The context.Canceled that results from our own cancellation is
+// filtered out, so this returns nil on a clean shutdown.
+func (obj *GAPI) Cleanup() error {
+	if obj.cancel == nil {
+		return nil // Next was never called; nothing to shut down
 	}
-	close(obj.closeChan)
+	obj.cancel()
+	return errwrap.NoContextCanceled(errwrap.WithoutContext(obj.Err()))
+}
+
+// Err will contain the last error when Next shuts down. It waits for all the
+// running processes to exit before it returns.
+func (obj *GAPI) Err() error {
 	obj.wg.Wait()
-	obj.initialized = false // closed = true
-	return nil
+	return obj.err
+}
+
+// errAppend is a simple helper function.
+func (obj *GAPI) errAppend(err error) {
+	obj.errMutex.Lock()
+	obj.err = errwrap.Append(obj.err, err)
+	obj.errMutex.Unlock()
 }

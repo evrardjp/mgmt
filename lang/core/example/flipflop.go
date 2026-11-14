@@ -1,0 +1,138 @@
+// Mgmt
+// Copyright (C) James Shubin and the project contributors
+// Written by James Shubin <james@shubin.ca> and the project contributors
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
+
+package coreexample
+
+import (
+	"context"
+	"sync"
+	"time"
+
+	"github.com/purpleidea/mgmt/lang/funcs"
+	"github.com/purpleidea/mgmt/lang/interfaces"
+	"github.com/purpleidea/mgmt/lang/types"
+)
+
+const (
+	// FlipFlopFuncName is the name this func is registered as.
+	FlipFlopFuncName = "flipflop"
+)
+
+func init() {
+	funcs.ModuleRegister(ModuleName, FlipFlopFuncName, func() interfaces.Func { return &FlipFlop{} })
+}
+
+// FlipFlop is a func which flips a bool repeatedly. This is an example func and
+// is not meant for serious computing. This would be better served by a flip
+// function which you could specify an interval for.
+type FlipFlop struct {
+	interfaces.Textarea
+
+	init  *interfaces.Init
+	mutex *sync.Mutex
+	value bool
+}
+
+// String returns a simple name for this func. This is needed so this struct can
+// satisfy the pgraph.Vertex interface.
+func (obj *FlipFlop) String() string {
+	return FlipFlopFuncName
+}
+
+// Validate makes sure we've built our struct properly.
+func (obj *FlipFlop) Validate() error {
+	return nil
+}
+
+// Info returns some static info about itself.
+func (obj *FlipFlop) Info() *interfaces.Info {
+	return &interfaces.Info{
+		Pure: false, // non-constant funcs can't be pure!
+		Memo: false,
+		Fast: false,
+		Spec: false,
+		Sig:  types.NewType("func() bool"),
+	}
+}
+
+// Init runs some startup code for this func.
+func (obj *FlipFlop) Init(init *interfaces.Init) error {
+	obj.init = init
+	obj.mutex = &sync.Mutex{}
+	// If this func is being re-added to the graph, then start flipping from
+	// the beginning again, instead of from wherever the old Stream stopped.
+	obj.value = false
+	return nil
+}
+
+// Stream starts a mainloop and runs Event when it's time to Call() again.
+func (obj *FlipFlop) Stream(ctx context.Context) error {
+	// TODO: don't hard code 5 sec interval
+	ticker := time.NewTicker(time.Duration(5) * time.Second)
+	defer ticker.Stop()
+
+	// streams must generate an initial event on startup
+	// even though ticker will send one, we want to be faster to first event
+	startChan := make(chan struct{}) // start signal
+	close(startChan)                 // kick it off!
+
+	for {
+		select {
+		case <-startChan:
+			startChan = nil // disable
+
+		case <-ticker.C: // received the timer event
+			// pass
+
+		case <-ctx.Done():
+			return nil
+		}
+
+		obj.mutex.Lock()
+		obj.value = !obj.value // flip it
+		obj.mutex.Unlock()
+
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
+	}
+}
+
+// Call this func and return the value if it is possible to do so at this time.
+func (obj *FlipFlop) Call(ctx context.Context, args []types.Value) (types.Value, error) {
+	if obj.mutex == nil {
+		return nil, funcs.ErrCantSpeculate
+	}
+	obj.mutex.Lock() // TODO: could be a read lock
+	value := obj.value
+	obj.mutex.Unlock()
+	return &types.BoolValue{
+		V: value,
+	}, nil
+}

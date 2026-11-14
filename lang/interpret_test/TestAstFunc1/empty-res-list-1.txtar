@@ -1,0 +1,20 @@
+-- main.mcl --
+# single resource
+test "name" {}
+
+# single resource, defined by list variable
+$names = ["hey"]
+test $names {}
+
+# multiples resources, defined by list
+test ["hello", "world"] {}
+-- OUTPUT --
+Edge: const: str("hello") -> composite: []str # 0
+Edge: const: str("hey") -> composite: []str # 0
+Edge: const: str("world") -> composite: []str # 1
+Vertex: composite: []str
+Vertex: composite: []str
+Vertex: const: str("hello")
+Vertex: const: str("hey")
+Vertex: const: str("name")
+Vertex: const: str("world")

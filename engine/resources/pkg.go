@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,13 +13,30 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package resources
 
 import (
+	"cmp"
+	"context"
+	"errors"
 	"fmt"
 	"path"
+	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/purpleidea/mgmt/engine"
@@ -32,6 +49,8 @@ import (
 func init() {
 	engine.RegisterResource("pkg", func() engine.Res { return &PkgRes{} })
 }
+
+var _ engine.EdgeableRes = &PkgRes{} // compile time check
 
 const (
 	// PkgStateInstalled is the string that represents that the package
@@ -48,6 +67,13 @@ const (
 )
 
 // PkgRes is a package resource for packagekit.
+//
+// It will attempt to make automatic edges with the package name, unless
+// Meta:autoedge is false. For the unique scenario where you are adding a new
+// package repository, and then installing something from it, you will want to
+// disable automatic edges, or this will fail to find the package during the
+// Init stage before mgmt can even run and create the repo! As a result, add an
+// edge between this and the repo creation stage, and avoid graph errors!
 type PkgRes struct {
 	traits.Base // add the base methods without re-implementation
 	traits.Edgeable
@@ -55,10 +81,29 @@ type PkgRes struct {
 
 	init *engine.Init
 
-	State            string `yaml:"state"`            // state: installed, uninstalled, newest, <version>
-	AllowUntrusted   bool   `yaml:"allowuntrusted"`   // allow untrusted packages to be installed?
-	AllowNonFree     bool   `yaml:"allownonfree"`     // allow nonfree packages to be found?
-	AllowUnsupported bool   `yaml:"allowunsupported"` // allow unsupported packages to be found?
+	// State determines if we want to install or uninstall the package, and
+	// what version we want to pin if any. Valid values include: installed,
+	// uninstalled, newest, and `version`, where you just put the raw
+	// version string desired.
+	State string `lang:"state" yaml:"state"`
+
+	// AllowDowngrade specifies if we want to allow a lower package version
+	// to be installed when State is set to a specific version string.
+	AllowDowngrade bool `lang:"allowdowngrade" yaml:"allowdowngrade"`
+
+	// AllowUntrusted specifies if we want to allow untrusted packages to be
+	// installed. Please see the PackageKit documentation for more
+	// information.
+	AllowUntrusted bool `lang:"allowuntrusted" yaml:"allowuntrusted"`
+
+	// AllowNonFree specifies if we want to allow nonfree packages to be
+	// found? Please see the PackageKit documentation for more information.
+	AllowNonFree bool `lang:"allownonfree" yaml:"allownonfree"`
+
+	// AllowUnsupported specifies if we want to unsupported packages to be
+	// found? Please see the PackageKit documentation for more information.
+	AllowUnsupported bool `lang:"allowunsupported" yaml:"allowunsupported"`
+
 	//bus              *packagekit.Conn    // pk bus connection
 	fileList []string // FIXME: update if pkg changes
 }
@@ -86,8 +131,9 @@ func (obj *PkgRes) Validate() error {
 func (obj *PkgRes) Init(init *engine.Init) error {
 	obj.init = init // save for later
 
-	if obj.fileList == nil {
-		if err := obj.populateFileList(); err != nil {
+	aem := obj.AutoEdgeMeta() // get current values
+	if obj.fileList == nil && !aem.Disabled {
+		if err := obj.populateFileList(context.TODO()); err != nil {
 			return errwrap.Wrapf(err, "error populating file list in init")
 		}
 	}
@@ -95,8 +141,8 @@ func (obj *PkgRes) Init(init *engine.Init) error {
 	return nil
 }
 
-// Close is run by the engine to clean up after the resource is done.
-func (obj *PkgRes) Close() error {
+// Cleanup is run by the engine to clean up after the resource is done.
+func (obj *PkgRes) Cleanup() error {
 	return nil
 }
 
@@ -104,10 +150,10 @@ func (obj *PkgRes) Close() error {
 // uses the PackageKit UpdatesChanged signal to watch for changes.
 // TODO: https://github.com/hughsie/PackageKit/issues/109
 // TODO: https://github.com/hughsie/PackageKit/issues/110
-func (obj *PkgRes) Watch() error {
-	bus := packagekit.NewBus()
-	if bus == nil {
-		return fmt.Errorf("can't connect to PackageKit bus")
+func (obj *PkgRes) Watch(ctx context.Context) error {
+	bus, err := packagekit.NewBus()
+	if err != nil {
+		return err
 	}
 	defer bus.Close()
 	bus.Debug = obj.init.Debug
@@ -115,14 +161,16 @@ func (obj *PkgRes) Watch() error {
 		obj.init.Logf("packagekit: "+format, v...)
 	}
 
-	ch, err := bus.WatchChanges()
+	ch, cleanup, err := bus.WatchChanges()
 	if err != nil {
 		return errwrap.Wrapf(err, "error adding signal match")
 	}
+	defer cleanup() // ignore the error
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
-	var send = false // send event?
 	for {
 		if obj.init.Debug {
 			obj.init.Logf("%s: Watching...", obj.fmtNames(obj.getNames()))
@@ -132,7 +180,7 @@ func (obj *PkgRes) Watch() error {
 		case event := <-ch:
 			// FIXME: ask packagekit for info on what packages changed
 			if obj.init.Debug {
-				obj.init.Logf("Event(%s): %s", event.Name, obj.fmtNames(obj.getNames()))
+				obj.init.Logf("event(%s): %s", event.Name, obj.fmtNames(obj.getNames()))
 			}
 
 			// since the chan is buffered, remove any supplemental
@@ -141,16 +189,12 @@ func (obj *PkgRes) Watch() error {
 				<-ch // discard
 			}
 
-			send = true
-
-		case <-obj.init.Done: // closed by the engine to signal shutdown
-			return nil
+		case <-ctx.Done(): // closed by the engine to signal shutdown
+			return ctx.Err()
 		}
 
-		// do all our event sending all together to avoid duplicate msgs
-		if send {
-			send = false
-			obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
 		}
 	}
 }
@@ -192,38 +236,135 @@ func (obj *PkgRes) groupMappingHelper() map[string]string {
 	return result
 }
 
-func (obj *PkgRes) pkgMappingHelper(bus *packagekit.Conn) (map[string]*packagekit.PkPackageIDActionData, error) {
+func (obj *PkgRes) pkgMappingHelper(ctx context.Context, bus *packagekit.Conn) (map[string]*packagekit.PkPackageIDActionData, error) {
 	packageMap := obj.groupMappingHelper() // get the grouped values
 	packageMap[obj.Name()] = obj.State     // key is pkg name, value is pkg state
 	var filter uint64                      // initializes at the "zero" value of 0
-	filter += packagekit.PkFilterEnumArch  // always search in our arch (optional!)
+	filter |= packagekit.PkFilterEnumArch  // always search in our arch (optional!)
 	// we're requesting newest version, or to narrow down install choices!
 	if obj.State == PkgStateNewest || obj.State == PkgStateInstalled {
 		// if we add this, we'll still see older packages if installed
 		// this is an optimization, and is *optional*, this logic is
 		// handled inside of PackagesToPackageIDs now automatically!
-		filter += packagekit.PkFilterEnumNewest // only search for newest packages
+		filter |= packagekit.PkFilterEnumNewest // only search for newest packages
 	}
 	if !obj.AllowNonFree {
-		filter += packagekit.PkFilterEnumFree
+		filter |= packagekit.PkFilterEnumFree
 	}
 	if !obj.AllowUnsupported {
-		filter += packagekit.PkFilterEnumSupported
+		filter |= packagekit.PkFilterEnumSupported
 	}
-	result, err := bus.PackagesToPackageIDs(packageMap, filter)
+	result, err := bus.PackagesToPackageIDs(ctx, packageMap, filter)
 	if err != nil {
 		return nil, errwrap.Wrapf(err, "can't run PackagesToPackageIDs")
 	}
 	return result, nil
 }
 
+// notFoundError returns the "can't find package" error, augmented with a hint
+// if the package would have been visible with one of the AllowNonFree or
+// AllowUnsupported search filters relaxed.
+func (obj *PkgRes) notFoundError(ctx context.Context, bus *packagekit.Conn, name string) error {
+	notFoundErr := fmt.Errorf("can't find package named '%s'", name)
+
+	var candidates []string
+	if !obj.AllowNonFree {
+		candidates = append(candidates, "allownonfree")
+	}
+	if !obj.AllowUnsupported {
+		candidates = append(candidates, "allowunsupported")
+	}
+	if len(candidates) == 0 {
+		// all relax flags are already on, nothing to suggest
+		return notFoundErr
+	}
+
+	packageMap := map[string]string{name: obj.State}
+	var filter uint64
+	filter |= packagekit.PkFilterEnumArch
+	if obj.State == PkgStateNewest || obj.State == PkgStateInstalled {
+		filter |= packagekit.PkFilterEnumNewest
+	}
+	// intentionally drop PkFilterEnumFree and PkFilterEnumSupported
+
+	result, err := bus.PackagesToPackageIDs(ctx, packageMap, filter)
+	if err != nil {
+		return errwrap.Wrapf(err, "can't run PackagesToPackageIDs")
+	}
+	data, ok := result[name]
+	if !ok || !data.Found {
+		// really not available, even with filters relaxed
+		return notFoundErr
+	}
+	if len(candidates) == 1 {
+		return fmt.Errorf("can't find package named '%s'; you need to enable: %s", name, candidates[0])
+	}
+	return fmt.Errorf("can't find package named '%s'; you need to enable one or more of: %s", name, strings.Join(candidates, ", "))
+}
+
+// versionNotFoundError returns the "version is not available" error, and logs
+// the list of versions which are actually available, if any, one per line.
+func (obj *PkgRes) versionNotFoundError(ctx context.Context, bus *packagekit.Conn, name string) error {
+	notFoundErr := fmt.Errorf("version %s of package '%s' is not available", obj.State, name)
+
+	// same filter that pkgMappingHelper uses for a version string state
+	var filter uint64
+	filter |= packagekit.PkFilterEnumArch
+	if !obj.AllowNonFree {
+		filter |= packagekit.PkFilterEnumFree
+	}
+	if !obj.AllowUnsupported {
+		filter |= packagekit.PkFilterEnumSupported
+	}
+
+	resolved, err := bus.ResolvePackages(ctx, []string{name}, filter)
+	if err != nil {
+		obj.init.Logf("can't list available versions: %v", err)
+		return notFoundErr
+	}
+	versions := []string{}
+	installed := make(map[string]bool)
+	for _, p := range resolved {
+		// format is: name;version;arch;data
+		s := strings.Split(p.PackageID, ";")
+		if len(s) != 4 || s[0] != name || s[1] == "" {
+			continue
+		}
+		ver, arch := s[1], s[2]
+		if b, err := packagekit.IsMyArch(arch); err != nil || !b {
+			continue
+		}
+		if !util.StrInList(ver, versions) {
+			versions = append(versions, ver)
+		}
+		if p.Info == packagekit.PkInfoEnumInstalled {
+			installed[ver] = true
+		}
+	}
+	if len(versions) == 0 {
+		return notFoundErr
+	}
+	// packagekit doesn't guarantee any order, so sort them ourselves
+	slices.SortStableFunc(versions, pkgVersionCmp)
+
+	obj.init.Logf("the available versions of '%s' are:", name)
+	for _, ver := range versions {
+		if installed[ver] {
+			obj.init.Logf("%s (installed)", ver)
+			continue
+		}
+		obj.init.Logf("%s", ver)
+	}
+	return notFoundErr
+}
+
 // populateFileList fills in the fileList structure with what is in the package.
 // TODO: should this work properly if pkg has been autogrouped ?
-func (obj *PkgRes) populateFileList() error {
+func (obj *PkgRes) populateFileList(ctx context.Context) error {
 
-	bus := packagekit.NewBus()
-	if bus == nil {
-		return fmt.Errorf("can't connect to PackageKit bus")
+	bus, err := packagekit.NewBus()
+	if err != nil {
+		return err
 	}
 	defer bus.Close()
 	if obj.init != nil {
@@ -233,7 +374,7 @@ func (obj *PkgRes) populateFileList() error {
 		}
 	}
 
-	result, err := obj.pkgMappingHelper(bus)
+	result, err := obj.pkgMappingHelper(ctx, bus)
 	if err != nil {
 		return errwrap.Wrapf(err, "the pkgMappingHelper failed")
 	}
@@ -241,18 +382,30 @@ func (obj *PkgRes) populateFileList() error {
 	data, ok := result[obj.Name()] // lookup single package (init does just one)
 	// package doesn't exist, this is an error!
 	if !ok || !data.Found {
-		return fmt.Errorf("can't find package named '%s'", obj.Name())
+		// common if we made a package name typo or repo doesn't exist!
+		return obj.notFoundError(ctx, bus, obj.Name())
+	}
+	if data.PackageID == "" && stateIsVersion(obj.State) {
+		// The requested version isn't available (yet?) so we can't get
+		// a file list. This isn't an error here, since CheckApply will
+		// report it more usefully. Leave fileList as nil so that we try
+		// again next time, in case a repo starts offering the version.
+		if obj.init != nil {
+			obj.init.Logf("version %s is not available, skipping file list", obj.State)
+		}
+		return nil
 	}
 	if data.PackageID == "" {
-		// this can happen if you specify a bad version like "latest"
 		return fmt.Errorf("empty PackageID found for '%s'", obj.Name())
 	}
 
 	packageIDs := []string{data.PackageID} // just one for now
-	filesMap, err := bus.GetFilesByPackageID(packageIDs)
+	filesMap, err := bus.GetFilesByPackageID(ctx, packageIDs)
 	if err != nil {
 		return errwrap.Wrapf(err, "can't run GetFilesByPackageID")
 	}
+	// empty (not nil) so a no-file fetch isn't retried via the nil guard
+	obj.fileList = []string{}
 	if files, ok := filesMap[data.PackageID]; ok {
 		obj.fileList = util.DirifyFileList(files, false)
 	}
@@ -262,12 +415,12 @@ func (obj *PkgRes) populateFileList() error {
 
 // CheckApply checks the resource state and applies the resource if the bool
 // input is true. It returns error info and if the state check passed or not.
-func (obj *PkgRes) CheckApply(apply bool) (bool, error) {
+func (obj *PkgRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 	obj.init.Logf("Check: %s", obj.fmtNames(obj.getNames()))
 
-	bus := packagekit.NewBus()
-	if bus == nil {
-		return false, fmt.Errorf("can't connect to PackageKit bus")
+	bus, err := packagekit.NewBus()
+	if err != nil {
+		return false, err
 	}
 	defer bus.Close()
 	bus.Debug = obj.init.Debug
@@ -275,7 +428,7 @@ func (obj *PkgRes) CheckApply(apply bool) (bool, error) {
 		obj.init.Logf("packagekit: "+format, v...)
 	}
 
-	result, err := obj.pkgMappingHelper(bus)
+	result, err := obj.pkgMappingHelper(ctx, bus)
 	if err != nil {
 		return false, errwrap.Wrapf(err, "the pkgMappingHelper failed")
 	}
@@ -283,6 +436,16 @@ func (obj *PkgRes) CheckApply(apply bool) (bool, error) {
 	packageMap := obj.groupMappingHelper() // map[string]string
 	packageList := []string{obj.Name()}
 	packageList = append(packageList, util.StrMapKeys(packageMap)...)
+
+	// produce a friendly diagnostic if any package is missing, before we
+	// hand the result off to FilterState which would also fail, but with
+	// less context about why
+	for _, name := range packageList {
+		p, ok := result[name]
+		if !ok || !p.Found {
+			return false, obj.notFoundError(ctx, bus, name)
+		}
+	}
 	//stateList := []string{obj.State}
 	//stateList = append(stateList, util.StrMapValues(packageMap)...)
 
@@ -292,7 +455,10 @@ func (obj *PkgRes) CheckApply(apply bool) (bool, error) {
 	if err != nil {
 		return false, errwrap.Wrapf(err, "the FilterState method failed")
 	}
-	data, _ := result[obj.Name()] // if above didn't error, we won't either!
+	data, ok := result[obj.Name()]
+	if !ok {
+		return false, fmt.Errorf("missing result for package %s", obj.Name())
+	}
 	validState := util.BoolMapTrue(util.BoolMapValues(states))
 
 	// obj.State == PkgStateInstalled || PkgStateUninstalled || PkgStateNewest || "4.2-1.fc23"
@@ -309,6 +475,9 @@ func (obj *PkgRes) CheckApply(apply bool) (bool, error) {
 		if obj.State == data.Version && data.Version != "" {
 			return true, nil
 		}
+		if data.PackageID == "" {
+			return false, obj.versionNotFoundError(ctx, bus, obj.Name())
+		}
 	}
 
 	// state is not okay, no work done, exit, but without error
@@ -324,18 +493,18 @@ func (obj *PkgRes) CheckApply(apply bool) (bool, error) {
 	}
 	// these are the packages that actually need their states applied!
 	applyPackages := util.StrFilterElementsInList(readyPackages, packageList)
-	packageIDs, _ := packagekit.FilterPackageIDs(result, applyPackages) // would be same err as above
-
-	var transactionFlags uint64 // initializes at the "zero" value of 0
-	if !obj.AllowUntrusted {    // allow
-		transactionFlags += packagekit.PkTransactionFlagEnumOnlyTrusted
+	packageIDs, err := packagekit.FilterPackageIDs(result, applyPackages)
+	if err != nil {
+		return false, err
 	}
+
+	transactionFlags := obj.packageTransactionFlags()
 	// apply correct state!
 	obj.init.Logf("Set(%s): %s...", obj.State, obj.fmtNames(util.StrListIntersection(applyPackages, obj.getNames())))
 	switch obj.State {
 	case PkgStateUninstalled: // run remove
-		// NOTE: packageID is different than when installed, because now
-		// it has the "installed" flag added to the data portion of it!!
+		// NOTE: this is the packageID of the installed package which on
+		// some backends differs from the available one in its data part
 		err = bus.RemovePackages(packageIDs, transactionFlags)
 
 	case PkgStateNewest: // TODO: isn't this the same operation as install, below?
@@ -347,10 +516,67 @@ func (obj *PkgRes) CheckApply(apply bool) (bool, error) {
 		err = bus.InstallPackages(packageIDs, transactionFlags)
 	}
 	if err != nil {
+		if e := obj.packageAlreadyInstalledError(err); e != nil {
+			return false, e
+		}
+		if e := obj.untrustedError(err); e != nil {
+			return false, e
+		}
 		return false, err // fail
 	}
 	obj.init.Logf("Set(%s) success: %s", obj.State, obj.fmtNames(util.StrListIntersection(applyPackages, obj.getNames())))
 	return false, nil // success
+}
+
+// untrustedError is a helper to provide a better error message when an install
+// or update was refused because the package or its repository was not trusted
+// and AllowUntrusted is off. It returns nil if the error is unrelated.
+func (obj *PkgRes) untrustedError(err error) error {
+	if obj.AllowUntrusted {
+		return nil // OnlyTrusted flag wasn't set, so trust isn't the cause
+	}
+	var pkErr *packagekit.PkError
+	if !errors.As(err, &pkErr) {
+		return nil
+	}
+	switch pkErr.Code {
+	case packagekit.PkErrorEnumGPGFailure:
+		obj.init.Logf("package had a GPG failure while verifying")
+	case packagekit.PkErrorEnumBadGPGSignature:
+		obj.init.Logf("package has a bad GPG signature")
+	case packagekit.PkErrorEnumMissingGPGSignature:
+		obj.init.Logf("package is missing a GPG signature")
+	case packagekit.PkErrorEnumCannotInstallRepoUnsigned:
+		// the apt backend uses this if it can't authenticate a package
+		obj.init.Logf("package can't be authenticated")
+	default:
+		return nil
+	}
+	return errwrap.Wrapf(err, "package is not trusted, use allowuntrusted to allow installing untrusted packages")
+}
+
+// packageAlreadyInstalledError is a helper to provide a better error message.
+func (obj *PkgRes) packageAlreadyInstalledError(err error) error {
+	var pkErr *packagekit.PkError
+	if obj.AllowDowngrade || !stateIsVersion(obj.State) || !errors.As(err, &pkErr) {
+		return nil
+	}
+	if pkErr.Code != packagekit.PkErrorEnumPackageAlreadyInstalled {
+		return nil
+	}
+	return errwrap.Wrapf(err, "higher version already installed, use allowdowngrade to allow pinning to lower version %q", obj.State)
+}
+
+// packageTransactionFlags is a helper to group all the flags together.
+func (obj *PkgRes) packageTransactionFlags() uint64 {
+	var transactionFlags uint64 // initializes at the "zero" value of 0
+	if !obj.AllowUntrusted {    // don't allow
+		transactionFlags |= packagekit.PkTransactionFlagEnumOnlyTrusted
+	}
+	if obj.AllowDowngrade && stateIsVersion(obj.State) {
+		transactionFlags |= packagekit.PkTransactionFlagEnumAllowDowngrade
+	}
+	return transactionFlags
 }
 
 // Cmp compares two resources and returns an error if they are not equivalent.
@@ -385,6 +611,10 @@ func (obj *PkgRes) Adapts(r engine.CompatibleRes) error {
 			return e
 		}
 		// one must be installed, and the other must be "newest"
+	}
+
+	if obj.AllowDowngrade != res.AllowDowngrade {
+		return fmt.Errorf("allowdowngrade differs: %t vs %t", obj.AllowDowngrade, res.AllowDowngrade)
 	}
 
 	if obj.AllowUntrusted != res.AllowUntrusted {
@@ -438,6 +668,7 @@ func (obj *PkgRes) Merge(r engine.CompatibleRes) (engine.CompatibleRes, error) {
 func (obj *PkgRes) Copy() engine.CopyableRes {
 	return &PkgRes{
 		State:            obj.State,
+		AllowDowngrade:   obj.AllowDowngrade,
 		AllowUntrusted:   obj.AllowUntrusted,
 		AllowNonFree:     obj.AllowNonFree,
 		AllowUnsupported: obj.AllowUnsupported,
@@ -558,13 +789,13 @@ func (obj *PkgResAutoEdges) Test(input []bool) bool {
 
 // AutoEdges produces an object which generates a minimal pkg file optimization
 // sequence of edges.
-func (obj *PkgRes) AutoEdges() (engine.AutoEdge, error) {
+func (obj *PkgRes) AutoEdges(ctx context.Context) (engine.AutoEdge, error) {
 	// in contrast with the FileRes AutoEdges() function which contains
 	// more of the mechanics, most of the AutoEdge mechanics for the PkgRes
 	// are contained in the Test() method! This design is completely okay!
 
 	if obj.fileList == nil {
-		if err := obj.populateFileList(); err != nil {
+		if err := obj.populateFileList(ctx); err != nil {
 			return nil, errwrap.Wrapf(err, "error populating file list for automatic edges")
 		}
 	}
@@ -677,4 +908,100 @@ func ReturnSvcInFileList(fileList []string) []string {
 // TODO: what should we do about the empty string?
 func stateIsVersion(state string) bool {
 	return (state != PkgStateInstalled && state != PkgStateUninstalled && state != PkgStateNewest) // must be a ver. string
+}
+
+// pkgVersionSegments matches the runs of digits or letters in a version string.
+var pkgVersionSegments = regexp.MustCompile(`[0-9]+|[a-zA-Z]+`)
+
+// pkgVersionCmp compares two [epoch:]version[-release] package version strings,
+// returning -1, 0 or 1. Each part is compared in turn with pkgVersionPartCmp.
+// This is an approximation of rpm's comparison, so only use it for display
+// purposes such as sorting.
+// XXX: improve this to work with .deb packages too...
+func pkgVersionCmp(a, b string) int {
+	split := func(s string) []string {
+		epoch, s, ok := strings.Cut(s, ":")
+		if !ok { // no epoch
+			epoch, s = "0", epoch
+		}
+		version, release := s, ""
+		if i := strings.LastIndex(s, "-"); i >= 0 {
+			version, release = s[:i], s[i+1:]
+		}
+		return []string{epoch, version, release}
+	}
+	x, y := split(a), split(b)
+	for i := range x {
+		if c := pkgVersionPartCmp(x[i], y[i]); c != 0 {
+			return c
+		}
+	}
+	return 0
+}
+
+// pkgVersionPartCmp compares one part of a package version string, returning
+// -1, 0 or 1. It is a simplified rpmvercmp: the strings are split into runs of
+// digits and runs of letters, ignoring separators, and compared run by run.
+// Digits compare numerically and are newer than letters. It doesn't know about
+// the special ~ and ^ characters.
+// XXX: improve this to work with .deb packages too...
+func pkgVersionPartCmp(a, b string) int {
+	x := pkgVersionSegments.FindAllString(a, -1)
+	y := pkgVersionSegments.FindAllString(b, -1)
+	for i := 0; i < len(x) && i < len(y); i++ {
+		xd, yd := x[i][0] >= '0' && x[i][0] <= '9', y[i][0] >= '0' && y[i][0] <= '9'
+		if xd != yd {
+			if xd {
+				return 1 // a number is newer than a letter
+			}
+			return -1
+		}
+		s, t := x[i], y[i]
+		if xd { // numeric compare without parsing, so no overflow
+			s, t = strings.TrimLeft(s, "0"), strings.TrimLeft(t, "0")
+			if c := cmp.Compare(len(s), len(t)); c != 0 {
+				return c
+			}
+		}
+		if c := strings.Compare(s, t); c != 0 {
+			return c
+		}
+	}
+	return cmp.Compare(len(x), len(y)) // more segments is newer
+}
+
+// InstallOnePackage is a helper function which uses the minimum resource
+// mechanics to install a single package. Keep this up-to-date with the resource
+// internals since we may make some concessions in this helper function in that
+// we don't call the full API.
+func InstallOnePackage(ctx context.Context, name string) error {
+	res, err := engine.NewNamedResource("pkg", name)
+	if err != nil {
+		return err
+	}
+	pkg, ok := res.(*PkgRes)
+	if !ok {
+		return fmt.Errorf("error casting PkgRes")
+	}
+	pkg.State = PkgStateInstalled
+
+	init := &engine.Init{
+		Event: func(ctx context.Context) error {
+			return nil
+		},
+		Debug: false,
+		Logf: func(format string, v ...interface{}) {
+			// noop
+		},
+	}
+	if err := res.Init(init); err != nil {
+		return err
+	}
+
+	apply := true
+	if _, err := res.CheckApply(ctx, apply); err != nil {
+		return err
+	}
+
+	return res.Cleanup()
 }

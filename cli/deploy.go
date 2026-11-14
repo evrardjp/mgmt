@@ -1,0 +1,331 @@
+// Mgmt
+// Copyright (C) James Shubin and the project contributors
+// Written by James Shubin <james@shubin.ca> and the project contributors
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
+
+package cli
+
+import (
+	"context"
+	"fmt"
+	"os"
+
+	cliUtil "github.com/purpleidea/mgmt/cli/util"
+	"github.com/purpleidea/mgmt/engine"
+	"github.com/purpleidea/mgmt/etcd"
+	etcdfs "github.com/purpleidea/mgmt/etcd/fs"
+	etcdSSH "github.com/purpleidea/mgmt/etcd/ssh"
+	"github.com/purpleidea/mgmt/gapi"
+	"github.com/purpleidea/mgmt/lib"
+	"github.com/purpleidea/mgmt/util"
+	"github.com/purpleidea/mgmt/util/errwrap"
+	. "github.com/purpleidea/mgmt/util/gettext"
+	"github.com/purpleidea/mgmt/util/signals"
+
+	git "github.com/go-git/go-git/v5"
+	"github.com/google/uuid"
+)
+
+// DeployArgs is the CLI parsing structure and type of the parsed result. This
+// particular one contains all the common flags for the `deploy` subcommand
+// which all frontends can use.
+type DeployArgs struct {
+	// SSHURL can be specified if we want to transport the SSH client
+	// connection over SSH. If this is specified, the second hop is made
+	// with the Seeds values, but they connect from this destination. You
+	// can specify this in the standard james@server:22 format. This will
+	// use your ~/.ssh/ directory for public key authentication and
+	// verifying the host key in the known_hosts file. This must already be
+	// setup for things to work.
+	SSHURL string `arg:"--ssh-url" help:"transport the etcd client connection over SSH to this server"`
+
+	// SSHHostKey is the key part (which is already base64 encoded) from a
+	// known_hosts file, representing the host we're connecting to. If this
+	// is specified, then it overrides looking for it in the URL.
+	SSHHostKey string `arg:"--ssh-hostkey" help:"use this ssh known hosts key when connecting over SSH"`
+
+	// SSHID is the private key path for SSH client auth with --ssh-url. If
+	// empty, mgmt scans the default SSH directory for id_* private keys.
+	SSHID string `arg:"--ssh-id" help:"private key for SSH client auth"`
+
+	Seeds []string `arg:"--seeds,separate,env:MGMT_SEEDS" help:"default etcd client endpoints"`
+	Noop  bool     `arg:"--noop" help:"globally force all resources into no-op mode"`
+	Sema  int      `arg:"--sema" default:"-1" help:"globally add a semaphore to all resources with this lock count"`
+	NoGit bool     `arg:"--no-git" help:"don't look at git commit id for safe deploys"`
+	Force bool     `arg:"--force" help:"force a new deploy, even if the safety chain would break"`
+
+	NoAutoEdges bool `arg:"--no-autoedges" help:"skip the autoedges stage"`
+	NoAutoGroup bool `arg:"--no-autogroup" help:"skip the autogroup stage"`
+
+	DeployEmpty *cliUtil.EmptyArgs `arg:"subcommand:empty" help:"deploy empty payload"`
+	DeployLang  *cliUtil.LangArgs  `arg:"subcommand:lang" help:"deploy lang (mcl) payload"`
+	DeployYaml  *cliUtil.YamlArgs  `arg:"subcommand:yaml" help:"deploy yaml graph payload"`
+}
+
+// Run executes the correct subcommand. It errors if there's ever an error. It
+// returns true if we did activate one of the subcommands. It returns false if
+// we did not. This information is used so that the top-level parser can return
+// usage or help information if no subcommand activates. This particular Run is
+// the run for the main `deploy` subcommand. This always requires a frontend to
+// deploy to the cluster, but if you don't want a graph, you can use the `empty`
+// frontend. The engine backend is agnostic to which frontend is deployed, in
+// fact, you can deploy with multiple different frontends, one after another, on
+// the same engine.
+func (obj *DeployArgs) Run(ctx context.Context, data *cliUtil.Data) (bool, error) {
+	var name string
+	var args interface{}
+	if cmd := obj.DeployEmpty; cmd != nil {
+		name = cliUtil.LookupSubcommand(obj, cmd) // "empty"
+		args = cmd
+	}
+	if cmd := obj.DeployLang; cmd != nil {
+		name = cliUtil.LookupSubcommand(obj, cmd) // "lang"
+		args = cmd
+	}
+	if cmd := obj.DeployYaml; cmd != nil {
+		name = cliUtil.LookupSubcommand(obj, cmd) // "yaml"
+		args = cmd
+	}
+	// XXX: workaround https://github.com/alexflint/go-arg/issues/239
+	gapiNames := gapi.Names() // list of registered names
+	if l := len(obj.Seeds); name == "" && l > 1 {
+		elem := obj.Seeds[l-2] // second to last element
+		if util.StrInList(elem, gapiNames) {
+			return false, cliUtil.CliParseError(cliUtil.MissingEquals) // consistent errors
+		}
+	}
+
+	fn, exists := gapi.RegisteredGAPIs[name]
+	if !exists {
+		return false, nil // did not activate
+	}
+	gapiObj := fn()
+
+	program, version := data.Program, data.Version
+	Logf := func(format string, v ...interface{}) {
+		data.Flags.Logf("deploy: "+format, v...)
+	}
+
+	// TODO: consider adding a timeout based on an args.Timeout flag ?
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// install the exit signal handler
+	ladder := &signals.Ladder{
+		Rungs: []*signals.Rung{
+			{Func: cancel},
+		},
+		Logf: data.Flags.Logf,
+	}
+	defer ladder.Start()()
+
+	cliUtil.Hello(program, version, data.Flags) // say hello!
+	defer Logf(G("goodbye!"))
+
+	var hash, pHash string
+	if !obj.NoGit {
+		wd, err := os.Getwd()
+		if err != nil {
+			return false, errwrap.Wrapf(err, "could not get current working directory")
+		}
+		repo, err := git.PlainOpen(wd)
+		if err != nil {
+			return false, errwrap.Wrapf(err, "could not open git repo")
+		}
+		worktree, err := repo.Worktree()
+		if err != nil {
+			return false, errwrap.Wrapf(err, "could not open git worktree")
+		}
+		status, err := worktree.Status()
+		if err != nil {
+			return false, errwrap.Wrapf(err, "could not read git worktree status")
+		}
+		if !status.IsClean() {
+			return false, fmt.Errorf("git worktree is dirty, commit or stash changes before deploying, or use --no-git")
+		}
+
+		head, err := repo.Head()
+		if err != nil {
+			return false, errwrap.Wrapf(err, "could not read git HEAD")
+		}
+
+		hash = head.Hash().String() // current commit id
+		Logf("hash: %s", hash)
+
+		lo := &git.LogOptions{
+			From: head.Hash(),
+		}
+		commits, err := repo.Log(lo)
+		if err != nil {
+			return false, errwrap.Wrapf(err, "could not read git log")
+		}
+		if _, err := commits.Next(); err != nil { // skip over HEAD
+			return false, errwrap.Wrapf(err, "could not read HEAD in git log") // weird!
+		}
+		commit, err := commits.Next()
+		if err == nil { // errors are okay, we might be empty
+			pHash = commit.Hash.String() // previous commit id
+		}
+		Logf("previous deploy hash: %s", pHash)
+		if obj.Force {
+			pHash = "" // don't check this :(
+		}
+		if hash == "" {
+			return false, fmt.Errorf("could not get git deploy hash")
+		}
+	}
+
+	uniqueid := uuid.New() // panic's if it can't generate one :P
+
+	var deployFs engine.Fs
+	var world engine.World
+	world = &etcd.World{ // XXX: What should some of these fields be?
+		Seeds:          obj.Seeds,
+		NS:             lib.NS,
+		MetadataPrefix: lib.MetadataPrefix,
+		StoragePrefix:  lib.StoragePrefix,
+		//StandaloneFs: ???.DeployFs, // used for static deploys
+		GetURI: func() string {
+			if deployFs == nil {
+				return ""
+			}
+			return deployFs.URI()
+		},
+	}
+	if obj.SSHURL != "" { // alternate world implementation over SSH
+		world = &etcdSSH.World{
+			URL:            obj.SSHURL,
+			HostKey:        obj.SSHHostKey,
+			SSHID:          obj.SSHID,
+			Seeds:          obj.Seeds,
+			NS:             lib.NS,
+			MetadataPrefix: lib.MetadataPrefix,
+			StoragePrefix:  lib.StoragePrefix,
+			//StandaloneFs: ???.DeployFs, // used for static deploys
+			GetURI: func() string {
+				if deployFs == nil {
+					return ""
+				}
+				return deployFs.URI()
+			},
+		}
+	}
+	worldInit := &engine.WorldInit{
+		Hostname: "", // XXX: Should we set this?
+		Debug:    data.Flags.Debug,
+		Logf: func(format string, v ...interface{}) {
+			Logf("world: etcd: "+format, v...)
+		},
+	}
+	if err := world.Connect(ctx, worldInit); err != nil {
+		return false, errwrap.Wrapf(err, "world Connect failed")
+	}
+	defer func() {
+		err := errwrap.Wrapf(world.Cleanup(), "world Cleanup failed")
+		if err != nil {
+			// TODO: cause the final exit code to be non-zero?
+			Logf("close error: %+v", err)
+		}
+	}()
+
+	// get max id (from all the previous deploys)
+	max, err := world.GetMaxDeployID(ctx)
+	if err != nil {
+		return false, errwrap.Wrapf(err, "error getting max deploy id")
+	}
+	// find the latest id
+	var id = max + 1 // next id
+	Logf("previous max deploy id: %d", max)
+
+	// TODO: using a uuid is meant as a temporary measure, i hate them
+	metadata := lib.MetadataPrefix + fmt.Sprintf("/deploy/%d-%s", id, uniqueid)
+	deployFs, err = world.Fs(ctx, fmt.Sprintf("%s://%s", etcdfs.Scheme, metadata))
+	if err != nil {
+		return false, errwrap.Wrapf(err, "could not create deploy filesystem")
+	}
+
+	etcdFs, ok := deployFs.(*etcdfs.Fs)
+	if ok {
+		// Defer the superblock write so the gapi copy phase doesn't
+		// re-upload the entire metadata tree once per file. We Flush()
+		// it ourselves once below, before the deploy is published.
+		etcdFs.DeferMetadata = true
+	}
+
+	info := &gapi.Info{
+		Args: args,
+		Flags: &gapi.Flags{
+			Noop: obj.Noop,
+			Sema: obj.Sema,
+			//Update: obj.Update,
+		},
+
+		Fs:    deployFs,
+		Debug: data.Flags.Debug,
+		Logf: func(format string, v ...interface{}) {
+			// TODO: is this a sane prefix to use here?
+			data.Flags.Logf("cli: "+format, v...)
+		},
+	}
+
+	deploy, err := gapiObj.Cli(info)
+	if err != nil {
+		return false, cliUtil.CliParseError(err) // consistent errors
+	}
+	if deploy == nil { // not used
+		return false, fmt.Errorf("not enough information specified")
+	}
+
+	if ok {
+		// Flush the deferred superblock so readers see the new tree before
+		// the deploy record addition below tries to look for it. Required
+		// when we use DeferMetadata.
+		if err := etcdFs.Flush(); err != nil {
+			return false, errwrap.Wrapf(err, "could not flush etcd fs metadata")
+		}
+	}
+
+	// redundant
+	deploy.Noop = obj.Noop
+	deploy.Sema = obj.Sema
+
+	deploy.NoAutoEdges = obj.NoAutoEdges
+	deploy.NoAutoGroup = obj.NoAutoGroup
+
+	str, err := deploy.ToB64()
+	if err != nil {
+		return false, errwrap.Wrapf(err, "encoding error")
+	}
+
+	Logf("pushing...")
+	// this nominally checks the previous git hash matches our expectation
+	if err := world.AddDeploy(ctx, id, hash, pHash, &str); err != nil {
+		return false, errwrap.Wrapf(err, "could not create deploy id `%d`", id)
+	}
+	Logf("success, id: %d", id)
+	return true, nil
+}

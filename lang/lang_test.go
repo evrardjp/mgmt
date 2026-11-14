@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,26 +13,38 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
-// +build !root
+//go:build !root
 
 package lang
 
 import (
+	"context"
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/purpleidea/mgmt/engine"
 	"github.com/purpleidea/mgmt/engine/resources"
-	_ "github.com/purpleidea/mgmt/lang/funcs/core" // import so the funcs register
+	_ "github.com/purpleidea/mgmt/lang/core" // import so the funcs register
 	"github.com/purpleidea/mgmt/lang/inputs"
 	"github.com/purpleidea/mgmt/lang/interfaces"
 	"github.com/purpleidea/mgmt/pgraph"
 	"github.com/purpleidea/mgmt/util"
 	"github.com/purpleidea/mgmt/util/errwrap"
-
-	"github.com/spf13/afero"
 )
 
 // TODO: unify with the other function like this...
@@ -90,13 +102,11 @@ func edgeCmpFn(e1, e2 pgraph.Edge) (bool, error) {
 	return e1.String() == e2.String(), nil
 }
 
-func runInterpret(t *testing.T, code string) (*pgraph.Graph, error) {
+func runInterpret(t *testing.T, code string) (_ *pgraph.Graph, reterr error) {
 	logf := func(format string, v ...interface{}) {
 		t.Logf("test: lang: "+format, v...)
 	}
-	mmFs := afero.NewMemMapFs()
-	afs := &afero.Afero{Fs: mmFs} // wrap so that we're implementing ioutil
-	fs := &util.Fs{Afero: afs}
+	fs := util.NewMemFs()
 
 	output, err := inputs.ParseInput(code, fs) // raw code can be passed in
 	if err != nil {
@@ -114,40 +124,46 @@ func runInterpret(t *testing.T, code string) (*pgraph.Graph, error) {
 	}
 	logf("tree:\n%s", tree)
 
+	wg := &sync.WaitGroup{}
+	defer wg.Wait()
+
+	ctx, cancel := context.WithCancel(context.Background()) // TODO: get it from parent
+	defer cancel()
+
 	lang := &Lang{
 		Fs:    fs,
 		Input: "/" + interfaces.MetadataFilename, // start path in fs
-		Debug: testing.Verbose(),                 // set via the -test.v flag to `go test`
+		Data: &Data{
+			UnificationStrategy: make(map[string]string), // empty
+		},
+		Debug: testing.Verbose(), // set via the -test.v flag to `go test`
 		Logf:  logf,
 	}
-	if err := lang.Init(); err != nil {
+	if err := lang.Init(ctx); err != nil {
 		return nil, errwrap.Wrapf(err, "init failed")
 	}
-	closeFn := func() error {
-		return errwrap.Wrapf(lang.Close(), "close failed")
-	}
+	defer lang.Cleanup()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := lang.Run(ctx); err != nil && err != context.Canceled {
+			reterr = errwrap.Append(reterr, err)
+		}
+	}()
+	defer cancel() // shutdown the Run
 
 	// we only wait for the first event, instead of the continuous stream
+	var graph *pgraph.Graph
+	var ok bool
 	select {
-	case err, ok := <-lang.Stream():
+	case graph, ok = <-lang.Stream(ctx):
 		if !ok {
-			return nil, errwrap.Wrapf(closeFn(), "stream closed without event")
-		}
-		if err != nil {
-			return nil, errwrap.Wrapf(err, "stream failed, close: %+v", closeFn())
+			return nil, fmt.Errorf("stream closed without event")
 		}
 	}
 
-	// run artificially without the entire GAPI loop
-	graph, err := lang.Interpret()
-	if err != nil {
-		err := errwrap.Wrapf(err, "interpret failed")
-		e := closeFn()
-		err = errwrap.Append(err, e) // list of errors
-		return nil, err
-	}
-
-	return graph, closeFn()
+	return graph, nil
 }
 
 // TODO: empty code is not currently allowed, should we allow it?
@@ -165,7 +181,7 @@ func runInterpret(t *testing.T, code string) (*pgraph.Graph, error) {
 //}
 
 func TestInterpret1(t *testing.T) {
-	code := `noop "n1" {}`
+	code := `noop "n1" {}` + "\n"
 	graph, err := runInterpret(t, code)
 	if err != nil {
 		t.Errorf("runInterpret failed: %+v", err)
@@ -602,7 +618,7 @@ func TestInterpretMany(t *testing.T) {
 			include c1($foo + "1")
 			include c1($foo + "2")
 			class c1($a) {
-				test $a {
+				test "${a}" {
 					stringptr => $foo,
 				}
 			}

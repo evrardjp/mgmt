@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # check that go vet passes
 
 echo running "$0"
@@ -34,7 +34,8 @@ function simplify-gocase() {
 
 function token-coloncheck() {
 	# add quotes to avoid matching three X's
-	if grep -Ei "[\/]+[\/]+[ ]*(T"'O''D'"O[^:]|F"'I''X''M'"E[^:]|X"'X'"X[^:])" "$1"; then
+	#if grep -Ei "[\/]+[\/]+[ ]*(T"'O''D'"O[^:]|F"'I''X''M'"E[^:]|X"'X'"X[^:])" "$1"; then
+	if grep -Ei "[\/]+[\/]+[\ 0-9a-zA-Z_@\*\?\'\(\)\{\}-]*(T"'O''D'"O[^:]|F"'I''X''M'"E[^:]|X"'X'"X[^:])" "$1"; then # not perfect
 		return 1	# tokens must end with a colon
 	fi
 	# tokens must be upper case
@@ -60,14 +61,19 @@ function naked-error() {
 
 # catch errors that start with a capital
 function lowercase-errors() {
-	if [[ $1 == *"/bindata.go" ]]; then	# ends with bindata.go ?
-		return 0	# skip those generated files
-	fi
-
-	if grep -E 'errors\.New\(\"[A-Z]' "$1"; then
+	if grep -E 'errors\.New\("[A-Z]' "$1"; then
 		return 1
 	fi
-	if grep -E 't\.Errorf\(\"[A-Z]' "$1"; then # t.Errorf or fmt.Errorf
+	if grep -E 't\.Error\("[A-Z]' "$1"; then # t.Error
+		return 1
+	fi
+	if grep -E 't\.Errorf\("[A-Z]' "$1"; then # t.Errorf or fmt.Errorf
+		return 1
+	fi
+	if grep -E 't\.Fatal\("[A-Z]' "$1"; then # t.Fatal
+		return 1
+	fi
+	if grep -E 't\.Fatalf\("[A-Z]' "$1"; then # t.Fatalf
 		return 1
 	fi
 	# TODO: add errwrap.Wrap* related matching
@@ -87,25 +93,38 @@ function consistent-imports() {
 	if grep $'\t"github.com/hashicorp/go-multierror"' "$1"; then
 		return 1
 	fi
-	# import as langutil
+	# import as *Util (should be fooUtil) with util capitalized
+	if grep $'util "github.com/purpleidea/mgmt"' "$1"; then
+		return 1
+	fi
+	# import as langUtil
 	if grep $'\t"github.com/purpleidea/mgmt/lang/util"' "$1"; then
 		return 1
 	fi
-	# import as engineutil
+	# import as engineUtil
 	if grep $'\t"github.com/purpleidea/mgmt/engine/util"' "$1"; then
+		return 1
+	fi
+	# import as cliUtil
+	if grep $'\t"github.com/purpleidea/mgmt/cli/util"' "$1"; then
 		return 1
 	fi
 	if grep '"golang.org/x/net/context"' "$1"; then	# use built-in context
 		return 1
 	fi
+
+	# deprecated import
+	if grep $'\t"io/ioutil"' "$1"; then # use the documented replacements
+		return 1
+	fi
 }
 
 function reflowed-comments() {
-	if [[ $1 == *"/bindata.go" ]]; then	# ends with bindata.go ?
-		return 0	# skip those generated files
+	if [ "$1" = './lang/core/generated_funcs.go' ]; then
+		return 0
 	fi
 
-	if [ "$1" = './lang/funcs/core/generated_funcs.go' ]; then
+	if [ "$1" = './lang/parser/y.go' ]; then
 		return 0
 	fi
 
@@ -117,19 +136,51 @@ function reflowed-comments() {
 		return 0
 	fi
 
-	./test/comment_parser "$1"
+	# Name this to match the function so it's easy to run this by itself.
+	./test/reflowed-comments "$1"
 }
 
-# run go vet on a per-package basis
+function receiver-check() {
+	if [ "$1" = './lang/core/generated_funcs.go' ]; then
+		return 0
+	fi
+
+	if [ "$1" = './lang/parser/y.go' ]; then
+		return 0
+	fi
+
+	if [ "$1" = './lang/parser/lexer.nn.go' ]; then
+		return 0
+	fi
+
+	if [ "$1" = './lang/interpolate/parse.generated.go' ]; then
+		return 0
+	fi
+
+	./test/receiver-check "$1"
+}
+
+# run go vet on the package list in one invocation
 base=$(go list .)
+packages=()
 for pkg in `go list -e ./... | grep -v "^${base}/vendor/" | grep -v "^${base}/examples/" | grep -v "^${base}/test/" | grep -v "^${base}/old" | grep -v "^${base}/old/" | grep -v "^${base}/tmp" | grep -v "^${base}/tmp/"`; do
-	echo -e "\tgo vet: $pkg"
-	run-test go vet -source "$pkg" || fail_test "go vet -source did not pass pkg"
+
+	# This special main package now has a js && wasm build tag, so go list
+	# no longer includes it, and we don't need to skip it.
+	#if [ "$pkg" = "${base}/engine/resources/http_server_ui" ]; then
+	#	continue # skip this special main package
+	#fi
+
+	packages+=("$pkg")
 
 done
+if [ "${#packages[@]}" -gt 0 ]; then
+	echo -e "\tgo vet: ${#packages[@]} packages"
+	go vet -source "${packages[@]}" || failures=$( [ -n "$failures" ] && echo "$failures\\ngo vet -source (${#packages[@]} packages)" || echo "go vet -source (${#packages[@]} packages)" )
+fi
 
 # loop through individual *.go files
-for file in `find . -maxdepth 9 -type f -name '*.go' -not -path './old/*' -not -path './tmp/*' -not -path './vendor/*'`; do
+for file in `find . -maxdepth 9 \( -type f -o -type l \) -name '*.go' -not -path './old/*' -not -path './tmp/*' -not -path './vendor/*' -not -path './sites/*'`; do
 	#if [[ $file == "./vendor/"* ]]; then # skip files that start with...
 	#	continue
 	#fi
@@ -141,6 +192,7 @@ for file in `find . -maxdepth 9 -type f -name '*.go' -not -path './old/*' -not -
 	run-test lowercase-errors "$file"
 	run-test consistent-imports "$file"
 	run-test reflowed-comments "$file"
+	run-test receiver-check "$file"
 done
 
 if [[ -n "$failures" ]]; then

@@ -1,0 +1,24 @@
+-- main.mcl --
+import "fmt"
+
+# we should only see one copy of $fn
+$fn = func() {
+	"hello world"
+}
+
+test "greeting1" {
+	anotherstr => $fn(),
+}
+test "greeting2" {
+	anotherstr => $fn(),
+}
+test "greeting3" {
+	anotherstr => $fn(),
+}
+-- OUTPUT --
+Vertex: const: str("greeting1")
+Vertex: const: str("greeting2")
+Vertex: const: str("greeting3")
+Vertex: const: str("hello world")
+Vertex: const: str("hello world")
+Vertex: const: str("hello world")

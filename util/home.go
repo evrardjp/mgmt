@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,19 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package util
 
@@ -27,18 +39,23 @@ import (
 	"github.com/purpleidea/mgmt/util/errwrap"
 )
 
-// ExpandHome does an expansion of ~/ or ~james/ into user's home dir value.
+// ExpandHome does an expansion of ~/ or ~james/ into user's home dir value. If
+// the input path ends in a slash, the result does too.
 func ExpandHome(p string) (string, error) {
+	suffix := "" // If it the input ends with a slash, so should the output.
+	if strings.HasSuffix(p, "/") {
+		suffix = "/"
+	}
 	if strings.HasPrefix(p, "~/") {
 		usr, err := user.Current()
 		if err != nil {
 			return p, fmt.Errorf("can't expand ~ into home directory")
 		}
-		return path.Join(usr.HomeDir, p[len("~/"):]), nil
+		return path.Join(usr.HomeDir, p[len("~/"):]) + suffix, nil
 	}
 
 	// check if provided path is in format ~username and keep track of provided username
-	r, err := regexp.Compile("~([^/]+)/")
+	r, err := regexp.Compile("^~([^/]+)/")
 	if err != nil {
 		return p, errwrap.Wrapf(err, "can't compile regexp")
 	}
@@ -48,7 +65,7 @@ func ExpandHome(p string) (string, error) {
 		if err != nil {
 			return p, fmt.Errorf("can't expand %s into home directory", match[0])
 		}
-		return path.Join(usr.HomeDir, p[len(match[0]):]), nil
+		return path.Join(usr.HomeDir, p[len(match[0]):]) + suffix, nil
 	}
 
 	return p, nil

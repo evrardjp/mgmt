@@ -1,0 +1,22 @@
+-- main.mcl --
+import "fmt"
+import "math"
+
+# This should fail since it can't be polymorphic!
+$myfortytwo = func() {
+	math.fortytwo()
+}
+
+$a = $myfortytwo() + 4
+$b = $myfortytwo() + 3.0
+
+test ["x"] {
+	int8 => $a,
+	float32 => $b,
+}
+-- OUTPUT --
+# err: errUnify: type error: int != float: /main.mcl @ 10:6-10:25
+type error: int != float: /main.mcl @ 10:6-10:25
+
+$b = $myfortytwo() + 3.0
+     ^^^^^^^^^^^^^^^^^^^

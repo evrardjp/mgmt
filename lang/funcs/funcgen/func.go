@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,13 +13,24 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
@@ -32,23 +43,25 @@ type function struct {
 	MgmtPackage string `yaml:"mgmtPackage"`
 	// MclName is the name of the function in mcl.
 	MclName string `yaml:"mclName"`
-	// InternalName is the name used inside the templated file.
-	// Used to avoid clash between same functions from different packages.
+	// InternalName is the name used inside the templated file. Used to
+	// avoid clash between same functions from different packages.
 	InternalName string `yaml:"internalName"`
-	// Help is the docstring of the function, including // and
-	// new lines.
+	// Help is the docstring of the function, including // and new lines.
 	Help string `yaml:"help"`
 	// GolangPackage is the representation of the package.
 	GolangPackage *golangPackage `yaml:"golangPackage"`
 	// GolangFunc is the name of the function in golang.
 	GolangFunc string `yaml:"golangFunc"`
-	// Errorful indicates wether the golang function can return an error
-	// as second argument.
+	// Errorful indicates whether the golang function can return an error as
+	// second argument.
 	Errorful bool `yaml:"errorful"`
 	// Args is the list of the arguments of the function.
 	Args []arg `yaml:"args"`
-	// ExtraGolangArgs are arguments that are added at the end of the go call.
-	// e.g. strconv.ParseFloat("3.1415", 64) could require add 64.
+	// Variadic is true if the last function parameter is variadic (e.g.
+	// param ...string)
+	Variadic bool
+	// ExtraGolangArgs are arguments that are added at the end of the go
+	// call. e.g. strconv.ParseFloat("3.1415", 64) could require add 64.
 	ExtraGolangArgs []arg `yaml:"extraGolangArgs"`
 	// Return is the list of arguments returned by the function.
 	Return []arg `yaml:"return"`
@@ -72,7 +85,7 @@ func parseFuncs(c config, f functions, path, templates string) error {
 func generateTemplate(c config, f functions, path, templateFile, finalName string) error {
 	log.Printf("Reading: %s", templateFile)
 	basename := filepath.Base(templateFile)
-	tplFile, err := ioutil.ReadFile(templateFile)
+	tplFile, err := os.ReadFile(templateFile)
 	if err != nil {
 		return err
 	}
@@ -90,7 +103,7 @@ func generateTemplate(c config, f functions, path, templateFile, finalName strin
 	}
 	return t.Execute(finalFile, struct {
 		Packages  golangPackages
-		Functions []function
+		Functions functions
 	}{
 		c.Packages,
 		f,
@@ -101,18 +114,24 @@ func generateTemplate(c config, f functions, path, templateFile, finalName strin
 func (obj *function) MakeGolangArgs() (string, error) {
 	var args []string
 	for i, a := range obj.Args {
-		gol, err := a.ToGolang()
+		gol, err := a.ToGolang(fmt.Sprintf("args[%d]", i))
 		if err != nil {
 			return "", err
 		}
-		input := fmt.Sprintf("input[%d].%s()", i, gol)
+
 		switch a.Type {
 		case "int":
-			input = fmt.Sprintf("int(%s)", input)
+			gol = fmt.Sprintf("int(%s)", gol)
 		case "[]byte":
-			input = fmt.Sprintf("[]byte(%s)", input)
+			gol = fmt.Sprintf("[]byte(%s)", gol)
 		}
-		args = append(args, input)
+
+		// Variadic expansion for the last slice argument.
+		if obj.Variadic && i == len(obj.Args)-1 && strings.HasPrefix(a.Type, "[]") {
+			gol = gol + "..."
+		}
+
+		args = append(args, gol)
 	}
 	for _, a := range obj.ExtraGolangArgs {
 		args = append(args, a.Value)
@@ -143,7 +162,7 @@ func (obj *function) Signature() (string, error) {
 
 // MakeGoReturn returns the golang signature of the return.
 func (obj *function) MakeGoReturn() (string, error) {
-	return obj.Return[0].ToGolang()
+	return obj.Return[0].OldToGolang()
 }
 
 // ConvertStart returns the start of a casting function required to convert from

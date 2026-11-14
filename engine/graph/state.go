@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,19 +13,34 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package graph
 
 import (
+	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/purpleidea/mgmt/converger"
 	"github.com/purpleidea/mgmt/engine"
+	"github.com/purpleidea/mgmt/engine/local"
+	engineUtil "github.com/purpleidea/mgmt/engine/util"
 	"github.com/purpleidea/mgmt/pgraph"
-	"github.com/purpleidea/mgmt/util"
 	"github.com/purpleidea/mgmt/util/errwrap"
 )
 
@@ -42,13 +57,15 @@ type State struct {
 	Program  string
 	Version  string
 	Hostname string
-	World    engine.World
+
+	Converger *converger.Coordinator
+
+	Local *local.API
+	World engine.World
 
 	// Prefix is a unique directory prefix which can be used. It should be
 	// created if needed.
 	Prefix string
-
-	//Converger *converger.Coordinator
 
 	// Debug turns on additional output and behaviours.
 	Debug bool
@@ -56,24 +73,53 @@ type State struct {
 	// Logf is the logging function that should be used to display messages.
 	Logf func(format string, v ...interface{})
 
-	timestamp int64 // last updated timestamp
-	isStateOK bool  // is state OK or do we need to run CheckApply ?
-	workerErr error // did the Worker error?
+	timestamp int64        // last updated timestamp
+	isStateOK *atomic.Bool // is state OK or do we need to run CheckApply ?
+	workerErr error        // did the Worker error?
 
-	// doneChan closes when Watch should shut down. When any of the
+	// async caches whether this resource runs its CheckApply in the async,
+	// non-blocking manner. It is resolved once during Init and must not
+	// change. See engine.AsyncCheckApply for how the value is determined.
+	async bool
+
+	// realized is closed while this resource has no pending work which it
+	// could run. It starts open, since we haven't run at all, is replaced
+	// with an open channel when an event or a poke arrives, and is closed
+	// again when a Process consumed that work, or found it blocked behind a
+	// prerequisite. The engine Pause waits on it for a realize resource, so
+	// that a graph swap waits for that work. It is guarded by mutex.
+	realized chan struct{}
+
+	mutex *sync.RWMutex // used for editing state properties
+
+	// pMutex guards pCancel below.
+	pMutex *sync.Mutex
+
+	// pCancel cancels the context of the currently running Process so that
+	// Watch can interrupt it. It is nil when no Process runs.
+	pCancel context.CancelFunc
+
+	// doneCtx is cancelled when Watch should shut down. When any of the
 	// following channels close, it causes this to close.
-	doneChan chan struct{}
+	doneCtx context.Context
+
+	// doneCtxCancel is the cancel function for doneCtx.
+	doneCtxCancel func()
 
 	// processDone is closed when the Process/CheckApply function fails
 	// permanently, and wants to cause Watch to exit.
 	processDone chan struct{}
 	// watchDone is closed when the Watch function fails permanently, and we
 	// close this to signal we should definitely exit. (Often redundant.)
-	watchDone chan struct{} // could be shared with limitDone
+	watchDone chan struct{} // could be shared with limitDone or retryDone
 	// limitDone is closed when the Watch function fails permanently, and we
 	// close this to signal we should definitely exit. This happens inside
 	// of the limit loop of the Process section of Worker.
-	limitDone chan struct{} // could be shared with watchDone
+	limitDone chan struct{} // could be shared with watchDone or retryDone
+	// retryDone is closed when the Watch function fails permanently, and we
+	// close this to signal we should definitely exit. This happens inside
+	// of the retry loop of the Process section of Worker.
+	retryDone chan struct{} // could be shared with watchDone or limitDone
 	// removeDone is closed when the vertexRemoveFn method asks for an exit.
 	// This happens when we're switching graphs. The switch to an "empty" is
 	// the equivalent of asking for a final shutdown.
@@ -86,7 +132,7 @@ type State struct {
 	// eventsChan is the channel that the engine listens on for events from
 	// the Watch loop for that resource. The event is nil normally, except
 	// when events are sent on this channel from the engine. This only
-	// happens as a signaling mechanism when Watch has shutdown and we want
+	// happens as a signalling mechanism when Watch has shutdown and we want
 	// to notify the Process loop which reads from this.
 	eventsChan chan error // outgoing from resource
 
@@ -95,14 +141,15 @@ type State struct {
 	// to send on since it is buffered.
 	pokeChan chan struct{} // outgoing from resource
 
-	// paused represents if this particular res is paused or not.
+	// paused represents if this particular res is paused or not. This is
+	// primarily used to avoid running an unnecessary Resume on the first
+	// run of this resource.
 	paused bool
-	// pauseSignal closes to request a pause of this resource.
+	// pauseSignal receives a message to request a pause of this resource.
 	pauseSignal chan struct{}
-	// resumeSignal closes to request a resume of this resource.
+	// resumeSignal receives a message to resume this resource. The channel
+	// closes when the resource is removed from the graph.
 	resumeSignal chan struct{}
-	// pausedAck is used to send an ack message saying that we've paused.
-	pausedAck *util.EasyAck
 
 	wg *sync.WaitGroup // used for all vertex specific processes
 
@@ -113,7 +160,7 @@ type State struct {
 }
 
 // Init initializes structures like channels.
-func (obj *State) Init() error {
+func (obj *State) Init(ctx context.Context) error {
 	res, isRes := obj.Vertex.(engine.Res)
 	if !isRes {
 		return fmt.Errorf("vertex is not a Res")
@@ -131,11 +178,21 @@ func (obj *State) Init() error {
 		return fmt.Errorf("the Logf function is missing")
 	}
 
-	obj.doneChan = make(chan struct{})
+	obj.isStateOK = &atomic.Bool{}
+
+	// Resolve the async setting once. This is the Meta:async override if set,
+	// otherwise the resource default (which traits.Async makes true).
+	obj.async = engine.AsyncCheckApply(res)
+
+	obj.mutex = &sync.RWMutex{}
+	obj.pMutex = &sync.Mutex{}
+	obj.doneCtx, obj.doneCtxCancel = context.WithCancel(context.Background())
+	obj.realized = make(chan struct{}) // open, we have work to do
 
 	obj.processDone = make(chan struct{})
 	obj.watchDone = make(chan struct{})
 	obj.limitDone = make(chan struct{})
+	obj.retryDone = make(chan struct{})
 	obj.removeDone = make(chan struct{})
 	obj.eventsDone = make(chan struct{})
 
@@ -143,10 +200,9 @@ func (obj *State) Init() error {
 
 	obj.pokeChan = make(chan struct{}, 1) // must be buffered
 
-	//obj.paused = false // starts off as started
+	obj.paused = true // starts off as paused
 	obj.pauseSignal = make(chan struct{})
-	//obj.resumeSignal = make(chan struct{}) // happens on pause
-	//obj.pausedAck = util.NewEasyAck() // happens on pause
+	obj.resumeSignal = make(chan struct{})
 
 	obj.wg = &sync.WaitGroup{}
 
@@ -154,14 +210,13 @@ func (obj *State) Init() error {
 	//obj.tuid = obj.Converger.Register() // gets registered in Worker()
 
 	obj.init = &engine.Init{
-		Program:  obj.Program,
-		Version:  obj.Version,
-		Hostname: obj.Hostname,
+		Program:   obj.Program,
+		Version:   obj.Version,
+		Hostname:  obj.Hostname,
+		Converger: obj.Converger,
 
 		// Watch:
-		Running: obj.event,
-		Event:   obj.event,
-		Done:    obj.doneChan,
+		Event: obj.event,
 
 		// CheckApply:
 		Refresh: func() bool {
@@ -186,9 +241,16 @@ func (obj *State) Init() error {
 		//},
 
 		FilteredGraph: func() (*pgraph.Graph, error) {
+			// The CheckApply of an async resource can overlap with
+			// a graph swap, and this walks the graph, so it can't
+			// be offered safely. See traits.Async for the details.
+			if obj.async {
+				return nil, fmt.Errorf("the FilteredGraph API is not available to an async resource")
+			}
+
 			graph, err := pgraph.NewGraph("filtered")
 			if err != nil {
-				return nil, errwrap.Wrapf(err, "could not create graph")
+				return nil, err
 			}
 
 			// filter graph and build a new one...
@@ -199,7 +261,7 @@ func (obj *State) Init() error {
 				if !ok {
 					continue
 				}
-				// pass in information on requestor...
+				// pass in information on requester...
 				if err := r1.GraphQueryAllowed(
 					engine.GraphQueryableOptionKind(res.Kind()),
 					engine.GraphQueryableOptionName(res.Name()),
@@ -214,7 +276,7 @@ func (obj *State) Init() error {
 					if !ok {
 						continue
 					}
-					// pass in information on requestor...
+					// pass in information on requester...
 					if err := r2.GraphQueryAllowed(
 						engine.GraphQueryableOptionKind(res.Kind()),
 						engine.GraphQueryableOptionName(res.Name()),
@@ -230,12 +292,13 @@ func (obj *State) Init() error {
 			return graph, nil // we return in a func so it's fresh!
 		},
 
+		Local:  obj.Local,
 		World:  obj.World,
 		VarDir: obj.varDir,
 
 		Debug: obj.Debug,
 		Logf: func(format string, v ...interface{}) {
-			obj.Logf("resource: "+format, v...)
+			obj.Logf(format, v...)
 		},
 	}
 
@@ -244,29 +307,34 @@ func (obj *State) Init() error {
 		obj.Logf("Init(%s)", res)
 	}
 
-	// write the reverse request to the disk...
-	if err := obj.ReversalInit(); err != nil {
-		return err // TODO: test this code path...
-	}
-
 	err := res.Init(obj.init)
 	if obj.Debug {
-		obj.Logf("Init(%s): Return(%+v)", res, err)
+		obj.Logf("Init(%s): Return(%s)", res, engineUtil.CleanError(err))
 	}
 	if err != nil {
 		return errwrap.Wrapf(err, "could not Init() resource")
 	}
 
+	// Write the reverse request to the disk... Do it after Init() so Watch
+	// and CheckApply can use the World API.
+	if err := obj.ReversalInit(ctx); err != nil {
+		// TODO: test this code path...
+		e := errwrap.Wrapf(res.Cleanup(), "could not Cleanup() res after reversal Init error")
+		return errwrap.Append(err, e)
+	}
+
 	return nil
 }
 
-// Close shuts down and performs any cleanup. This is most akin to a "post" or
+// Cleanup shuts down and performs any cleanup. This is most akin to a "post" or
 // cleanup command as the initiator for closing a vertex happens in graph sync.
-func (obj *State) Close() error {
+func (obj *State) Cleanup() error {
 	res, isRes := obj.Vertex.(engine.Res)
 	if !isRes {
 		return fmt.Errorf("vertex is not a Res")
 	}
+
+	obj.doneCtxCancel() // probably not required, but add as an extra safety
 
 	//if obj.cuid != nil {
 	//	obj.cuid.Unregister() // gets unregistered in Worker()
@@ -285,15 +353,15 @@ func (obj *State) Close() error {
 
 	var reverr error
 	// clear the reverse request from the disk...
-	if err := obj.ReversalClose(); err != nil {
+	if err := obj.ReversalCleanup(); err != nil {
 		// TODO: test this code path...
 		// TODO: should this be an error or a warning?
 		reverr = err
 	}
 
-	reterr := res.Close()
+	reterr := res.Cleanup()
 	if obj.Debug {
-		obj.Logf("Close(%s): Return(%+v)", res, reterr)
+		obj.Logf("Close(%s): Return(%s)", res, engineUtil.CleanError(reterr))
 	}
 
 	reterr = errwrap.Append(reterr, reverr)
@@ -308,37 +376,51 @@ func (obj *State) Close() error {
 // callers are expected to make sure that they don't leave any of these running
 // by the time the Worker() shuts down.
 func (obj *State) Poke() {
-	// redundant
-	//if len(obj.pokeChan) > 0 {
-	//	return
-	//}
-
+	// A poke is work, so mark ourselves unrealized here, at the send, and
+	// not when the Worker later receives it. A realize pause (see
+	// waitRealized in the engine) pauses in topological order and waits on
+	// this before it pauses us, so the poke from a prerequisite which just
+	// ran must be visible as work by the time we are looked at, even if our
+	// Worker hasn't dequeued it yet. Otherwise the pause could slip in and
+	// skip our run.
+	obj.setUnrealized()
 	select {
 	case obj.pokeChan <- struct{}{}:
 	default: // if chan is now full because more than one poke happened...
 	}
 }
 
-// Pause pauses this resource. It should not be called on any already paused
+// Pause pauses this resource. It must not be called on any already paused live
 // resource. It will block until the resource pauses with an acknowledgment, or
-// until an exit for that resource is seen. If the latter happens it will error.
-// It is NOT thread-safe with the Resume() method so only call either one at a
-// time.
+// until an exit for that resource is seen. If the latter happens it will error,
+// regardless of the last pause state. It must not be called concurrently with
+// either the Resume() method or itself, so only call these one at a time and
+// alternate between the two.
 func (obj *State) Pause() error {
 	if obj.paused {
-		return fmt.Errorf("already paused")
+		select {
+		case <-obj.doneCtx.Done():
+			return engine.ErrClosed
+		default:
+			// programming error
+			panic("already paused")
+		}
 	}
 
-	obj.pausedAck = util.NewEasyAck()
-	obj.resumeSignal = make(chan struct{}) // build the resume signal
-	close(obj.pauseSignal)
-	obj.Poke() // unblock and notice the pause if necessary
+	// Pause runs here, but if this resource has already errored (eg:
+	// CheckApply errored for some reason) then that resource will exit and
+	// instead of sending the `obj.pauseSignal`, we'll hit the
+	// `obj.doneCtx.Done()` case and return without setting `obj.paused`.
+	//
+	// As a result, during the Resume call, it would normally error because
+	// it is only expecting resources with `obj.paused = true`.
 
 	// wait for ack (or exit signal)
 	select {
-	case <-obj.pausedAck.Wait(): // we got it!
+	case obj.pauseSignal <- struct{}{}:
 		// we're paused
-	case <-obj.doneChan:
+
+	case <-obj.doneCtx.Done():
 		return engine.ErrClosed
 	}
 	obj.paused = true
@@ -346,23 +428,36 @@ func (obj *State) Pause() error {
 	return nil
 }
 
-// Resume unpauses this resource. It can be safely called on a brand-new
-// resource that has just started running without incident. It is NOT
-// thread-safe with the Pause() method, so only call either one at a time.
-func (obj *State) Resume() {
-	// TODO: do we need a mutex around Resume?
-	if !obj.paused { // no need to unpause brand-new resources
-		return
+// Resume unpauses this resource. It can and must be called once on a brand-new
+// resource that has just started running as they start paused. It must not be
+// called concurrently with either the Pause() method or itself, so only call
+// these one at a time and alternate between the two.
+func (obj *State) Resume() error {
+	if !obj.paused { // for debug
+		select {
+		case <-obj.doneCtx.Done():
+			//return engine.ErrClosed // happens below the same way
+		default:
+			// programming error
+			panic("not paused or exited")
+		}
 	}
 
-	obj.pauseSignal = make(chan struct{}) // rebuild for next pause
-	close(obj.resumeSignal)
-	//obj.Poke() // not needed, we're already waiting for resume
+	// If the resource already errored/exited, then we'll skip the
+	// `obj.resumeSignal` case here and not touch the `obj.paused` flag.
+	// Please read the comments in the corresponding Pause() function too.
+
+	select {
+	case obj.resumeSignal <- struct{}{}:
+		// we're resumed
+
+	case <-obj.doneCtx.Done():
+		return engine.ErrClosed
+	}
 
 	obj.paused = false
 
-	// no need to wait for it to resume
-	//return // implied
+	return nil
 }
 
 // event is a helper function to send an event to the CheckApply process loop.
@@ -370,41 +465,129 @@ func (obj *State) Resume() {
 // should instead use Poke() to "schedule" a new Process/CheckApply loop when
 // one might be needed. This method will block until we're unpaused and ready to
 // receive on the events channel.
-func (obj *State) event() {
-	obj.setDirty() // assume we're initially dirty
-
+func (obj *State) event(ctx context.Context) error {
+	// NOTE: The receiver runs setDirty for us. If we ran it here, and a
+	// Process was running while we blocked on this send, then that Process
+	// could complete afterwards and mark the state clean again, and this
+	// event would then wrongly skip its CheckApply, swallowing our change.
 	select {
-	case obj.eventsChan <- nil:
-		// send!
-	}
+	case obj.eventsChan <- nil: // blocks! (this is unbuffered)
+		return nil
 
-	//return // implied
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // setDirty marks the resource state as dirty. This signals to the engine that
-// CheckApply will have some work to do in order to converge it.
+// CheckApply will have some work to do in order to converge it. That work is
+// also what makes us unrealized.
 func (obj *State) setDirty() {
 	obj.tuid.StopTimer()
-	obj.isStateOK = false
+	//obj.mutex.Lock()
+	obj.isStateOK.Store(false) // concurrent write
+	//obj.mutex.Unlock()
+	obj.setUnrealized()
+}
+
+// setUnrealized records that we have pending work, so we are not realized. It
+// reopens the realized channel if it was closed. See that field for who waits.
+func (obj *State) setUnrealized() {
+	obj.mutex.Lock()
+	defer obj.mutex.Unlock()
+	select {
+	case <-obj.realized: // it was closed, so make a fresh open one
+		obj.realized = make(chan struct{})
+	default: // still open, nothing to do
+	}
+}
+
+// setRealized records that we have no pending work which we could run, either
+// since a Process consumed it, or since it is blocked behind a prerequisite. It
+// closes the realized channel if it was open.
+func (obj *State) setRealized() {
+	obj.mutex.Lock()
+	defer obj.mutex.Unlock()
+	select {
+	case <-obj.realized: // already closed, nothing to do
+	default:
+		close(obj.realized)
+	}
+}
+
+// realizedChan returns the current realized channel to wait on. It's closed
+// once we have no pending work which we could run.
+func (obj *State) realizedChan() <-chan struct{} {
+	obj.mutex.RLock()
+	defer obj.mutex.RUnlock()
+	return obj.realized
 }
 
 // poll is a replacement for Watch when the Poll metaparameter is used.
-func (obj *State) poll(interval uint32) error {
+func (obj *State) poll(ctx context.Context, interval int32) error {
 	// create a time.Ticker for the given interval
 	ticker := time.NewTicker(time.Duration(interval) * time.Second)
 	defer ticker.Stop()
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
 	for {
 		select {
 		case <-ticker.C: // received the timer event
 			obj.init.Logf("polling...")
 
-		case <-obj.init.Done: // signal for shutdown request
+		case <-ctx.Done(): // signal for shutdown request
 			return nil
 		}
 
-		obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
+	}
+}
+
+// once is a replacement for Watch when the Poll metaparameter is negative.
+func (obj *State) once(ctx context.Context) error {
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
+
+	select {
+	case <-ctx.Done(): // signal for shutdown request
+		return nil
+	}
+}
+
+// hidden is a replacement for Watch when the Hidden metaparameter is used.
+func (obj *State) hidden(ctx context.Context) error {
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
+
+	select {
+	case <-ctx.Done(): // signal for shutdown request
+		return nil
+	}
+}
+
+// registerProcessCancel saves the cancel function which can interrupt the
+// currently running Process. Pass nil to clear it. This is called by the
+// process loop around each Process invocation.
+func (obj *State) registerProcessCancel(cancel context.CancelFunc) {
+	obj.pMutex.Lock()
+	defer obj.pMutex.Unlock()
+	obj.pCancel = cancel
+}
+
+// cancelProcess cancels the currently running Process if there is one. It is
+// used when Watch fails, because a restarting Watch must never overlap with a
+// running Process.
+func (obj *State) cancelProcess() {
+	obj.pMutex.Lock()
+	defer obj.pMutex.Unlock()
+	if obj.pCancel != nil {
+		obj.pCancel()
 	}
 }

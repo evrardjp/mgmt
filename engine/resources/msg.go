@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,11 +13,24 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package resources
 
 import (
+	"context"
 	"fmt"
 	"regexp"
 	"strings"
@@ -39,11 +52,23 @@ type MsgRes struct {
 
 	init *engine.Init
 
-	Body           string            `yaml:"body"`
-	Priority       string            `yaml:"priority"`
-	Fields         map[string]string `yaml:"fields"`
-	Journal        bool              `yaml:"journal"` // enable systemd journal output
-	Syslog         bool              `yaml:"syslog"`  // enable syslog output
+	// Body is the body of the message to send.
+	Body string `lang:"body" yaml:"body"`
+
+	// Priority is the priority of the message. Currently this is one of:
+	// Emerg, Alert, Crit, Err, Warning, Notice, Info, Debug.
+	Priority string `lang:"priority" yaml:"priority"`
+
+	// Fields are the key/value pairs set in the journal if we are using it.
+	Fields map[string]string `lang:"fields" yaml:"fields"`
+
+	// Journal should be true to enable systemd journaled (journald) output.
+	Journal bool `lang:"journal" yaml:"journal"`
+
+	// Syslog should be true to enable traditional syslog output. This is
+	// probably going to somewhere in `/var/log/` on your filesystem.
+	Syslog bool `lang:"syslog" yaml:"syslog"`
+
 	logStateOK     bool
 	journalStateOK bool
 	syslogStateOK  bool
@@ -87,27 +112,20 @@ func (obj *MsgRes) Init(init *engine.Init) error {
 	return nil
 }
 
-// Close is run by the engine to clean up after the resource is done.
-func (obj *MsgRes) Close() error {
+// Cleanup is run by the engine to clean up after the resource is done.
+func (obj *MsgRes) Cleanup() error {
 	return nil
 }
 
 // Watch is the primary listener for this resource and it outputs events.
-func (obj *MsgRes) Watch() error {
-	obj.init.Running() // when started, notify engine that we're running
+func (obj *MsgRes) Watch(ctx context.Context) error {
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
-	//var send = false // send event?
-	for {
-		select {
-		case <-obj.init.Done: // closed by the engine to signal shutdown
-			return nil
-		}
-
-		// do all our event sending all together to avoid duplicate msgs
-		//if send {
-		//	send = false
-		//	obj.init.Event() // notify engine of an event (this can block)
-		//}
+	select {
+	case <-ctx.Done(): // closed by the engine to signal shutdown
+		return ctx.Err()
 	}
 }
 
@@ -156,7 +174,7 @@ func (obj *MsgRes) journalPriority() journal.Priority {
 
 // CheckApply method for Msg resource. Every check leads to an apply, meaning
 // that the message is flushed to the journal.
-func (obj *MsgRes) CheckApply(apply bool) (bool, error) {
+func (obj *MsgRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 	// isStateOK() done by engine, so we updateStateOK() to pass in value
 	//if obj.isAllStateOK() {
 	//	return true, nil
@@ -219,6 +237,12 @@ func (obj *MsgRes) Cmp(r engine.Res) error {
 		if res.Fields[field] != value {
 			return fmt.Errorf("the Fields differ")
 		}
+	}
+	if obj.Journal != res.Journal {
+		return fmt.Errorf("the Journal differs")
+	}
+	if obj.Syslog != res.Syslog {
+		return fmt.Errorf("the Syslog differs")
 	}
 
 	return nil

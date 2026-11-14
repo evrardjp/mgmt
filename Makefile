@@ -1,5 +1,5 @@
 # Mgmt
-# Copyright (C) 2013-2021+ James Shubin and the project contributors
+# Copyright (C) James Shubin and the project contributors
 # Written by James Shubin <james@shubin.ca> and the project contributors
 #
 # This program is free software: you can redistribute it and/or modify
@@ -13,19 +13,39 @@
 # GNU General Public License for more details.
 #
 # You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# Additional permission under GNU GPL version 3 section 7
+#
+# If you modify this program, or any covered work, by linking or combining it
+# with embedded mcl code and modules (and that the embedded mcl code and
+# modules which link with this program, contain a copy of their source code in
+# the authoritative form) containing parts covered by the terms of any other
+# license, the licensors of this program grant you additional permission to
+# convey the resulting work. Furthermore, the licensors of this program grant
+# the original author, James Shubin, additional permission to update this
+# additional permission if he deems it necessary to achieve the goals of this
+# additional permission.
 
-SHELL = /usr/bin/env bash
-.PHONY: all art cleanart version program lang path deps run race bindata generate build build-debug crossbuild clean test gofmt yamlfmt format docs
+SHELL = bash
+.PHONY: all art cleanart version program lang path deps run race generate build build-debug crossbuild clean test gofmt godocfmt mclfmt txtarfmt yamlfmt format docs
 .PHONY: rpmbuild mkdirs rpm srpm spec tar upload upload-sources upload-srpms upload-rpms upload-releases copr tag
-.PHONY: mkosi mkosi_fedora-30 mkosi_fedora-29 mkosi_centos-7 mkosi_debian-10 mkosi_ubuntu-bionic mkosi_archlinux
-.PHONY: release releases_path release_fedora-30 release_fedora-29 release_centos-7 release_debian-10 release_ubuntu-bionic release_archlinux
-.PHONY: funcgen
-.SILENT: clean bindata
+.PHONY: mkosi mkosi_fedora-latest mkosi_fedora-older mkosi_stream-latest mkosi_debian-stable mkosi_ubuntu-latest mkosi_archlinux
+.PHONY: release release_test releases_path release_binary_amd64 release_binary_arm64 release_fedora-latest release_fedora-older release_stream-latest release_debian-stable release_ubuntu-latest release_archlinux
+.PHONY: funcgen FORCE
+.SILENT: clean
 
 # a large amount of output from this `find`, can cause `make` to be much slower!
-GO_FILES := $(shell find * -name '*.go' -not -path 'old/*' -not -path 'tmp/*')
-MCL_FILES := $(shell find lang/funcs/ -name '*.mcl' -not -path 'old/*' -not -path 'tmp/*')
+GO_FILES_FIND = find * -name '*.go' -not -path 'old/*' -not -path 'tmp/*'
+MCL_FILES_FIND = find lang/ -name '*.mcl' -not -path 'old/*' -not -path 'tmp/*'
+# these are the other files that are embedded with go:embed into the binary
+MISC_FILES_FIND = find engine/resources/http_server_ui/ lang/core/embedded/provisioner/ data/fwattr.json COPYING
+PO_FILES_FIND = find * -name '*.po' -not -path 'old/*' -not -path 'tmp/*'
+GO_FILES := $(shell $(GO_FILES_FIND))
+MCL_FILES := $(shell $(MCL_FILES_FIND))
+MISC_FILES := $(shell $(MISC_FILES_FIND))
+PO_FILES := $(shell $(PO_FILES_FIND))
+FILES_STAMP = build/.stamp
 
 SVERSION := $(or $(SVERSION),$(shell git describe --match '[0-9]*\.[0-9]*\.[0-9]*' --tags --dirty --always))
 VERSION := $(or $(VERSION),$(shell git describe --match '[0-9]*\.[0-9]*\.[0-9]*' --tags --abbrev=0))
@@ -36,6 +56,28 @@ ifeq ($(VERSION),$(SVERSION))
 else
 	RELEASE = untagged
 endif
+# debugging is harder if -trimpath is set, so disable it if env var is set
+# this is force enabled automatically when using the release target
+ifeq ($(MGMT_NOTRIMPATH),true)
+	TRIMPATH =
+else
+	TRIMPATH = -trimpath
+endif
+ifeq ($(MGMT_NOGOLANGRACE),true)
+	GOLANGRACE =
+else
+	# can't use -race with CGO_ENABLED=0
+	ifeq ($(MGMT_NOCGO),true)
+		GOLANGRACE =
+	else
+		GOLANGRACE = -race
+	endif
+endif
+ifeq ($(MGMT_NOCGO),true)
+	GOLANGCGO = CGO_ENABLED=0
+else
+	GOLANGCGO =
+endif
 ARCH = $(uname -m)
 SPEC = rpmbuild/SPECS/$(PROGRAM).spec
 SOURCE = rpmbuild/SOURCES/$(PROGRAM)-$(VERSION).tar.bz2
@@ -44,7 +86,21 @@ SRPM_BASE = $(PROGRAM)-$(VERSION)-$(RELEASE).src.rpm
 RPM = rpmbuild/RPMS/$(PROGRAM)-$(VERSION)-$(RELEASE).$(ARCH).rpm
 USERNAME := $(shell cat ~/.config/copr 2>/dev/null | grep username | awk -F '=' '{print $$2}' | tr -d ' ')
 SERVER = 'dl.fedoraproject.org'
-REMOTE_PATH = 'pub/alt/$(USERNAME)/$(PROGRAM)'
+REMOTE_PATH = '/srv/pub/alt/$(USERNAME)/$(PROGRAM)'
+
+# Load at runtime instead of linking against it, so that the binary can at least
+# still run on machines which don't have the symbols available.
+ifneq ($(MGMT_NOAUGEASDLOPEN),true)
+	ifeq ($(filter augeas_dlopen,$(GOTAGS)),)
+		GOTAGS += augeas_dlopen
+	endif
+endif
+ifneq ($(MGMT_NOLIBVIRTDLOPEN),true)
+	ifeq ($(filter libvirt_dlopen,$(GOTAGS)),)
+		GOTAGS += libvirt_dlopen
+	endif
+endif
+
 ifneq ($(GOTAGS),)
 	BUILD_FLAGS = -tags '$(GOTAGS)'
 endif
@@ -53,33 +109,76 @@ GOOSARCHES ?= linux/amd64 linux/ppc64 linux/ppc64le linux/arm64 darwin/amd64
 GOHOSTOS = $(shell go env GOHOSTOS)
 GOHOSTARCH = $(shell go env GOHOSTARCH)
 
-# Work around a golang 1.16 bug https://github.com/golang/go/issues/44129
-# Can be removed when 1.17 is the minimum supported version
-export GOFLAGS ?= -mod=mod
+# The underscores separate the prefix name ("TOKEN") the distro ("BINARY",
+# "FEDORA-LATEST", etc...) and the arch ("AMD64"). The distro can have a dash.
+TOKEN_BINARY_AMD64 = $(shell grep -v '#' releases/binary-amd64.release)
+TOKEN_BINARY_ARM64 = $(shell grep -v '#' releases/binary-arm64.release)
+TOKEN_FEDORA-LATEST = $(shell grep -v '#' releases/fedora-latest.release)
+TOKEN_FEDORA-OLDER = $(shell grep -v '#' releases/fedora-older.release)
+TOKEN_STREAM-LATEST = $(shell grep -v '#' releases/stream-latest.release)
+TOKEN_DEBIAN-STABLE = $(shell grep -v '#' releases/debian-stable.release)
+TOKEN_UBUNTU-LATEST = $(shell grep -v '#' releases/ubuntu-latest.release)
+TOKEN_ARCHLINUX = $(shell grep -v '#' releases/archlinux.release)
 
-TOKEN_FEDORA-30 = fedora-30
-TOKEN_FEDORA-29 = fedora-29
-TOKEN_CENTOS-7 = centos-7
-TOKEN_DEBIAN-10 = debian-10
-TOKEN_UBUNTU-BIONIC = ubuntu-bionic
-TOKEN_ARCHLINUX = archlinux
-
-FILE_FEDORA-30 = mgmt-$(TOKEN_FEDORA-30)-$(VERSION)-1.x86_64.rpm
-FILE_FEDORA-29 = mgmt-$(TOKEN_FEDORA-29)-$(VERSION)-1.x86_64.rpm
-FILE_CENTOS-7 = mgmt-$(TOKEN_CENTOS-7)-$(VERSION)-1.x86_64.rpm
-FILE_DEBIAN-10 = mgmt_$(TOKEN_DEBIAN-10)_$(VERSION)_amd64.deb
-FILE_UBUNTU-BIONIC = mgmt_$(TOKEN_UBUNTU-BIONIC)_$(VERSION)_amd64.deb
+FILE_BINARY_AMD64 = mgmt-linux-amd64-$(VERSION)
+FILE_BINARY_ARM64 = mgmt-linux-arm64-$(VERSION)
+# TODO: add ARCH onto these at the end, eg _AMD64
+FILE_FEDORA-LATEST = mgmt-$(TOKEN_FEDORA-LATEST)-$(VERSION)-1.x86_64.rpm
+FILE_FEDORA-OLDER = mgmt-$(TOKEN_FEDORA-OLDER)-$(VERSION)-1.x86_64.rpm
+FILE_STREAM-LATEST = mgmt-$(TOKEN_STREAM-LATEST)-$(VERSION)-1.x86_64.rpm
+FILE_DEBIAN-STABLE = mgmt_$(TOKEN_DEBIAN-STABLE)_$(VERSION)_amd64.deb
+FILE_UBUNTU-LATEST = mgmt_$(TOKEN_UBUNTU-LATEST)_$(VERSION)_amd64.deb
 FILE_ARCHLINUX = mgmt-$(TOKEN_ARCHLINUX)-$(VERSION)-1-x86_64.pkg.tar.xz
 
-PKG_FEDORA-30 = releases/$(VERSION)/$(TOKEN_FEDORA-30)/$(FILE_FEDORA-30)
-PKG_FEDORA-29 = releases/$(VERSION)/$(TOKEN_FEDORA-29)/$(FILE_FEDORA-29)
-PKG_CENTOS-7 = releases/$(VERSION)/$(TOKEN_CENTOS-7)/$(FILE_CENTOS-7)
-PKG_DEBIAN-10 = releases/$(VERSION)/$(TOKEN_DEBIAN-10)/$(FILE_DEBIAN-10)
-PKG_UBUNTU-BIONIC = releases/$(VERSION)/$(TOKEN_UBUNTU-BIONIC)/$(FILE_UBUNTU-BIONIC)
+PKG_BINARY_AMD64_MASTER = releases/master/$(TOKEN_BINARY_AMD64)/$(FILE_BINARY_AMD64)
+PKG_BINARY_ARM64_MASTER = releases/master/$(TOKEN_BINARY_ARM64)/$(FILE_BINARY_ARM64)
+PKG_BINARY_AMD64 = releases/$(VERSION)/$(TOKEN_BINARY_AMD64)/$(FILE_BINARY_AMD64)
+PKG_BINARY_ARM64 = releases/$(VERSION)/$(TOKEN_BINARY_ARM64)/$(FILE_BINARY_ARM64)
+PKG_FEDORA-LATEST = releases/$(VERSION)/$(TOKEN_FEDORA-LATEST)/$(FILE_FEDORA-LATEST)
+PKG_FEDORA-OLDER = releases/$(VERSION)/$(TOKEN_FEDORA-OLDER)/$(FILE_FEDORA-OLDER)
+PKG_STREAM-LATEST = releases/$(VERSION)/$(TOKEN_STREAM-LATEST)/$(FILE_STREAM-LATEST)
+PKG_DEBIAN-STABLE = releases/$(VERSION)/$(TOKEN_DEBIAN-STABLE)/$(FILE_DEBIAN-STABLE)
+PKG_UBUNTU-LATEST = releases/$(VERSION)/$(TOKEN_UBUNTU-LATEST)/$(FILE_UBUNTU-LATEST)
 PKG_ARCHLINUX = releases/$(VERSION)/$(TOKEN_ARCHLINUX)/$(FILE_ARCHLINUX)
+
+DEP_BINARY_AMD64 =
+ifneq ($(TOKEN_BINARY_AMD64),)
+	DEP_BINARY_AMD64 = $(PKG_BINARY_AMD64)
+endif
+DEP_BINARY_ARM64 =
+ifneq ($(TOKEN_BINARY_ARM64),)
+	DEP_BINARY_ARM64 = $(PKG_BINARY_ARM64)
+endif
+DEP_FEDORA-LATEST =
+ifneq ($(TOKEN_FEDORA-LATEST),)
+	DEP_FEDORA-LATEST = $(PKG_FEDORA-LATEST)
+endif
+DEP_FEDORA-OLDER =
+ifneq ($(TOKEN_FEDORA-OLDER),)
+	DEP_FEDORA-OLDER = $(PKG_FEDORA-OLDER)
+endif
+DEP_STREAM-LATEST =
+ifneq ($(TOKEN_STREAM-LATEST),)
+	DEP_STREAM-LATEST = $(PKG_STREAM-LATEST)
+endif
+DEP_DEBIAN-STABLE =
+ifneq ($(TOKEN_DEBIAN-STABLE),)
+	DEP_DEBIAN-STABLE = $(PKG_DEBIAN-STABLE)
+endif
+DEP_UBUNTU-LATEST =
+ifneq ($(TOKEN_UBUNTU-LATEST),)
+	DEP_UBUNTU-LATEST = $(PKG_UBUNTU-LATEST)
+endif
+DEP_ARCHLINUX =
+ifneq ($(TOKEN_ARCHLINUX),)
+	DEP_ARCHLINUX = $(PKG_ARCHLINUX)
+endif
 
 SHA256SUMS = releases/$(VERSION)/SHA256SUMS
 SHA256SUMS_ASC = $(SHA256SUMS).asc
+
+SHA256SUMS_MASTER = releases/master/SHA256SUMS
+SHA256SUMS_MASTER_ASC = $(SHA256SUMS_MASTER).asc
 
 default: build
 
@@ -134,16 +233,9 @@ path: ## create working paths
 deps: ## install system and golang dependencies
 	./misc/make-deps.sh
 
-run: ## run mgmt
-	find . -maxdepth 1 -type f -name '*.go' -not -name '*_test.go' | xargs go run -ldflags "-X main.program=$(PROGRAM) -X main.version=$(SVERSION)"
-
-# include race flag
-race:
-	find . -maxdepth 1 -type f -name '*.go' -not -name '*_test.go' | xargs go run -race -ldflags "-X main.program=$(PROGRAM) -X main.version=$(SVERSION)"
-
-# generate go files from non-go source
-bindata: ## generate go files from non-go sources
-	$(MAKE) --quiet -C lang/funcs
+.PHONY: gettext
+gettext: ## pull latest translations out and merge them into the locales/ dir.
+	@./misc/gettext.sh
 
 generate:
 	go generate
@@ -152,40 +244,73 @@ lang: ## generates the lexer/parser for the language frontend
 	@# recursively run make in child dir named lang
 	@$(MAKE) --quiet -C lang
 
+resources: ## builds the resources dependencies required for the engine backend
+	@# recursively run make in child dir named engine/resources
+	@$(MAKE) --quiet -C engine/resources
+
 # build a `mgmt` binary for current host os/arch
 $(PROGRAM): build/mgmt-${GOHOSTOS}-${GOHOSTARCH} ## build an mgmt binary for current host os/arch
 	cp -a $< $@
 
-$(PROGRAM).static: $(GO_FILES) $(MCL_FILES)
+$(PROGRAM).static: $(FILES_STAMP) $(GO_FILES) $(MCL_FILES) $(MISC_FILES) $(PO_FILES) go.mod go.sum
 	@echo "Building: $(PROGRAM).static, version: $(SVERSION)..."
 	go generate
-	go build -a -installsuffix cgo -tags netgo -ldflags '-extldflags "-static" -X main.program=$(PROGRAM) -X main.version=$(SVERSION) -s -w' -o $(PROGRAM).static $(BUILD_FLAGS);
+	go build $(TRIMPATH) -a -installsuffix cgo -tags netgo -ldflags '-extldflags "-static" -X main.program=$(PROGRAM) -X main.version=$(SVERSION) -s -w' -o $(PROGRAM).static $(BUILD_FLAGS);
+
+# Export these target-specific variables to the recursive make below.
+export LDFLAGS BUILD_FLAGS
 
 build: LDFLAGS=-s -w ## build a fresh mgmt binary
-build: $(PROGRAM)
+build: lang resources funcgen
+	@$(MAKE) --no-print-directory $(PROGRAM)
 
 build-debug: LDFLAGS=
-build-debug: $(PROGRAM)
+build-debug: lang resources funcgen
+	@$(MAKE) --no-print-directory $(PROGRAM)
+
+# if you're using the bad/dev branch, you might want this too!
+baddev: BUILD_FLAGS = -tags 'noaugeas novirt'
+baddev: lang resources funcgen
+	@$(MAKE) --no-print-directory $(PROGRAM)
 
 # pattern rule target for (cross)building, mgmt-OS-ARCH will be expanded to the correct build
 # extract os and arch from target pattern
 GOOS=$(firstword $(subst -, ,$*))
 GOARCH=$(lastword $(subst -, ,$*))
-build/mgmt-%: $(GO_FILES) $(MCL_FILES) | bindata lang funcgen
+build/mgmt-%: $(FILES_STAMP) $(GO_FILES) $(MCL_FILES) $(MISC_FILES) $(PO_FILES) go.mod go.sum | lang resources funcgen
+	@# If you need to run `go mod tidy` then this can trigger.
+	@if [ "$(PKGNAME)" = "" ]; then echo "\$$(PKGNAME) is empty, test with: go list ."; exit 42; fi
 	@echo "Building: $(PROGRAM), os/arch: $*, version: $(SVERSION)..."
-	@time env GOOS=${GOOS} GOARCH=${GOARCH} go build -ldflags=$(PKGNAME)="-X main.program=$(PROGRAM) -X main.version=$(SVERSION) ${LDFLAGS}" -o $@ $(BUILD_FLAGS)
+	@# XXX: leave race detector on by default for now. For production
+	@# builds, we can consider turning it off for performance improvements.
+	@# XXX: ./mgmt run --tmp-prefix lang something_fast.mcl > /tmp/race 2>&1 # search for "WARNING: DATA RACE"
+	time env $(GOLANGCGO) GOOS=${GOOS} GOARCH=${GOARCH} go build $(TRIMPATH) $(GOLANGRACE) -ldflags=$(PKGNAME)="-X main.program=$(PROGRAM) -X main.version=$(SVERSION) ${LDFLAGS}" -o $@ $(BUILD_FLAGS)
+
+# The file lists above are expanded before make considers targets. If a source
+# file is deleted, it disappears from the prerequisites, so this stamp tracks
+# list membership and changes only when files are added or removed.
+$(FILES_STAMP): FORCE
+	@mkdir -p $(@D)
+	@{ $(GO_FILES_FIND); $(MCL_FILES_FIND); $(MISC_FILES_FIND); $(PO_FILES_FIND); } | sort > $@.tmp
+	@if ! test -f $@ || ! cmp -s $@.tmp $@; then mv $@.tmp $@; else rm $@.tmp; fi
+
+FORCE:
 
 # create a list of binary file names to use as make targets
+# to use this you might want to run something like:
+# GOOSARCHES='linux/arm64' GOTAGS='noaugeas novirt' make crossbuild
+# and the output will end up in build/
 crossbuild_targets = $(addprefix build/mgmt-,$(subst /,-,${GOOSARCHES}))
-crossbuild: ${crossbuild_targets}
+crossbuild: lang resources funcgen
+	@$(MAKE) --no-print-directory ${crossbuild_targets}
 
 clean: ## clean things up
 	$(MAKE) --quiet -C test clean
-	$(MAKE) --quiet -C lang/funcs clean
 	$(MAKE) --quiet -C lang clean
+	$(MAKE) --quiet -C engine/resources clean
 	$(MAKE) --quiet -C misc/mkosi clean
-	rm -f lang/funcs/core/generated_funcs.go || true
-	rm -f lang/funcs/core/generated_funcs_test.go || true
+	rm -f lang/core/generated_funcs.go || true
+	rm -f lang/core/generated_funcs_test.go || true
 	[ ! -e $(PROGRAM) ] || rm $(PROGRAM)
 	rm -f *_stringer.go	# generated by `go generate`
 	rm -f *_mock.go		# generated by `go generate`
@@ -210,13 +335,22 @@ $(addprefix test-shell-,${test_shell}): test-shell-%: build
 
 gofmt:
 	# TODO: remove gofmt once goimports has a -s option
-	find . -maxdepth 9 -type f -name '*.go' -not -path './old/*' -not -path './tmp/*' -not -path './vendor/*' -exec gofmt -s -w {} \;
-	find . -maxdepth 9 -type f -name '*.go' -not -path './old/*' -not -path './tmp/*' -not -path './vendor/*' -exec goimports -w {} \;
+	find . -maxdepth 9 \( -type f -o -type l \) -name '*.go' -not -path './old/*' -not -path './tmp/*' -not -path './vendor/*' -exec gofmt -s -w {} +
+	find . -maxdepth 9 \( -type f -o -type l \) -name '*.go' -not -path './old/*' -not -path './tmp/*' -not -path './vendor/*' -exec goimports -w {} +
+
+godocfmt: ## reflow golang doc comments
+	find . -maxdepth 9 \( -type f -o -type l \) -name '*.go' -not -path './old/*' -not -path './tmp/*' -not -path './vendor/*' \( -type l -o -not -exec git check-ignore --no-index -q -- {} \; \) -exec go run ./test/tools/reflowed-comments/ -w {} +
+
+mclfmt: ## format mcl files
+	./mgmt fmt
+
+txtarfmt: ## format mcl files embedded in txtar archives
+	go run ./test/tools/txtarfmt
 
 yamlfmt:
-	find . -maxdepth 3 -type f -name '*.yaml' -not -path './old/*' -not -path './tmp/*' -not -path './omv.yaml' -exec ruby -e "require 'yaml'; x=YAML.load_file('{}').to_yaml.each_line.map(&:rstrip).join(10.chr)+10.chr; File.open('{}', 'w').write x" \;
+	find . -maxdepth 3 \( -type f -o -type l \) -name '*.yaml' -not -path './old/*' -not -path './tmp/*' -not -path './omv.yaml' -exec ruby -e "require 'yaml'; x=YAML.load_file('{}').to_yaml.each_line.map(&:rstrip).join(10.chr)+10.chr; File.open('{}', 'w').write x" \;
 
-format: gofmt yamlfmt ## format yaml and golang code
+format: gofmt txtarfmt yamlfmt ## format yaml, mcl txtar, and golang code
 
 docs: $(PROGRAM)-documentation.pdf ## generate docs
 
@@ -367,25 +501,25 @@ tag: ## tags a new release
 #
 #	mkosi
 #
-mkosi: mkosi_fedora-30 mkosi_fedora-29 mkosi_centos-7 mkosi_debian-10 mkosi_ubuntu-bionic mkosi_archlinux ## builds distro packages via mkosi
+mkosi: mkosi_fedora-latest mkosi_fedora-older mkosi_stream-latest mkosi_debian-stable mkosi_ubuntu-latest mkosi_archlinux ## builds distro packages via mkosi
 
-mkosi_fedora-30: releases/$(VERSION)/.mkdir
+mkosi_fedora-latest: releases/$(VERSION)/.mkdir
 	@title='$@' ; echo "Generating: $${title#'mkosi_'} via mkosi..."
 	@title='$@' ; distro=$${title#'mkosi_'} ; ./misc/mkosi/make.sh $${distro} `realpath "releases/$(VERSION)/"`
 
-mkosi_fedora-29: releases/$(VERSION)/.mkdir
+mkosi_fedora-older: releases/$(VERSION)/.mkdir
 	@title='$@' ; echo "Generating: $${title#'mkosi_'} via mkosi..."
 	@title='$@' ; distro=$${title#'mkosi_'} ; ./misc/mkosi/make.sh $${distro} `realpath "releases/$(VERSION)/"`
 
-mkosi_centos-7: releases/$(VERSION)/.mkdir
+mkosi_stream-latest: releases/$(VERSION)/.mkdir
 	@title='$@' ; echo "Generating: $${title#'mkosi_'} via mkosi..."
 	@title='$@' ; distro=$${title#'mkosi_'} ; ./misc/mkosi/make.sh $${distro} `realpath "releases/$(VERSION)/"`
 
-mkosi_debian-10: releases/$(VERSION)/.mkdir
+mkosi_debian-stable: releases/$(VERSION)/.mkdir
 	@title='$@' ; echo "Generating: $${title#'mkosi_'} via mkosi..."
 	@title='$@' ; distro=$${title#'mkosi_'} ; ./misc/mkosi/make.sh $${distro} `realpath "releases/$(VERSION)/"`
 
-mkosi_ubuntu-bionic: releases/$(VERSION)/.mkdir
+mkosi_ubuntu-latest: releases/$(VERSION)/.mkdir
 	@title='$@' ; echo "Generating: $${title#'mkosi_'} via mkosi..."
 	@title='$@' ; distro=$${title#'mkosi_'} ; ./misc/mkosi/make.sh $${distro} `realpath "releases/$(VERSION)/"`
 
@@ -394,33 +528,111 @@ mkosi_archlinux: releases/$(VERSION)/.mkdir
 	@title='$@' ; distro=$${title#'mkosi_'} ; ./misc/mkosi/make.sh $${distro} `realpath "releases/$(VERSION)/"`
 
 #
+#	release master
+#
+.PHONY: release_master
+release_master: TRIMPATH = -trimpath
+release_master: GOLANGRACE =
+release_master: VERSION = master
+release_master: $(SHA256SUMS_MASTER_ASC) ## makes and uploads a master release
+	@#echo SVERSION: $(SVERSION)
+	@#echo VERSION: $(VERSION)
+	./misc/fpm-repo.sh --master --version $(SVERSION)
+
+$(SHA256SUMS_MASTER_ASC): $(SHA256SUMS_MASTER)
+	@echo "Signing sha256 sum..."
+	@gpg2 --yes --clearsign $(SHA256SUMS_MASTER)
+
+#$(SHA256SUMS_MASTER): $(PKG_BINARY_AMD64_MASTER) $(PKG_BINARY_ARM64_MASTER)
+$(SHA256SUMS_MASTER): $(PKG_BINARY_AMD64_MASTER)
+	@# remove the directory separator in the SHA256SUMS file
+	@echo "Generating: sha256 sum..."
+	@sha256sum \
+	` [ -e $(PKG_BINARY_AMD64_MASTER) ] && printf -- "$(PKG_BINARY_AMD64_MASTER)" ` \
+	` [ -e $(PKG_BINARY_ARM64_MASTER) ] && printf -- "$(PKG_BINARY_ARM64_MASTER)" ` \
+	| awk -F '/| ' '{print $$1"  "$$6}' > $(SHA256SUMS_MASTER)
+
+$(PKG_BINARY_AMD64_MASTER): build/mgmt-linux-amd64
+	@mkdir -p $$(dirname $(PKG_BINARY_AMD64_MASTER))
+	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; echo "Building: $${distro} package..."
+	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; cp -a build/mgmt-linux-amd64 $(PKG_BINARY_AMD64_MASTER)
+
+# XXX: requires magic to cross-compile go-libvirt for arm64, so figure this out later...
+$(PKG_BINARY_ARM64_MASTER): build/mgmt-linux-arm64
+	@mkdir -p $$(dirname $(PKG_BINARY_ARM64_MASTER))
+	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; echo "Building: $${distro} package..."
+	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; cp -a build/mgmt-linux-arm64 $(PKG_BINARY_ARM64_MASTER)
+
+#
 #	release
 #
+release: TRIMPATH = -trimpath
 release: releases/$(VERSION)/mgmt-release.url ## generates and uploads a release
 
 releases_path:
 	@#Don't put any other output or dependencies in here or they'll show!
 	@echo "releases/$(VERSION)/"
 
-release_fedora-30: $(PKG_FEDORA-30)
-release_fedora-29: $(PKG_FEDORA-29)
-release_centos-7: $(PKG_CENTOS-7)
-release_debian-10: $(PKG_DEBIAN-10)
-release_ubuntu-bionic: $(PKG_UBUNTU-BIONIC)
+release_test: $(DEP_BINARY_AMD64) $(DEP_BINARY_ARM64) $(DEP_FEDORA-LATEST) $(DEP_FEDORA-OLDER) $(DEP_STREAM-LATEST) $(DEP_DEBIAN-STABLE) $(DEP_UBUNTU-LATEST) $(DEP_ARCHLINUX) $(SHA256SUMS_ASC)
+	@echo '$$< denotes "the first dependency of the current rule".'
+	@echo '> '"$<"
+	@echo
+	@echo '$$@ denotes "the target of the current rule".'
+	@echo '> '"$@"
+	@echo
+	@echo '$$^ denotes "the dependencies of the current rule".'
+	@echo '> '"$^"
+	@echo
+	@echo '$$* denotes "the stem with which the pattern of the current rule matched".'
+	@echo '> '"$*"
+	@echo
+	@echo "TOKEN_BINARY_AMD64: $(TOKEN_BINARY_AMD64)"
+	@echo "DEP_BINARY_AMD64: $(DEP_BINARY_AMD64)"
+	@echo
+	@echo "TOKEN_BINARY_ARM64: $(TOKEN_BINARY_ARM64)"
+	@echo "DEP_BINARY_ARM64: $(DEP_BINARY_ARM64)"
+	@echo
+	@echo "TOKEN_FEDORA-LATEST: $(TOKEN_FEDORA-LATEST)"
+	@echo "DEP_FEDORA-LATEST: $(DEP_FEDORA-LATEST)"
+	@echo
+	@echo "TOKEN_FEDORA-OLDER: $(TOKEN_FEDORA-OLDER)"
+	@echo "DEP_FEDORA-OLDER: $(DEP_FEDORA-OLDER)"
+	@echo
+	@echo "TOKEN_STREAM-LATEST: $(TOKEN_STREAM-LATEST)"
+	@echo "DEP_STREAM-LATEST: $(DEP_STREAM-LATEST)"
+	@echo
+	@echo "TOKEN_DEBIAN-STABLE: $(TOKEN_DEBIAN-STABLE)"
+	@echo "DEP_DEBIAN-STABLE: $(DEP_DEBIAN-STABLE)"
+	@echo
+	@echo "TOKEN_UBUNTU-LATEST: $(TOKEN_UBUNTU-LATEST)"
+	@echo "DEP_UBUNTU-LATEST: $(DEP_UBUNTU-LATEST)"
+	@echo
+	@echo "TOKEN_ARCHLINUX: $(TOKEN_ARCHLINUX)"
+	@echo "DEP_ARCHLINUX: $(DEP_ARCHLINUX)"
+
+release_binary_amd64: $(PKG_BINARY_AMD64)
+release_binary_arm64: $(PKG_BINARY_ARM64)
+release_fedora-latest: $(PKG_FEDORA-LATEST)
+release_fedora-older: $(PKG_FEDORA-OLDER)
+release_stream-latest: $(PKG_STREAM-LATEST)
+release_debian-stable: $(PKG_DEBIAN-STABLE)
+release_ubuntu-latest: $(PKG_UBUNTU-LATEST)
 release_archlinux: $(PKG_ARCHLINUX)
 
-releases/$(VERSION)/mgmt-release.url: $(PKG_FEDORA-30) $(PKG_FEDORA-29) $(PKG_CENTOS-7) $(PKG_DEBIAN-10) $(PKG_UBUNTU-BIONIC) $(PKG_ARCHLINUX) $(SHA256SUMS_ASC)
+releases/$(VERSION)/mgmt-release.url: $(DEP_BINARY_AMD64) $(DEP_BINARY_ARM64) $(DEP_FEDORA-LATEST) $(DEP_FEDORA-OLDER) $(DEP_STREAM-LATEST) $(DEP_DEBIAN-STABLE) $(DEP_UBUNTU-LATEST) $(DEP_ARCHLINUX) $(SHA256SUMS_ASC)
 	@echo "Pushing git tag $(VERSION) to origin..."
 	git push origin $(VERSION)
 	@echo "Creating github release..."
 	hub release create \
-		-F <( echo -e "$(VERSION)\n";echo "Verify the signatures of all packages before you use them. The signing key can be downloaded from https://purpleidea.com/contact/#pgp-key to verify the release." ) \
-		-a $(PKG_FEDORA-30) \
-		-a $(PKG_FEDORA-29) \
-		-a $(PKG_CENTOS-7) \
-		-a $(PKG_DEBIAN-10) \
-		-a $(PKG_UBUNTU-BIONIC) \
-		-a $(PKG_ARCHLINUX) \
+		-F <( echo -e "$(VERSION)\n";echo -e "Full release notes at: https://github.com/purpleidea/mgmt/raw/refs/heads/master/docs/release-notes/$(VERSION) for all the details.\n\nVerify the signatures of all packages before you use them. The signing key can be downloaded from https://purpleidea.com/contact/#pgp-key to verify the release." ) \
+		` [ -e $(PKG_BINARY_AMD64) ] && printf -- "-a $(PKG_BINARY_AMD64)" ` \
+		` [ -e $(PKG_BINARY_ARM64) ] && printf -- "-a $(PKG_BINARY_ARM64)" ` \
+		` [ -e $(PKG_FEDORA-LATEST) ] && printf -- "-a $(PKG_FEDORA-LATEST)" ` \
+		` [ -e $(PKG_FEDORA-OLDER) ] && printf -- "-a $(PKG_FEDORA-OLDER)" ` \
+		` [ -e $(PKG_STREAM-LATEST) ] && printf -- "-a $(PKG_STREAM-LATEST)" ` \
+		` [ -e $(PKG_DEBIAN-STABLE) ] && printf -- "-a $(PKG_DEBIAN-STABLE)" ` \
+		` [ -e $(PKG_UBUNTU-LATEST) ] && printf -- "-a $(PKG_UBUNTU-LATEST)" ` \
+		` [ -e $(PKG_ARCHLINUX) ] && printf -- "-a $(PKG_ARCHLINUX)" ` \
 		-a $(SHA256SUMS_ASC) \
 		$(VERSION) \
 		> releases/$(VERSION)/mgmt-release.url \
@@ -428,56 +640,92 @@ releases/$(VERSION)/mgmt-release.url: $(PKG_FEDORA-30) $(PKG_FEDORA-29) $(PKG_CE
 		|| rm -f releases/$(VERSION)/mgmt-release.url
 
 releases/$(VERSION)/.mkdir:
-	mkdir -p releases/$(VERSION)/{$(TOKEN_FEDORA-30),$(TOKEN_FEDORA-29),$(TOKEN_CENTOS-7),$(TOKEN_DEBIAN-10),$(TOKEN_UBUNTU-BIONIC),$(TOKEN_ARCHLINUX)}/ && touch releases/$(VERSION)/.mkdir
+	mkdir -p \
+	` [ "$(TOKEN_BINARY_AMD64)" != "" ] && printf -- "releases/$(VERSION)/$(TOKEN_BINARY_AMD64)/" ` \
+	` [ "$(TOKEN_BINARY_ARM64)" != "" ] && printf -- "releases/$(VERSION)/$(TOKEN_BINARY_ARM64)/" ` \
+	` [ "$(TOKEN_FEDORA-LATEST)" != "" ] && printf -- "releases/$(VERSION)/$(TOKEN_FEDORA-LATEST)/" ` \
+	` [ "$(TOKEN_FEDORA-OLDER)" != "" ] && printf -- "releases/$(VERSION)/$(TOKEN_FEDORA-OLDER)/" ` \
+	` [ "$(TOKEN_STREAM-LATEST)" != "" ] && printf -- "releases/$(VERSION)/$(TOKEN_STREAM-LATEST)/" ` \
+	` [ "$(TOKEN_DEBIAN-STABLE)" != "" ] && printf -- "releases/$(VERSION)/$(TOKEN_DEBIAN-STABLE)/" ` \
+	` [ "$(TOKEN_UBUNTU-LATEST)" != "" ] && printf -- "releases/$(VERSION)/$(TOKEN_UBUNTU-LATEST)/" ` \
+	` [ "$(TOKEN_ARCHLINUX)" != "" ] && printf -- "releases/$(VERSION)/$(TOKEN_ARCHLINUX)/" ` \
+	&& touch releases/$(VERSION)/.mkdir
 
-releases/$(VERSION)/$(TOKEN_FEDORA-30)/changelog: $(PROGRAM) releases/$(VERSION)/.mkdir
+# These are defined conditionally, since if the token is empty, they warn!
+ifneq ($(TOKEN_BINARY_AMD64),)
+$(PKG_BINARY_AMD64): build/mgmt-linux-amd64 releases/$(VERSION)/.mkdir
+	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; echo "Building: $${distro} package..."
+	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; cp -a build/mgmt-linux-amd64 $(PKG_BINARY_AMD64)
+endif
+ifneq ($(TOKEN_BINARY_ARM64),)
+$(PKG_BINARY_ARM64): build/mgmt-linux-arm64 releases/$(VERSION)/.mkdir
+	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; echo "Building: $${distro} package..."
+	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; cp -a build/mgmt-linux-arm64 $(PKG_BINARY_ARM64)
+endif
+ifneq ($(TOKEN_FEDORA-LATEST),)
+releases/$(VERSION)/$(TOKEN_FEDORA-LATEST)/changelog: $(PROGRAM) releases/$(VERSION)/.mkdir
 	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; echo "Generating: $${distro} changelog..."
 	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; ./misc/make-rpm-changelog.sh "$${distro}" $(VERSION)
 
-$(PKG_FEDORA-30): releases/$(VERSION)/$(TOKEN_FEDORA-30)/changelog
+$(PKG_FEDORA-LATEST): releases/$(VERSION)/$(TOKEN_FEDORA-LATEST)/changelog
 	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; echo "Building: $${distro} package..."
-	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; ./misc/fpm-pack.sh $${distro} $(VERSION) "$(FILE_FEDORA-30)" libvirt-devel augeas-devel
-
-releases/$(VERSION)/$(TOKEN_FEDORA-29)/changelog: $(PROGRAM) releases/$(VERSION)/.mkdir
+	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; ./misc/fpm-pack.sh $${distro} $(VERSION) "$(FILE_FEDORA-LATEST)" libvirt-devel augeas-devel
+endif
+ifneq ($(TOKEN_FEDORA-OLDER),)
+releases/$(VERSION)/$(TOKEN_FEDORA-OLDER)/changelog: $(PROGRAM) releases/$(VERSION)/.mkdir
 	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; echo "Generating: $${distro} changelog..."
 	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; ./misc/make-rpm-changelog.sh "$${distro}" $(VERSION)
 
-$(PKG_FEDORA-29): releases/$(VERSION)/$(TOKEN_FEDORA-29)/changelog
+$(PKG_FEDORA-OLDER): releases/$(VERSION)/$(TOKEN_FEDORA-OLDER)/changelog
 	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; echo "Building: $${distro} package..."
-	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; ./misc/fpm-pack.sh $${distro} $(VERSION) "$(FILE_FEDORA-29)" libvirt-devel augeas-devel
-
-releases/$(VERSION)/$(TOKEN_CENTOS-7)/changelog: $(PROGRAM) releases/$(VERSION)/.mkdir
+	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; ./misc/fpm-pack.sh $${distro} $(VERSION) "$(FILE_FEDORA-OLDER)" libvirt-devel augeas-devel
+endif
+ifneq ($(TOKEN_STREAM-LATEST),)
+releases/$(VERSION)/$(TOKEN_STREAM-LATEST)/changelog: $(PROGRAM) releases/$(VERSION)/.mkdir
 	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; echo "Generating: $${distro} changelog..."
 	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; ./misc/make-rpm-changelog.sh "$${distro}" $(VERSION)
 
-$(PKG_CENTOS-7): releases/$(VERSION)/$(TOKEN_CENTOS-7)/changelog
+$(PKG_STREAM-LATEST): releases/$(VERSION)/$(TOKEN_STREAM-LATEST)/changelog
 	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; echo "Building: $${distro} package..."
-	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; ./misc/fpm-pack.sh $${distro} $(VERSION) "$(FILE_CENTOS-7)" libvirt-devel augeas-devel
-
-releases/$(VERSION)/$(TOKEN_DEBIAN-10)/changelog: $(PROGRAM) releases/$(VERSION)/.mkdir
+	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; ./misc/fpm-pack.sh $${distro} $(VERSION) "$(FILE_STREAM-LATEST)" libvirt-devel augeas-devel
+endif
+ifneq ($(TOKEN_DEBIAN-STABLE),)
+releases/$(VERSION)/$(TOKEN_DEBIAN-STABLE)/changelog: $(PROGRAM) releases/$(VERSION)/.mkdir
 	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; echo "Generating: $${distro} changelog..."
 	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; ./misc/make-deb-changelog.sh "$${distro}" $(VERSION)
 
-$(PKG_DEBIAN-10): releases/$(VERSION)/$(TOKEN_DEBIAN-10)/changelog
+$(PKG_DEBIAN-STABLE): releases/$(VERSION)/$(TOKEN_DEBIAN-STABLE)/changelog
 	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; echo "Building: $${distro} package..."
-	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; ./misc/fpm-pack.sh $${distro} $(VERSION) "$(FILE_DEBIAN-10)" libvirt-dev libaugeas-dev
-
-releases/$(VERSION)/$(TOKEN_UBUNTU-BIONIC)/changelog: $(PROGRAM) releases/$(VERSION)/.mkdir
+	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; ./misc/fpm-pack.sh $${distro} $(VERSION) "$(FILE_DEBIAN-STABLE)" libvirt-dev libaugeas-dev
+endif
+ifneq ($(TOKEN_UBUNTU-LATEST),)
+releases/$(VERSION)/$(TOKEN_UBUNTU-LATEST)/changelog: $(PROGRAM) releases/$(VERSION)/.mkdir
 	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; echo "Generating: $${distro} changelog..."
 	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; ./misc/make-deb-changelog.sh "$${distro}" $(VERSION)
 
-$(PKG_UBUNTU-BIONIC): releases/$(VERSION)/$(TOKEN_UBUNTU-BIONIC)/changelog
+$(PKG_UBUNTU-LATEST): releases/$(VERSION)/$(TOKEN_UBUNTU-LATEST)/changelog
 	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; echo "Building: $${distro} package..."
-	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; ./misc/fpm-pack.sh $${distro} $(VERSION) "$(FILE_UBUNTU-BIONIC)" libvirt-dev libaugeas-dev
-
+	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; ./misc/fpm-pack.sh $${distro} $(VERSION) "$(FILE_UBUNTU-LATEST)" libvirt-dev libaugeas-dev
+endif
+ifneq ($(TOKEN_ARCHLINUX),)
 $(PKG_ARCHLINUX): $(PROGRAM) releases/$(VERSION)/.mkdir
 	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; echo "Building: $${distro} package..."
 	@title='$(@D)' ; distro=$${title#'releases/$(VERSION)/'} ; ./misc/fpm-pack.sh $${distro} $(VERSION) "$(FILE_ARCHLINUX)" libvirt augeas
+endif
 
-$(SHA256SUMS): $(PKG_FEDORA-30) $(PKG_FEDORA-29) $(PKG_CENTOS-7) $(PKG_DEBIAN-10) $(PKG_UBUNTU-BIONIC) $(PKG_ARCHLINUX)
+$(SHA256SUMS): $(DEP_BINARY_AMD64) $(DEP_BINARY_ARM64) $(DEP_FEDORA-LATEST) $(DEP_FEDORA-OLDER) $(DEP_STREAM-LATEST) $(DEP_DEBIAN-STABLE) $(DEP_UBUNTU-LATEST) $(DEP_ARCHLINUX)
 	@# remove the directory separator in the SHA256SUMS file
 	@echo "Generating: sha256 sum..."
-	sha256sum $(PKG_FEDORA-30) $(PKG_FEDORA-29) $(PKG_CENTOS-7) $(PKG_DEBIAN-10) $(PKG_UBUNTU-BIONIC) $(PKG_ARCHLINUX) | awk -F '/| ' '{print $$1"  "$$6}' > $(SHA256SUMS)
+	sha256sum \
+	` [ -e $(PKG_BINARY_AMD64) ] && printf -- "$(PKG_BINARY_AMD64)" ` \
+	` [ -e $(PKG_BINARY_ARM64) ] && printf -- "$(PKG_BINARY_ARM64)" ` \
+	` [ -e $(PKG_FEDORA-LATEST) ] && printf -- "$(PKG_FEDORA-LATEST)" ` \
+	` [ -e $(PKG_FEDORA-OLDER) ] && printf -- "$(PKG_FEDORA-OLDER)" ` \
+	` [ -e $(PKG_STREAM-LATEST) ] && printf -- "$(PKG_STREAM-LATEST)" ` \
+	` [ -e $(PKG_DEBIAN-STABLE) ] && printf -- "$(PKG_DEBIAN-STABLE)" ` \
+	` [ -e $(PKG_UBUNTU-LATEST) ] && printf -- "$(PKG_UBUNTU-LATEST)" ` \
+	` [ -e $(PKG_ARCHLINUX) ] && printf -- "$(PKG_ARCHLINUX)" ` \
+	| awk -F '/| ' '{print $$1"  "$$6}' > $(SHA256SUMS)
 
 $(SHA256SUMS_ASC): $(SHA256SUMS)
 	@echo "Signing sha256 sum..."
@@ -503,10 +751,11 @@ help: ## show this help screen
 		awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
 	@echo ''
 
-funcgen: lang/funcs/core/generated_funcs.go
+funcgen: lang/core/generated_funcs.go
 
-lang/funcs/core/generated_funcs.go: lang/funcs/funcgen/*.go lang/funcs/core/funcgen.yaml lang/funcs/funcgen/templates/generated_funcs.go.tpl
+lang/core/generated_funcs.go: lang/funcs/funcgen/*.go lang/core/funcgen.yaml lang/funcs/funcgen/templates/generated_funcs.go.tpl
 	@echo "Generating: funcs..."
 	@go run `find lang/funcs/funcgen/ -maxdepth 1 -type f -name '*.go' -not -name '*_test.go'` -templates=lang/funcs/funcgen/templates/generated_funcs.go.tpl >/dev/null
+	@gofmt -s -w $@
 
 # vim: ts=8

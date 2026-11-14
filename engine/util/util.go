@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,18 +13,29 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 // Package util contains utility functions that are specific to the resource
 // engine.
 package util
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/gob"
 	"fmt"
+	"io"
 	"os"
 	"os/user"
 	"reflect"
@@ -34,12 +45,14 @@ import (
 	"github.com/purpleidea/mgmt/engine"
 	"github.com/purpleidea/mgmt/lang/types"
 	"github.com/purpleidea/mgmt/util/errwrap"
+	utilJSON "github.com/purpleidea/mgmt/util/json"
 
+	"github.com/go-json-experiment/json/jsontext"
 	"github.com/godbus/dbus/v5"
 )
 
 const (
-	// DBusInterface is the dbus interface that contains genereal methods.
+	// DBusInterface is the dbus interface that contains general methods.
 	DBusInterface = "org.freedesktop.DBus"
 	// DBusAddMatch is the dbus method to receive a subset of dbus broadcast
 	// signals.
@@ -80,33 +93,51 @@ func ResPathUID(res engine.Res) string {
 	return fmt.Sprintf("%s-%s+%s", res.Kind(), encoded, name)
 }
 
+// resJSON is how ResToB64 stores a resource. The kind is kept beside the
+// encoded resource, so that we know what kind of resource to decode it into.
+type resJSON struct {
+	Kind string         `json:"kind"`
+	Res  jsontext.Value `json:"res"`
+}
+
 // ResToB64 encodes a resource to a base64 encoded string (after serialization).
+// We use json instead of gob, because gob doesn't keep the distinction between
+// a nil pointer and a pointer to a zero value, such as nil versus &"".
 func ResToB64(res engine.Res) (string, error) {
-	b := bytes.Buffer{}
-	e := gob.NewEncoder(&b)
-	err := e.Encode(&res) // pass with &
+	b, err := utilJSON.Marshal(res)
 	if err != nil {
-		return "", errwrap.Wrapf(err, "gob failed to encode")
+		return "", errwrap.Wrapf(err, "json failed to encode")
 	}
-	return base64.StdEncoding.EncodeToString(b.Bytes()), nil
+	b, err = utilJSON.Marshal(&resJSON{
+		Kind: res.Kind(),
+		Res:  b,
+	})
+	if err != nil {
+		return "", errwrap.Wrapf(err, "json failed to encode")
+	}
+	return base64.StdEncoding.EncodeToString(b), nil
 }
 
 // B64ToRes decodes a resource from a base64 encoded string (after
 // deserialization).
 func B64ToRes(str string) (engine.Res, error) {
-	var output interface{}
-	bb, err := base64.StdEncoding.DecodeString(str)
+	b, err := base64.StdEncoding.DecodeString(str)
 	if err != nil {
 		return nil, errwrap.Wrapf(err, "base64 failed to decode")
 	}
-	b := bytes.NewBuffer(bb)
-	d := gob.NewDecoder(b)
-	if err := d.Decode(&output); err != nil { // pass with &
-		return nil, errwrap.Wrapf(err, "gob failed to decode")
+	data := &resJSON{}
+	if err := utilJSON.Unmarshal(b, data); err != nil {
+		return nil, errwrap.Wrapf(err, "json failed to decode")
 	}
-	res, ok := output.(engine.Res)
-	if !ok {
-		return nil, fmt.Errorf("output `%v` is not a Res", output)
+	res, err := engine.NewResource(data.Kind)
+	if err != nil {
+		return nil, err
+	}
+	if err := utilJSON.Unmarshal(data.Res, res); err != nil {
+		return nil, errwrap.Wrapf(err, "json failed to decode a %s", data.Kind)
+	}
+	if kind := res.Kind(); kind != data.Kind { // the res stores it too
+		return nil, fmt.Errorf("decoded kind `%s` is not `%s`", kind, data.Kind)
 	}
 	return res, nil
 }
@@ -121,7 +152,7 @@ func StructTagToFieldName(stptr interface{}) (map[string]string, error) {
 		return nil, fmt.Errorf("got nil input instead of ptr to struct")
 	}
 	typ := reflect.TypeOf(stptr)
-	if k := typ.Kind(); k != reflect.Ptr { // we only look at *Struct's
+	if k := typ.Kind(); k != reflect.Pointer { // we only look at *Struct's
 		return nil, fmt.Errorf("input is not a ptr, got: %+v", k)
 	}
 	st := typ.Elem()                         // elem for ptr to struct (dereference the pointer)
@@ -148,7 +179,8 @@ func StructTagToFieldName(stptr interface{}) (map[string]string, error) {
 
 // StructFieldCompat returns whether a send struct and key is compatible with a
 // recv struct and key. This inputs must both be a ptr to a string, and a valid
-// key that can be found in the struct tag.
+// key that can be found in the struct tag. The (1) first values are for send,
+// and the (2) second values are for recv.
 // TODO: add a bool to decide if *string to string or string to *string is okay.
 func StructFieldCompat(st1 interface{}, key1 string, st2 interface{}, key2 string) error {
 	m1, err := StructTagToFieldName(st1)
@@ -179,14 +211,6 @@ func StructFieldCompat(st1 interface{}, key1 string, st2 interface{}, key2 strin
 	value2 := obj2.FieldByName(k2)
 	kind2 := value2.Kind()
 
-	if kind1 != kind2 {
-		return fmt.Errorf("kind mismatch between %s and %s", kind1, kind2)
-	}
-
-	if t1, t2 := value1.Type(), value2.Type(); t1 != t2 {
-		return fmt.Errorf("type mismatch between %s and %s", t1, t2)
-	}
-
 	if !value2.CanSet() { // if we can't set, then this is pointless!
 		return fmt.Errorf("can't set")
 	}
@@ -197,6 +221,25 @@ func StructFieldCompat(st1 interface{}, key1 string, st2 interface{}, key2 strin
 	}
 	if !value2.CanInterface() {
 		return fmt.Errorf("can't interface the recv")
+	}
+
+	// If we're sending _from_ an interface... (value res `any` field)
+	if kind1 == reflect.Interface || kind1 == reflect.Pointer {
+		// TODO: Can we do more checks instead of only returning early?
+		return nil
+	}
+	// If we're sending _to_ an interface... (value res `any` field)
+	if kind2 == reflect.Interface || kind2 == reflect.Pointer {
+		// TODO: Can we do more checks instead of only returning early?
+		return nil
+	}
+
+	if kind1 != kind2 {
+		return fmt.Errorf("field kind mismatch between %s and %s", kind1, kind2)
+	}
+
+	if t1, t2 := value1.Type(), value2.Type(); t1 != t2 {
+		return fmt.Errorf("type mismatch between %s and %s", t1, t2)
 	}
 
 	return nil
@@ -252,91 +295,84 @@ func LangFieldNameToStructFieldName(kind string) (map[string]string, error) {
 	return mapping, nil // lang field name -> field name
 }
 
-// StructKindToFieldNameTypeMap returns a map from field name to expected type
-// in the lang type system.
-func StructKindToFieldNameTypeMap(kind string) (map[string]*types.Type, error) {
+// LangFieldNameToStructType returns the mapping from lang (AST) field names,
+// and the expected type in our type system for each.
+// XXX: Should this return unification variables instead of variant types?
+func LangFieldNameToStructType(kind string) (map[string]*types.Type, error) {
 	res, err := engine.NewResource(kind)
 	if err != nil {
 		return nil, err
 	}
 
-	sv := reflect.ValueOf(res).Elem() // pointer to struct, then struct
-	if k := sv.Kind(); k != reflect.Struct {
-		return nil, fmt.Errorf("expected struct, got: %s", k)
-	}
-
-	result := make(map[string]*types.Type)
-
-	st := reflect.TypeOf(res).Elem() // pointer to struct, then struct
-	for i := 0; i < st.NumField(); i++ {
-		field := st.Field(i)
-		name := field.Name
-		// TODO: in future, skip over fields that don't have a `lang` tag
-		//if name == "Base" { // TODO: hack!!!
-		//	continue
-		//}
-
-		// Skip unexported fields. These should never be mapped golang<->mcl.
-		// TODO: Use StructField.IsExported() in golang 1.17
-		//if !field.IsExported() {
-		if field.PkgPath != "" {
-			continue
-		}
-
-		typ, err := types.TypeOf(field.Type)
-		// some types (eg complex64) aren't convertible, so skip for now...
-		if err != nil {
-			continue
-			//return nil, errwrap.Wrapf(err, "could not identify type of field `%s`", name)
-		}
-		result[name] = typ
-	}
-
-	return result, nil
-}
-
-// LangFieldNameToStructType returns the mapping from lang (AST) field names,
-// and the expected type in our type system for each.
-func LangFieldNameToStructType(kind string) (map[string]*types.Type, error) {
-	// returns a mapping between fieldName and expected *types.Type
-	fieldNameTypMap, err := StructKindToFieldNameTypeMap(kind)
-	if err != nil {
-		return nil, errwrap.Wrapf(err, "could not determine types for `%s` resource", kind)
-	}
-
-	mapping, err := LangFieldNameToStructFieldName(kind)
+	gtyp := reflect.TypeOf(res)
+	st, err := types.ResTypeOf(gtyp)
 	if err != nil {
 		return nil, err
 	}
-
-	// transform from field name to tag name
-	typMap := make(map[string]*types.Type)
-	for name, typ := range fieldNameTypMap {
-		if strings.Title(name) != name {
-			continue // skip private fields
-		}
-
-		found := false
-		for k, v := range mapping {
-			if v != name {
-				continue
-			}
-			// found
-			if found { // previously found!
-				return nil, fmt.Errorf("duplicate mapping for: %s", name)
-			}
-			typMap[k] = typ
-			found = true // :)
-		}
-		if !found {
-			return nil, fmt.Errorf("could not find mapping for: %s", name)
-		}
+	if st == nil {
+		return nil, fmt.Errorf("got empty type")
 	}
+	if st.Kind != types.KindStruct {
+		return nil, fmt.Errorf("not a struct kind")
+	}
+	// unpack the top-level struct, it should have the field names matching
+	// the parameters of the struct.
 
-	return typMap, nil
+	return st.Map, nil
 }
 
-// GetUID returns the UID of an user. It supports an UID or an username. Caller
+// ResToParamValues returns a list of field names and their corresponding values
+// if they are non-zero. This is meant for testing, and should be improved for
+// robustness or with tests if it's ever used for value extraction. This also
+// contains a hack to specifically print from resources that contain interface
+// fields too. Consider moving that into types.ValueOf after testing if that
+// doesn't break other code paths.
+func ResToParamValues(res engine.Res) (map[string]types.Value, error) {
+
+	ret := make(map[string]types.Value)
+	st := reflect.ValueOf(res).Elem() // pointer to struct, then struct
+	tt := reflect.TypeOf(res).Elem()  // pointer to struct, then struct
+
+	fields := []string{}
+	// TODO: private fields inside of a struct are still printed
+	vf := reflect.VisibleFields(tt) // []reflect.StructField
+	for _, field := range vf {
+		if field.Tag == "" {
+			continue // skip
+		}
+		if _, ok := field.Tag.Lookup(types.StructTag); !ok {
+			continue
+		}
+
+		fields = append(fields, field.Name)
+	}
+
+	for _, name := range fields {
+		rval := st.FieldByName(name) // exported field type
+
+		// TODO: zero fields inside of a struct are still printed
+		if rval.IsZero() {
+			continue // skip zero values
+		}
+
+		// TODO: consider turning this into types.ConfigurableValueOf
+		// and allowing the `kind == reflect.Interface` option?
+		val, err := types.ValueOf(rval)
+		if err != nil {
+			// This can happen for bad fields like "Base" and so on.
+			// They are supposed to be skipped by the struct tag,
+			// but if this changes and we need to label them, then
+			// we can improve our above heuristic.
+			return nil, fmt.Errorf("field `%s` does not have a valid value: %+v", name, err)
+		}
+
+		ret[name] = val
+	}
+
+	return ret, nil
+}
+
+// GetUID returns the UID of a user. It supports a UID or a username. Caller
 // should first check user is not empty. It will return an error if it can't
 // lookup the UID or username.
 func GetUID(username string) (int, error) {
@@ -370,7 +406,84 @@ func GetGID(group string) (int, error) {
 	return -1, errwrap.Wrapf(err, "group lookup error (%s)", group)
 }
 
-// RestartUnit resarts the given dbus unit and waits for it to finish starting.
+// GetUIDGID is a small helper function to return the current uid and gid of the
+// user running this program. If invoked under `sudo` it works as expected to
+// return the root uid and gid.
+func GetUIDGID() (int, int, error) {
+	currentUser, err := user.Current()
+	if err != nil {
+		return -1, -1, err
+	}
+
+	uid, err := strconv.Atoi(currentUser.Uid)
+	if err != nil {
+		return -1, -1, err
+	}
+
+	gid, err := strconv.Atoi(currentUser.Gid)
+	if err != nil {
+		return -1, -1, err
+	}
+
+	return uid, gid, nil
+}
+
+// ReadData is a helper to read data, usually from our vardir directory. If the
+// data is nil, this means the file didn't exist.
+func ReadData(p string) (*string, error) {
+	file, err := os.Open(p) // open a handle to read the file
+	if os.IsNotExist(err) {
+		return nil, nil // no file
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return nil, err
+	}
+	s := string(data)
+	return &s, nil
+}
+
+// WriteData is a helper to write data, usually into our vardir directory. If
+// the data is nil, this counts as a request to delete the file.
+func WriteData(p string, data *string) (int, error) {
+	if data == nil {
+		err := os.Remove(p)
+		if os.IsNotExist(err) {
+			return 0, nil // no file
+		}
+		return -1, err
+	}
+
+	uid, gid, err := GetUIDGID()
+	if err != nil {
+		return -1, err
+	}
+
+	// Chmod it before we write the secret data.
+	file, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	//file, err := os.Create(p) // open a handle to create the file
+	if err != nil {
+		return -1, err
+	}
+	defer file.Close()
+
+	// Chown it before we write the secret data.
+	if err := file.Chown(uid, gid); err != nil {
+		return -1, err
+	}
+
+	c, err := file.WriteString(*data)
+	if err != nil {
+		return c, errwrap.Wrapf(err, "can't write file")
+	}
+	return c, file.Sync()
+}
+
+// RestartUnit restarts the given dbus unit and waits for it to finish starting.
 func RestartUnit(ctx context.Context, conn *dbus.Conn, unit string) error {
 	return unitStateAction(ctx, conn, unit, DBusRestartUnit)
 }
@@ -458,4 +571,44 @@ func AutoEdgeCombiner(ae ...engine.AutoEdge) (engine.AutoEdge, error) {
 	return &autoEdgeCombiner{
 		ae: ae,
 	}, nil
+}
+
+// CleanError takes the engine errors and prints them on a single line.
+// TODO: maybe we can improve this here, it's a bit ugly.
+func CleanError(err error) string {
+	if err == nil {
+		return fmt.Sprintf("%v", err)
+	}
+	return strings.ReplaceAll(err.Error(), "\n", " ")
+}
+
+// DebugStructFields returns a pretty string display of struct fields (like a
+// resource) for debugging. The output is not guaranteed to be stable.
+func DebugStructFields(st interface{}) string {
+	s := ""
+	v := reflect.ValueOf(st)
+	t := reflect.TypeOf(st)
+
+	// if it's a pointer, get the element it points to
+	if v.Kind() == reflect.Pointer {
+		v = v.Elem()
+		t = t.Elem()
+	}
+
+	for i := 0; i < v.NumField(); i++ {
+		field := t.Field(i)
+		value := v.Field(i)
+
+		// only print exported (public) fields
+		if field.PkgPath != "" {
+			continue
+		}
+		if value.IsZero() {
+			s += fmt.Sprintf("(%s): %v\n", field.Name, "<nil>")
+		} else {
+			s += fmt.Sprintf("(%s): %v\n", field.Name, value.Elem().Interface())
+		}
+	}
+
+	return s
 }

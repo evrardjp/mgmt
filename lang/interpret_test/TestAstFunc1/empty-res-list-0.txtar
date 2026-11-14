@@ -1,0 +1,7 @@
+-- main.mcl --
+# This is an empty list of test resources, iow test resources. This must pass
+# type unification. This previously only passed if we allowed recursive
+# unification solving, but now we can support it without that.
+test [] {}
+-- OUTPUT --
+Vertex: composite: []str

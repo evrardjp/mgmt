@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,23 +13,57 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package structs
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/purpleidea/mgmt/lang/interfaces"
 	"github.com/purpleidea/mgmt/lang/types"
 )
 
+const (
+	// ConstFuncName is the unique name identifier for this function.
+	ConstFuncName = "const"
+)
+
 // ConstFunc is a function that returns the constant value passed to Value.
 type ConstFunc struct {
-	Value types.Value
+	interfaces.Textarea
 
-	init      *interfaces.Init
-	closeChan chan struct{}
+	Value    types.Value
+	NameHint string
+
+	init *interfaces.Init
+}
+
+// String returns a simple name for this function. This is needed so this struct
+// can satisfy the pgraph.Vertex interface.
+func (obj *ConstFunc) String() string {
+	if obj.NameHint != "" {
+		return obj.NameHint
+	}
+	if obj.Value != nil {
+		if t := obj.Value.Type(); t != nil {
+			return ConstFuncName + ": " + t.String() + "(" + obj.Value.String() + ")"
+		}
+	}
+	return ConstFuncName
 }
 
 // Validate makes sure we've built our struct properly.
@@ -45,7 +79,7 @@ func (obj *ConstFunc) Info() *interfaces.Info {
 	var typ *types.Type
 	if obj.Value != nil { // don't panic if called speculatively
 		if t := obj.Value.Type(); t != nil {
-			typ = types.NewType(fmt.Sprintf("func() %s", t.String()))
+			typ = types.NewType("func() " + t.String())
 		}
 	}
 	return &interfaces.Info{
@@ -59,24 +93,24 @@ func (obj *ConstFunc) Info() *interfaces.Info {
 // Init runs some startup code for this const.
 func (obj *ConstFunc) Init(init *interfaces.Init) error {
 	obj.init = init
-	obj.closeChan = make(chan struct{})
 	return nil
 }
 
-// Stream returns the single value that this const has, and then closes.
-func (obj *ConstFunc) Stream() error {
-	select {
-	case obj.init.Output <- obj.Value:
-		// pass
-	case <-obj.closeChan:
-		return nil
+// Call this function with the input args and return the value if it is possible
+// to do so at this time.
+func (obj *ConstFunc) Call(ctx context.Context, args []types.Value) (types.Value, error) {
+	if obj.Info() == nil {
+		return nil, fmt.Errorf("info is empty")
 	}
-	close(obj.init.Output) // signal that we're done sending
-	return nil
-}
+	if obj.Info().Sig == nil {
+		return nil, fmt.Errorf("sig is empty")
+	}
+	if i, j := len(args), len(obj.Info().Sig.Ord); i != j {
+		return nil, fmt.Errorf("arg length doesn't match, got %d, exp: %d", i, j)
+	}
 
-// Close runs some shutdown code for this const and turns off the stream.
-func (obj *ConstFunc) Close() error {
-	close(obj.closeChan)
-	return nil
+	if obj.Value == nil {
+		return nil, fmt.Errorf("no value available from const")
+	}
+	return obj.Value, nil
 }

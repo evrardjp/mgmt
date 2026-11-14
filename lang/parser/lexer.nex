@@ -1,4 +1,8 @@
-/[ \t\n]/	{ /* skip over whitespace */ }
+/[ \t]/		{ /* skip over tabs and spaces */ }
+/[\n]/		{
+			yylex.pos(lval) // our pos
+			return NEWLINE
+		}
 /{/		{
 			yylex.pos(lval) // our pos
 			lval.str = yylex.Text()
@@ -44,6 +48,11 @@
 			lval.str = yylex.Text()
 			return ELVIS
 		}
+/<\|>/		{
+			yylex.pos(lval) // our pos
+			lval.str = yylex.Text()
+			return EXCEPT
+		}
 /=>/		{
 			yylex.pos(lval) // our pos
 			lval.str = yylex.Text()
@@ -57,6 +66,10 @@
 /:/		{
 			yylex.pos(lval) // our pos
 			lval.str = yylex.Text()
+			// sanity check... these should be the same!
+			if x, y := lval.str, interfaces.ClassSep; x != y {
+				panic(fmt.Sprintf("COLON does not match ClassSep (%s != %s)", x, y))
+			}
 			return COLON
 		}
 /;/		{
@@ -80,8 +93,14 @@
 			return MINUS
 		}
 /\*/		{
+			// This is used as the multiplication symbol, but also
+			// (for now) the bare import feature, eg: `import as *`.
 			yylex.pos(lval) // our pos
 			lval.str = yylex.Text()
+			// sanity check... these should be the same!
+			if x, y := lval.str, interfaces.BareSymbol; x != y {
+				panic(fmt.Sprintf("MULTIPLY does not match BareSymbol (%s != %s)", x, y))
+			}
 			return MULTIPLY
 		}
 /\//		{
@@ -119,17 +138,17 @@
 			lval.str = yylex.Text()
 			return GTE
 		}
-/&&/		{
+/and/		{
 			yylex.pos(lval) // our pos
 			lval.str = yylex.Text()
 			return AND
 		}
-/\|\|/		{
+/or/		{
 			yylex.pos(lval) // our pos
 			lval.str = yylex.Text()
 			return OR
 		}
-/!/		{
+/not/		{
 			yylex.pos(lval) // our pos
 			lval.str = yylex.Text()
 			return NOT
@@ -138,6 +157,16 @@
 			yylex.pos(lval) // our pos
 			lval.str = yylex.Text()
 			return IN
+		}
+/for/		{
+			yylex.pos(lval) // our pos
+			lval.str = yylex.Text()
+			return FOR
+		}
+/forkv/		{
+			yylex.pos(lval) // our pos
+			lval.str = yylex.Text()
+			return FORKV
 		}
 /\->/		{
 			yylex.pos(lval) // our pos
@@ -231,6 +260,16 @@
 			}
 			return BOOL
 		}
+/panic/		{
+			yylex.pos(lval) // our pos
+			lval.str = yylex.Text()
+			return PANIC_IDENTIFIER
+		}
+/collect/	{
+			yylex.pos(lval) // our pos
+			lval.str = yylex.Text()
+			return COLLECT_IDENTIFIER
+		}
 /"(\\.|[^"])*"/
 		{	// This matches any number of the bracketed patterns
 			// that are surrounded by the two quotes on each side.
@@ -295,48 +334,6 @@
 				panic(fmt.Sprintf("error lexing FLOAT, got: %v", err))
 			}
 		}
-/\$[a-z]+([a-z0-9_]*[a-z0-9]+)?{[0-9]+}/
-		{
-			// we have this as a single token, because otherwise the
-			// parser can get confused by the curly brackets :/
-			yylex.pos(lval) // our pos
-			s := yylex.Text()
-			s = s[1:len(s)] // remove the leading $
-			s = s[0:len(s)-1] // remove the trailing close curly
-			// XXX: nex has a bug that it gets confused by the
-			// following single curly brace. Please see:
-			// https://github.com/blynn/nex/issues/48
-			a := strings.Split(s, "{") // XXX: close match here: }
-			if len(a) != 2 {
-				panic(fmt.Sprintf("error lexing VAR_IDENTIFIER_HX: %v", a))
-			}
-			lval.str = a[0]
-			var err error
-			lval.int, err = strconv.ParseInt(a[1], 10, 64) // int64
-			if err == nil {
-				return VAR_IDENTIFIER_HX
-			} else if e := err.(*strconv.NumError); e.Err == strconv.ErrRange {
-				// this catches range errors for very large ints
-				lp := yylex.cast()
-				lp.lexerErr = &LexParseErr{
-					Err: ErrLexerIntegerOverflow,
-					Str: a[1],
-					Row: yylex.Line(),
-					Col: yylex.Column(),
-				}
-				return ERROR
-			} else {
-				panic(fmt.Sprintf("error lexing VAR_IDENTIFIER_HX, got: %v", err))
-			}
-		}
-/\$[a-z]([a-z0-9_]*[a-z0-9]+)?/
-		{
-			// an alternate pattern: /\$[a-z](|[a-z0-9_]*[a-z0-9])/
-			yylex.pos(lval) // our pos
-			s := yylex.Text()
-			lval.str = s[1:len(s)] // remove the leading $
-			return VAR_IDENTIFIER
-		}
 /[a-z]([a-z0-9_]*[a-z0-9]+)?/
 		{
 			yylex.pos(lval) // our pos
@@ -350,12 +347,6 @@
 			lval.str = strings.ToLower(s) // uncapitalize it
 			return CAPITALIZED_IDENTIFIER
 		}
-/[a-z]([a-z0-9:]*[a-z0-9]+)?/
-		{
-			yylex.pos(lval) // our pos
-			lval.str = yylex.Text()
-			return RES_IDENTIFIER
-		}
 /#[^\n]*/
 		{	// this matches a (#) pound char followed by any
 			// number of chars that aren't the (\n) newline!
@@ -363,9 +354,18 @@
 			yylex.pos(lval) // our pos
 			s := yylex.Text()
 
-			lval.str = s[1:len(s)] // remove the leading #
+			lval.str = s[1:] // remove the leading #
 			//log.Printf("lang: lexer: comment: `%s`", lval.str)
-			//return COMMENT // skip return to avoid parsing
+			// We don't return a COMMENT token (which would need
+			// grammar support everywhere) but we instead collect
+			// the comments in a side-channel list so that tools
+			// like the code formatter can re-attach them by pos.
+			lp := yylex.cast()
+			lp.comments = append(lp.comments, &interfaces.Comment{
+				Value: lval.str,
+				Row:   yylex.Line(),
+				Col:   yylex.Column(),
+			})
 		}
 /./		{
 			yylex.pos(lval) // our pos
@@ -386,7 +386,7 @@
 //
 
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -400,12 +400,27 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package parser
 
 import (
+	"bufio"
+	"io"
 	"fmt"
+	"strings"
 	"strconv"
 
 	"github.com/purpleidea/mgmt/lang/interfaces"

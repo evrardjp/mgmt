@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,14 +13,27 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
-// +build !root
+//go:build !root
 
 package types
 
 import (
 	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/purpleidea/mgmt/util"
@@ -501,7 +514,7 @@ func TestType1(t *testing.T) {
 				Kind: KindFloat,
 			},
 		},
-		"func(str) bool": {
+		"func(a0 str) bool": {
 			Kind: KindFunc,
 			// key names are arbitrary...
 			Map: map[string]*Type{
@@ -516,7 +529,7 @@ func TestType1(t *testing.T) {
 				Kind: KindBool,
 			},
 		},
-		"func(str, int) bool": {
+		"func(hello str, answer int) bool": {
 			Kind: KindFunc,
 			// key names are arbitrary...
 			Map: map[string]*Type{
@@ -535,7 +548,7 @@ func TestType1(t *testing.T) {
 				Kind: KindBool,
 			},
 		},
-		"func(str, []int, float) bool": {
+		"func(a0 str, a1 []int, a2 float) bool": {
 			Kind: KindFunc,
 			// key names are arbitrary...
 			Map: map[string]*Type{
@@ -561,7 +574,7 @@ func TestType1(t *testing.T) {
 				Kind: KindBool,
 			},
 		},
-		"func(map{str: int}) bool": {
+		"func(answer map{str: int}) bool": {
 			Kind: KindFunc,
 			// key names are arbitrary...
 			Map: map[string]*Type{
@@ -582,7 +595,7 @@ func TestType1(t *testing.T) {
 				Kind: KindBool,
 			},
 		},
-		"func(bool, map{str: int}) bool": {
+		"func(hello bool, answer map{str: int}) bool": {
 			Kind: KindFunc,
 			// key names are arbitrary...
 			Map: map[string]*Type{
@@ -607,7 +620,7 @@ func TestType1(t *testing.T) {
 				Kind: KindBool,
 			},
 		},
-		"func(struct{a str; bb int}) bool": {
+		"func(answer struct{a str; bb int}) bool": {
 			Kind: KindFunc,
 			// key names are arbitrary...
 			Map: map[string]*Type{
@@ -634,7 +647,7 @@ func TestType1(t *testing.T) {
 				Kind: KindBool,
 			},
 		},
-		"func(bool, struct{a str; bb int}) bool": {
+		"func(hello bool, answer struct{a str; bb int}) bool": {
 			Kind: KindFunc,
 			// key names are arbitrary...
 			Map: map[string]*Type{
@@ -665,6 +678,15 @@ func TestType1(t *testing.T) {
 				Kind: KindBool,
 			},
 		},
+
+		// invalid trailing separators
+		"struct{;}":                nil,
+		"struct{a int;}":           nil,
+		"struct{a int; b str;}":    nil,
+		"struct{a int; }":          nil,
+		"map{str: struct{a int;}}": nil,
+		"func(int,) str":           nil,
+		"func(a int, b str,) str":  nil,
 	}
 
 	for str, val := range testCases { // run all the tests
@@ -1472,7 +1494,554 @@ func TestComplexCmp0(t *testing.T) {
 	}
 }
 
+func TestTypeCopy0(t *testing.T) {
+	typ := NewType("func(arg0 str, arg1 bool) int")
+	cp := typ.Copy()
+	if len(cp.Ord) != 2 {
+		t.Errorf("incorrect ord length after Copy")
+	}
+	if cp.Ord[0] != "arg0" {
+		t.Errorf("incorrect 0th arg name after Copy")
+	}
+	if cp.Ord[1] != "arg1" {
+		t.Errorf("incorrect 1st arg name after Copy")
+	}
+}
+
+// checkCopy walks a type and its copy together, and errors if they share any
+// part, or if the copy differs. Each unification variable in the copy must be
+// new, and the elems table checks that the original variables which are in the
+// same set are still the same in the copy, and the different ones are
+// different. A solved variable must be copied as its solution.
+func checkCopy(typ, cp *Type, elems, seen map[*Elem]*Elem) error {
+	if typ == nil || cp == nil {
+		if typ != cp {
+			return fmt.Errorf("got %v, want %v", cp, typ)
+		}
+		return nil
+	}
+	if typ == cp {
+		return fmt.Errorf("shares %v", typ)
+	}
+	if typ.Kind == KindUnification {
+		if root := typ.Uni.Find(); root.Data != nil {
+			return checkCopy(root.Data, cp, elems, seen)
+		}
+	}
+	if typ.Kind != cp.Kind {
+		return fmt.Errorf("got kind %v, want %v", cp.Kind, typ.Kind)
+	}
+	switch typ.Kind {
+	case KindList:
+		return checkCopy(typ.Val, cp.Val, elems, seen)
+
+	case KindMap:
+		if err := checkCopy(typ.Key, cp.Key, elems, seen); err != nil {
+			return err
+		}
+		return checkCopy(typ.Val, cp.Val, elems, seen)
+
+	case KindStruct, KindFunc:
+		if reflect.ValueOf(typ.Map).Pointer() == reflect.ValueOf(cp.Map).Pointer() {
+			return fmt.Errorf("shares the map of %v", typ)
+		}
+		if len(typ.Ord) > 0 && len(cp.Ord) > 0 && &typ.Ord[0] == &cp.Ord[0] {
+			return fmt.Errorf("shares the order of %v", typ)
+		}
+		if !reflect.DeepEqual(typ.Ord, cp.Ord) && len(typ.Ord)+len(cp.Ord) > 0 {
+			return fmt.Errorf("got names %v, want %v", cp.Ord, typ.Ord)
+		}
+		for _, k := range typ.Ord {
+			if err := checkCopy(typ.Map[k], cp.Map[k], elems, seen); err != nil {
+				return err
+			}
+		}
+		return checkCopy(typ.Out, cp.Out, elems, seen)
+
+	case KindVariant:
+		return checkCopy(typ.Var, cp.Var, elems, seen)
+
+	case KindUnification:
+		root := typ.Uni.Find()
+		if cp.Uni.Find() == root {
+			return fmt.Errorf("shares a unification variable")
+		}
+		if uni, exists := elems[root]; exists && uni != cp.Uni {
+			return fmt.Errorf("split a unification variable")
+		}
+		if uni, exists := seen[cp.Uni]; exists && uni != root {
+			return fmt.Errorf("merged two unification variables")
+		}
+		elems[root] = cp.Uni
+		seen[cp.Uni] = root
+	}
+	return nil
+}
+
+func TestTypeCopy(t *testing.T) {
+	uni := &Type{Kind: KindUnification, Uni: NewElem()}
+	for _, typ := range []*Type{
+		NewType("nil"),
+		NewType("bool"),
+		NewType("str"),
+		NewType("int"),
+		NewType("float"),
+		NewType("variant"),
+		NewType("[]str"),
+		NewType("map{str: []map{int: bool}}"),
+		NewType("struct{}"),
+		NewType("struct{z []str; a struct{x float}}"),
+		NewType("func()"),
+		NewType("func(a int)"),
+		NewType("func(arg0 str, arg1 bool) int"),
+		NewType("func(a func(x int) str, b []str) map{str: int}"),
+		NewType("?1"),
+		NewType("map{?1: ?2}"),
+		NewType("func(?1, ?1) ?1"),
+		NewType("struct{a ?1; b []?1; c ?2}"),
+		NewType("func(a ?1, b func(x ?2) ?1) map{?2: ?3}"),
+		{Kind: KindVariant, Var: TypeStr},
+		{Kind: KindVariant, Var: &Type{Kind: KindVariant, Var: NewType("[]int")}},
+		{
+			Kind: KindStruct,
+			Map: map[string]*Type{
+				"a": uni,
+				"b": {Kind: KindVariant, Var: &Type{Kind: KindList, Val: uni}},
+			},
+			Ord: []string{"a", "b"},
+		},
+	} {
+		t.Run(typ.String(), func(t *testing.T) {
+			cp := typ.Copy()
+			if s := cp.String(); s != typ.String() {
+				t.Errorf("got %s", s)
+			}
+			if err := checkCopy(typ, cp, map[*Elem]*Elem{}, map[*Elem]*Elem{}); err != nil {
+				t.Errorf("copy: %v", err)
+			}
+		})
+	}
+}
+
+func TestTypeCopyUnified(t *testing.T) {
+	typ := NewType("func(a ?1, b ?2, c ?3) []?3")
+	typ.Map["a"].Uni.Union(typ.Map["b"].Uni) // ?1 and ?2 are the same
+	typ.Map["c"].Uni.Find().Data = TypeInt   // ?3 is solved as an int
+	cp := typ.Copy()
+	if s := cp.String(); s != "func(a ?1, b ?1, c int) []int" {
+		t.Errorf("got %s", s)
+	}
+	if err := checkCopy(typ, cp, map[*Elem]*Elem{}, map[*Elem]*Elem{}); err != nil {
+		t.Errorf("copy: %v", err)
+	}
+}
+
+func BenchmarkTypeCopy(b *testing.B) {
+	for _, bc := range []struct {
+		name, typ string
+	}{
+		{"str", "str"},
+		{"nested", "map{str: []struct{a int; b str}}"},
+		{"func", "func(a int, b str) bool"},
+		{"partial", "struct{left map{str: []struct{a ?1; b str}}; right map{str: []struct{a int; b ?1}}}"},
+	} {
+		b.Run(bc.name, func(b *testing.B) {
+			typ := NewType(bc.typ)
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				_ = typ.Copy()
+			}
+		})
+	}
+}
+
+func TestUni0(t *testing.T) {
+	// good type strings
+	if NewType("?1") == nil {
+		t.Errorf("unexpected nil type")
+	}
+	if NewType("?123") == nil {
+		t.Errorf("unexpected nil type")
+	}
+	if NewType("[]?123") == nil {
+		t.Errorf("unexpected nil type")
+	}
+	if NewType("map{?123: ?123}") == nil {
+		t.Errorf("unexpected nil type")
+	}
+
+	// bad type strings
+	if typ := NewType("?0"); typ != nil {
+		t.Errorf("expected nil type, got: %v", typ)
+	}
+	if typ := NewType("?00"); typ != nil {
+		t.Errorf("expected nil type, got: %v", typ)
+	}
+	if typ := NewType("?000000000000000000000"); typ != nil {
+		t.Errorf("expected nil type, got: %v", typ)
+	}
+}
+
+func TestUni1(t *testing.T) {
+	// functions with named types...
+	testCases := map[string]*Type{
+		// good type strings
+		"?1": {
+			Kind: KindUnification,
+			Uni:  NewElem(),
+		},
+		"?123": {
+			Kind: KindUnification,
+			Uni:  NewElem(),
+		},
+		"[]?123": {
+			Kind: KindList,
+			Val: &Type{
+				Kind: KindUnification,
+				Uni:  NewElem(),
+			},
+		},
+
+		// bad type strings
+		"?0":     nil,
+		"?00":    nil,
+		"?00000": nil,
+		"?-1":    nil,
+		"?-42":   nil,
+		"?0x42":  nil, // hexadecimal
+		"?013":   nil, // octal
+	}
+
+	for str, val := range testCases { // run all the tests
+		// for debugging
+		//if str != "?0" {
+		//continue
+		//}
+
+		// check the type
+		typ := NewType(str)
+		//t.Logf("str: %+v", str)
+		//t.Logf("typ: %+v", typ)
+
+		if val == nil { // catch error cases
+			if typ != nil {
+				t.Errorf("invalid type: `%s` did not match expected nil", str)
+			}
+			continue
+		}
+
+		if err := typ.Cmp(val); err != nil {
+			t.Errorf("type: `%s` did not match expected: `%v`", str, err)
+			return
+		}
+	}
+}
+
+func TestUniCmp0(t *testing.T) {
+	type test struct { // an individual test
+		name string
+		typ1 *Type
+		typ2 *Type
+		err  bool   // expected err ?
+		str  string // expected output str
+	}
+	testCases := []test{}
+
+	testCases = append(testCases, test{
+		name: "simple ?1 compare",
+		typ1: NewType("?1"),
+		typ2: NewType("?1"),
+		err:  false,
+	})
+	testCases = append(testCases, test{
+		name: "different ?1 compare",
+		typ1: NewType("?13"), // they don't need to be the same
+		typ2: NewType("?42"),
+		err:  false,
+	})
+	testCases = append(testCases, test{
+		name: "duplicate type unification variables",
+		// the type unification variables should be the same
+		typ1: NewType("map{?123:?123}"),
+		typ2: &Type{
+			Kind: KindMap,
+			Key: &Type{
+				Kind: KindUnification,
+				Uni:  NewElem(),
+			},
+			Val: &Type{
+				Kind: KindUnification,
+				Uni:  NewElem(),
+			},
+		},
+		err: true,
+	})
+	{
+		uni0 := NewElem()
+		testCases = append(testCases, test{
+			name: "same type unification variables in map",
+			// the type unification variables should be the same
+			typ1: NewType("map{?123:?123}"),
+			typ2: &Type{
+				Kind: KindMap,
+				Key: &Type{
+					Kind: KindUnification,
+					Uni:  uni0,
+				},
+				Val: &Type{
+					Kind: KindUnification,
+					Uni:  uni0,
+				},
+			},
+			err: false,
+		})
+	}
+	{
+		uni1 := NewElem()
+		uni2 := NewElem()
+		uni3 := NewElem()
+		// XXX: should we instead have uni0 for the return type and
+		// .Union() it with uni2 ?
+		//uni0 := NewElem()
+		//uni2.Union(uni0)
+		testCases = append(testCases, test{
+			name: "duplicate type unification variables in functions",
+			// the type unification variables should be the same
+			typ1: NewType("func(?13, ?42, ?4, int) ?42"),
+			typ2: &Type{
+				Kind: KindFunc,
+				Map: map[string]*Type{
+					"a": {
+						Kind: KindUnification,
+						Uni:  uni1,
+					},
+					"b": {
+						Kind: KindUnification,
+						Uni:  uni2,
+					},
+					"c": {
+						Kind: KindUnification,
+						Uni:  uni3,
+					},
+					"d": TypeInt,
+				},
+				Ord: []string{"a", "b", "c", "d"},
+				Out: &Type{
+					Kind: KindUnification,
+					Uni:  uni2, // same as the second arg
+				},
+			},
+			err: false,
+		})
+	}
+	{
+		uni1 := NewElem()
+		uni2 := NewElem()
+		// XXX: should we instead have uni0 for the return type and
+		// .Union() it with uni2 ?
+		//uni0 := NewElem()
+		//uni2.Union(uni0)
+		testCases = append(testCases, test{
+			name: "duplicate type unification variables in functions unbalanced",
+			// the type unification variables should be the same
+			typ1: NewType("func(?13, ?42, ?4, int) ?42"),
+			typ2: &Type{
+				Kind: KindFunc,
+				Map: map[string]*Type{
+					"a": {
+						Kind: KindUnification,
+						Uni:  uni1,
+					},
+					"b": {
+						Kind: KindUnification,
+						Uni:  uni2,
+					},
+					"c": {
+						Kind: KindUnification,
+						Uni:  uni1, // must not match!
+					},
+					"d": TypeInt,
+				},
+				Ord: []string{"a", "b", "c", "d"},
+				Out: &Type{
+					Kind: KindUnification,
+					Uni:  uni2, // same as the second arg
+				},
+			},
+			err: true,
+		})
+	}
+
+	if testing.Short() {
+		t.Logf("available tests:")
+	}
+	names := []string{}
+	for index, tc := range testCases { // run all the tests
+		if tc.name == "" {
+			t.Errorf("test #%d: not named", index)
+			continue
+		}
+		if util.StrInList(tc.name, names) {
+			t.Errorf("test #%d: duplicate sub test name of: %s", index, tc.name)
+			continue
+		}
+		names = append(names, tc.name)
+
+		testName := fmt.Sprintf("test #%d (%s)", index, tc.name)
+		if testing.Short() { // make listing tests easier
+			t.Logf("%s", testName)
+			continue
+		}
+		t.Run(testName, func(t *testing.T) {
+			typ1, typ2, err := tc.typ1, tc.typ2, tc.err
+
+			// the reverse should probably match the forward version
+			err1 := typ1.Cmp(typ2)
+			err2 := typ2.Cmp(typ1)
+
+			if err && err1 == nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: expected error, got nil", index)
+			}
+			if !err && err1 != nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: unexpected error: %+v", index, err1)
+			}
+			if err && err2 == nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: expected error, got nil", index)
+			}
+			if !err && err2 != nil {
+				t.Errorf("test #%d: FAIL", index)
+				t.Errorf("test #%d: unexpected error: %+v", index, err2)
+			}
+		})
+	}
+}
+
 func TestTypeOf0(t *testing.T) {
 	// TODO: implement testing of the TypeOf function
 	// TODO: implement testing TypeOf for struct field name mappings
+}
+
+// TestTypeOfSkipPrivateFields verifies that ConfigurableTypeOf with
+// SkipPrivateFieldsOpt(true) skips unexported struct fields, so that structs
+// with unexported fields can be converted to mcl types.
+func TestTypeOfSkipPrivateFields(t *testing.T) {
+	type testStruct struct {
+		Name    string
+		Count   int64
+		private string //nolint:unused
+	}
+
+	typ := reflect.TypeOf(testStruct{})
+
+	// With SkipPrivateFieldsOpt(true), only exported fields should appear.
+	result, err := ConfigurableTypeOf(typ, SkipPrivateFieldsOpt(true))
+	if err != nil {
+		t.Fatalf("unexpected error with SkipPrivateFieldsOpt(true): %v", err)
+	}
+	if result.Kind != KindStruct {
+		t.Fatalf("expected struct kind, got: %s", result.Kind)
+	}
+	if len(result.Ord) != 2 {
+		t.Fatalf("expected 2 fields, got %d: %v", len(result.Ord), result.Ord)
+	}
+	if _, ok := result.Map["Name"]; !ok {
+		t.Errorf("expected exported field 'Name' in result")
+	}
+	if _, ok := result.Map["Count"]; !ok {
+		t.Errorf("expected exported field 'Count' in result")
+	}
+	if _, ok := result.Map["private"]; ok {
+		t.Errorf("unexported field 'private' should not be in result")
+	}
+
+	// With SkipPrivateFieldsOpt(false), all fields are included.
+	result2, err := ConfigurableTypeOf(typ, SkipPrivateFieldsOpt(false))
+	if err != nil {
+		t.Fatalf("unexpected error with SkipPrivateFieldsOpt(false): %v", err)
+	}
+	if len(result2.Ord) != 3 {
+		t.Fatalf("expected 3 fields, got %d: %v", len(result2.Ord), result2.Ord)
+	}
+	if _, ok := result2.Map["private"]; !ok {
+		t.Errorf("expected unexported field 'private' in result when not skipping")
+	}
+}
+
+// TestResTypeOfSkipPrivateFields verifies that ResTypeOf (which uses
+// SkipPrivateFieldsOpt(true) internally) skips unexported struct fields.
+func TestResTypeOfSkipPrivateFields(t *testing.T) {
+	type resLike struct {
+		Name   string `lang:"name"`
+		secret string //nolint:unused
+	}
+
+	typ := reflect.TypeOf(resLike{})
+	result, err := ResTypeOf(typ)
+	if err != nil {
+		t.Fatalf("func ResTypeOf failed on struct with unexported field: %v", err)
+	}
+	if result.Kind != KindStruct {
+		t.Fatalf("expected struct kind, got: %s", result.Kind)
+	}
+	// ResTypeOf uses StrictStructTagOpt(true), so only tagged fields appear.
+	if len(result.Ord) != 1 {
+		t.Fatalf("expected 1 field, got %d: %v", len(result.Ord), result.Ord)
+	}
+	if _, ok := result.Map["name"]; !ok {
+		t.Errorf("expected field 'name' (from lang tag) in result")
+	}
+}
+
+func TestReflect0(t *testing.T) {
+	// Lowercase (unexported) struct field names get capitalized, so that
+	// reflect.StructOf doesn't panic on them, and the original name is
+	// stored in the `lang` struct tag, which TypeOf uses to map it back.
+	typ := NewType("struct{field1 str}")
+	st := typ.Reflect()
+
+	field, ok := st.FieldByName("Field1")
+	if !ok {
+		t.Fatalf("expected a `Field1` field, got: %+v", st)
+	}
+	if field.Type.Kind() != reflect.String {
+		t.Errorf("expected a string field, got: %+v", field.Type)
+	}
+	if alias, ok := field.Tag.Lookup(StructTag); !ok || alias != "field1" {
+		t.Errorf("expected a `%s` tag of `field1`, got: `%s`", StructTag, alias)
+	}
+
+	// And the original type can round trip back out of the golang type.
+	out, err := TypeOf(st)
+	if err != nil {
+		t.Fatalf("could not TypeOf the reflected struct: %+v", err)
+	}
+	if err := typ.Cmp(out); err != nil {
+		t.Errorf("type did not round trip through Reflect: %+v", err)
+	}
+}
+
+// TestFuncCmpIgnoresArgNames makes sure that two func types are the same as
+// long as their arg types are, even if those args are named differently. A
+// function value keeps the arg names of the lambda (or the function) which made
+// it, but whoever receives that value declares the type of it with names of its
+// own. For example: iter.map gives the arg of its function arg a name of its
+// own, but the lambda which gets passed to it might be `func($x) {...}`. If
+// this changed, the function engine would panic when it checks the type of each
+// value that gets passed to a func (see StructValue.Set) and type unification
+// and call speculation would stop matching function types which are the same.
+func TestFuncCmpIgnoresArgNames(t *testing.T) {
+	typ1 := NewType("func(a str, b int) bool")
+	typ2 := NewType("func(x str, y int) bool")
+	if err := typ1.Cmp(typ2); err != nil {
+		t.Errorf("func types with different arg names don't cmp: %+v", err)
+	}
+
+	// But the arg types (and their order) still matter.
+	typ3 := NewType("func(a int, b str) bool")
+	if err := typ1.Cmp(typ3); err == nil {
+		t.Errorf("func types with different arg types cmp")
+	}
 }

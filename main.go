@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,22 +13,44 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package main
 
 import (
+	"context"
 	_ "embed"
 	"fmt"
+	"log"
 	"os"
 
-	mgmt "github.com/purpleidea/mgmt/lib"
+	"github.com/purpleidea/mgmt/cli"
+	cliUtil "github.com/purpleidea/mgmt/cli/util"
+	"github.com/purpleidea/mgmt/entry"
+	_ "github.com/purpleidea/mgmt/gapi/empty" // import so the gapi registers
+	_ "github.com/purpleidea/mgmt/lang/gapi"  // import so the gapi registers
+	"github.com/purpleidea/mgmt/util"
+	"github.com/purpleidea/mgmt/util/pprof"
+	_ "github.com/purpleidea/mgmt/yamlgraph" // import so the gapi registers
+	"go.etcd.io/etcd/server/v3/etcdmain"
 )
 
 // These constants are some global variables that are used throughout the code.
 const (
-	Debug   = false // add additional log messages
-	Verbose = false // add extra log message output
+	tagline = "next generation config management"
+	debug   = false // add additional log messages
 )
 
 // set at compile time
@@ -41,19 +63,62 @@ var (
 var copying string
 
 func main() {
-	flags := mgmt.Flags{
-		Debug:   Debug,
-		Verbose: Verbose,
+	// embed etcd completely
+	if len(os.Args) >= 2 && os.Args[1] == "etcd" {
+		args := []string{}
+		for i, s := range os.Args {
+			if i == 0 { // pop off our argv[0] and let `etcd` be it
+				continue
+			}
+			args = append(args, s)
+		}
+		etcdmain.Main(args) // this will os.Exit
+		return              // for safety
 	}
-	cliArgs := &mgmt.CLIArgs{
+
+	cliUtil.LogSetup(debug)
+	data := &cliUtil.Data{
 		Program: program,
 		Version: version,
 		Copying: copying,
-		Flags:   flags,
+		Tagline: tagline,
+		Flags: cliUtil.Flags{
+			Debug: debug,
+			Logf: func(format string, v ...interface{}) {
+				log.Printf(format, v...) // the top-level log!
+			},
+		},
+		Args: os.Args,
 	}
-	if err := mgmt.CLI(cliArgs); err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+
+	// Run profiling if it's activated.
+	// TODO: Should we pass a logger into this?
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := pprof.Run(ctx); err != nil {
+		fmt.Println(err) // TODO: let pprof log errors
+		os.Exit(util.ExitCode(err))
+		//return // redundant
+	}
+	defer cancel()
+
+	name := ""
+	if len(data.Args) > 1 {
+		name = data.Args[1]
+	}
+	// is there an alternate entry point for the cli?
+	if cli, err := entry.Lookup(name); err == nil && cli.Name() == name {
+		data.Args = data.Args[1:] // pop off "argv[0]"
+		if err := cli.CLI(context.Background(), data); err != nil {
+			//fmt.Println(err)
+			os.Exit(util.ExitCode(err))
+			//return // redundant
+		}
 		return
+	}
+
+	if err := cli.CLI(context.Background(), data); err != nil {
+		//fmt.Println(err)
+		os.Exit(util.ExitCode(err))
+		//return // redundant
 	}
 }

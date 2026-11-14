@@ -1,0 +1,15 @@
+-- CONFIG --
+{
+	"nofmt": true
+}
+-- main.mcl --
+import "fmt"
+
+$msg = fmt.printf(
+	"hello %s",
+	,
+	"world",
+)
+test "${msg}" {}
+-- OUTPUT --
+# err: errLexParse: parser: `syntax error: unexpected COMMA, expecting CLOSE_PAREN`: /main.mcl @ 5:2-5:3

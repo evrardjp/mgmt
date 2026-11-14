@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,11 +13,24 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package graph
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/purpleidea/mgmt/engine"
@@ -28,7 +41,7 @@ import (
 )
 
 // AutoGroup runs the auto grouping on the loaded graph.
-func (obj *Engine) AutoGroup(ag engine.AutoGrouper) error {
+func (obj *Engine) AutoGroup(ctx context.Context, ag engine.AutoGrouper) error {
 	if obj.nextGraph == nil {
 		return fmt.Errorf("there is no active graph to autogroup")
 	}
@@ -42,7 +55,7 @@ func (obj *Engine) AutoGroup(ag engine.AutoGrouper) error {
 		AutoGrouper: ag, // pass in the existing autogrouper
 	}
 
-	if err := autogroup.AutoGroup(wrapped, obj.nextGraph, obj.Debug, logf); err != nil {
+	if err := autogroup.AutoGroup(ctx, wrapped, obj.nextGraph, obj.Debug, logf); err != nil {
 		return errwrap.Wrapf(err, "autogrouping failed")
 	}
 
@@ -83,11 +96,19 @@ func (obj *wrappedGrouper) VertexCmp(v1, v2 pgraph.Vertex) error {
 		return fmt.Errorf("one of the autogroup flags is false")
 	}
 
-	if r1.IsGrouped() { // already grouped!
-		return fmt.Errorf("already grouped")
-	}
-	if len(r2.GetGroup()) > 0 { // already has children grouped!
-		return fmt.Errorf("already has groups")
+	// We don't want to bail on these two conditions if the kinds are the
+	// same. This prevents us from having a linear chain of pkg->pkg->pkg,
+	// instead of flattening all of them into one arbitrary choice. But if
+	// we are doing hierarchical grouping, then we want to allow this type
+	// of grouping, or we won't end up building any hierarchies! This was
+	// added for http:server:ui. Check this condition is really required.
+	if r1.Kind() == r2.Kind() { // XXX: needed or do we unwrap the contents?
+		if r1.IsGrouped() { // already grouped!
+			return fmt.Errorf("already grouped")
+		}
+		if len(r2.GetGroup()) > 0 { // already has children grouped!
+			return fmt.Errorf("already has groups")
+		}
 	}
 	if err := r1.GroupCmp(r2); err != nil { // resource groupcmp failed!
 		return errwrap.Wrapf(err, "the GroupCmp failed")
@@ -109,6 +130,7 @@ func (obj *wrappedGrouper) VertexMerge(v1, v2 pgraph.Vertex) (v pgraph.Vertex, e
 	if err = r1.GroupRes(r2); err != nil { // GroupRes skips stupid groupings
 		return // return early on error
 	}
+	r2.SetParent(r1) // store who my parent is
 
 	// merging two resources into one should yield the sum of their semas
 	if semas := r2.MetaParams().Sema; len(semas) > 0 {

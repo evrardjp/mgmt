@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,13 +13,25 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package graph
 
 import (
+	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"sort"
@@ -41,7 +53,8 @@ const (
 
 // Reversals adds the reversals onto the loaded graph. This should happen last,
 // and before Commit.
-func (obj *Engine) Reversals() error {
+// TODO: use the ctx? maybe one day wrap the file i/o stuff
+func (obj *Engine) Reversals(ctx context.Context) error {
 	if obj.nextGraph == nil {
 		return fmt.Errorf("there is no active graph to add reversals to")
 	}
@@ -90,12 +103,16 @@ func (obj *Engine) Reversals() error {
 	}
 	sort.Strings(sorted)
 	for _, key := range sorted {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		val := data[key]
-		// XXX: replace this ResToB64 method with one that stores it in
-		// a human readable format, in case someone wants to hack and
-		// edit it manually.
-		// XXX: we probably want this to be YAML, it works with the diff
-		// too...
+		// NOTE: The stored value is a res as base64 encoded json, which
+		// ReversalInit wrote with ResToB64. See the note there about
+		// storing plain json instead, so that it can be edited by hand.
 		r, err := engineUtil.B64ToRes(val)
 		if err != nil {
 			return errwrap.Wrapf(err, "error decoding res with UID: `%s`", key)
@@ -104,7 +121,7 @@ func (obj *Engine) Reversals() error {
 		res, ok := r.(engine.ReversibleRes)
 		if !ok {
 			// this requirement is here to keep things simpler...
-			return errwrap.Wrapf(err, "decoded res with UID: `%s` was not reversible", key)
+			return fmt.Errorf("decoded res with UID: `%s` was not reversible", key)
 		}
 
 		matchFn := func(vertex pgraph.Vertex) (bool, error) {
@@ -142,6 +159,11 @@ func (obj *Engine) Reversals() error {
 	if len(resources) == 0 {
 		return nil // end early
 	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
 
 	// Now that we've passed the chance of any errors, we modify the graph.
 	obj.Logf("adding %d reversals...", len(resources))
@@ -161,7 +183,7 @@ func (obj *Engine) ReversalList() (map[string]string, error) {
 	result := make(map[string]string) // some key to contents
 
 	dir := obj.statePrefix() // loop through this dir...
-	files, err := ioutil.ReadDir(dir)
+	files, err := os.ReadDir(dir)
 	if err != nil && !os.IsNotExist(err) {
 		return nil, errwrap.Wrapf(err, "error reading list of state dirs")
 	} else if err != nil {
@@ -171,7 +193,7 @@ func (obj *Engine) ReversalList() (map[string]string, error) {
 	for _, x := range files {
 		key := x.Name() // some uid for the resource
 		file := path.Join(dir, key, ReverseFile)
-		content, err := ioutil.ReadFile(file)
+		content, err := os.ReadFile(file)
 		if err != nil && !os.IsNotExist(err) {
 			return nil, errwrap.Wrapf(err, "could not read reverse file: %s", file)
 		} else if err != nil {
@@ -188,7 +210,7 @@ func (obj *Engine) ReversalList() (map[string]string, error) {
 
 // ReversalInit performs the reversal initialization steps if necessary for this
 // resource.
-func (obj *State) ReversalInit() error {
+func (obj *State) ReversalInit(ctx context.Context) error {
 	res, ok := obj.Vertex.(engine.ReversibleRes)
 	if !ok {
 		return nil // nothing to do
@@ -207,7 +229,7 @@ func (obj *State) ReversalInit() error {
 		obj.Logf("triangle reversal") // warn!
 	}
 
-	r, err := res.Reversed()
+	r, err := res.Reversed(ctx)
 	if err != nil {
 		return errwrap.Wrapf(err, "could not reverse: %s", res.String())
 	}
@@ -219,9 +241,9 @@ func (obj *State) ReversalInit() error {
 	// erase the reversal state file after we've used it.
 	r.ReversibleMeta().Reversal = true // set this for later...
 
-	// XXX: replace this ResToB64 method with one that stores it in a human
-	// readable format, in case someone wants to hack and edit it manually.
-	// XXX: we probably want this to be YAML, it works with the diff too...
+	// TODO: ResToB64 encodes the resource as json, but then it base64
+	// encodes that, which stops anyone from reading or editing this file by
+	// hand. Store the json directly instead, and indent it so it diffs well.
 	str, err := engineUtil.ResToB64(r)
 	if err != nil {
 		return errwrap.Wrapf(err, "could not encode: %s", res.String())
@@ -231,9 +253,9 @@ func (obj *State) ReversalInit() error {
 	return obj.ReversalWrite(str, res.ReversibleMeta().Overwrite) // Store!
 }
 
-// ReversalClose performs the reversal shutdown steps if necessary for this
+// ReversalCleanup performs the reversal shutdown steps if necessary for this
 // resource.
-func (obj *State) ReversalClose() error {
+func (obj *State) ReversalCleanup() error {
 	res, ok := obj.Vertex.(engine.ReversibleRes)
 	if !ok {
 		return nil // nothing to do
@@ -246,7 +268,7 @@ func (obj *State) ReversalClose() error {
 		return nil // nothing to erase, we're not a reversal resource
 	}
 
-	if !obj.isStateOK { // did we successfully reverse?
+	if !obj.isStateOK.Load() { // did we successfully reverse? (mutex RLock/RUnlock)
 		obj.Logf("did not complete reversal") // warn
 		return nil
 	}
@@ -263,7 +285,7 @@ func (obj *State) ReversalWrite(str string, overwrite bool) error {
 	}
 	file := path.Join(dir, ReverseFile) // return a unique file
 
-	content, err := ioutil.ReadFile(file)
+	content, err := os.ReadFile(file)
 	if err != nil && !os.IsNotExist(err) {
 		return errwrap.Wrapf(err, "could not read reverse file: %s", file)
 	}
@@ -275,12 +297,12 @@ func (obj *State) ReversalWrite(str string, overwrite bool) error {
 		if str != oldStr {
 			obj.Logf("existing, pending, reversible resource exists")
 			//obj.Logf("diff:")
-			//obj.Logf("") // TODO: print the diff w/o and secret values
+			//obj.Logf("") // TODO: print the diff w/o secret values
 			return fmt.Errorf("existing, pending, reversible resource exists")
 		}
 	}
 
-	return ioutil.WriteFile(file, []byte(str), ReversePerm)
+	return os.WriteFile(file, []byte(str), ReversePerm)
 }
 
 // ReversalDelete removes the reversal state information for this resource.

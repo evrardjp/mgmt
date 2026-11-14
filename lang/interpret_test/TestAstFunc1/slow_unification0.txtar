@@ -1,0 +1,100 @@
+-- main.mcl --
+# state machine that previously experienced unusable slow type unification
+import "world"
+
+$ns = "estate"
+$exchanged = world.kvlookup($ns)
+$state = $exchanged[$hostname] <|> "default"
+
+if $state == "one" or $state == "default" {
+
+	file "/tmp/mgmt/state" {
+		content => "state: one\n",
+	}
+
+	exec "timer" {
+		cmd => "/usr/bin/sleep 1s",
+	}
+	kv "${ns}" {
+		key => $ns,
+		value => "two",
+	}
+	Exec["timer"] -> Kv["${ns}"]
+}
+if $state == "two" {
+
+	file "/tmp/mgmt/state" {
+		content => "state: two\n",
+	}
+
+	exec "timer" {
+		cmd => "/usr/bin/sleep 1s",
+	}
+	kv "${ns}" {
+		key => $ns,
+		value => "three",
+	}
+	Exec["timer"] -> Kv["${ns}"]
+}
+if $state == "three" {
+
+	file "/tmp/mgmt/state" {
+		content => "state: three\n",
+	}
+
+	exec "timer" {
+		cmd => "/usr/bin/sleep 1s",
+	}
+	kv "${ns}" {
+		key => $ns,
+		value => "one",
+	}
+	Exec["timer"] -> Kv["${ns}"]
+}
+-- OUTPUT --
+Edge: _lookup -> exprexcept # value
+Edge: _operator -> _operator # a
+Edge: _operator -> _operator # b
+Edge: _operator -> stmtif # condition
+Edge: _operator -> stmtif # condition
+Edge: _operator -> stmtif # condition
+Edge: const: str("") -> _lookup # indexorkey
+Edge: const: str("==") -> _operator # op
+Edge: const: str("==") -> _operator # op
+Edge: const: str("==") -> _operator # op
+Edge: const: str("==") -> _operator # op
+Edge: const: str("default") -> _operator # b
+Edge: const: str("estate") -> kvlookup # namespace
+Edge: const: str("one") -> _operator # b
+Edge: const: str("or") -> _operator # op
+Edge: const: str("three") -> _operator # b
+Edge: const: str("two") -> _operator # b
+Edge: exprExceptSubgraphOutput -> _operator # a
+Edge: exprExceptSubgraphOutput -> _operator # a
+Edge: exprExceptSubgraphOutput -> _operator # a
+Edge: exprExceptSubgraphOutput -> _operator # a
+Edge: exprexcept -> exprExceptSubgraphOutput # dummy
+Edge: kvlookup -> _lookup # listormap
+Vertex: _lookup
+Vertex: _operator
+Vertex: _operator
+Vertex: _operator
+Vertex: _operator
+Vertex: _operator
+Vertex: const: str("")
+Vertex: const: str("==")
+Vertex: const: str("==")
+Vertex: const: str("==")
+Vertex: const: str("==")
+Vertex: const: str("default")
+Vertex: const: str("estate")
+Vertex: const: str("one")
+Vertex: const: str("or")
+Vertex: const: str("three")
+Vertex: const: str("two")
+Vertex: exprExceptSubgraphOutput
+Vertex: exprexcept
+Vertex: kvlookup
+Vertex: stmtif
+Vertex: stmtif
+Vertex: stmtif

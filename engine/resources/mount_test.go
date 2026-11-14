@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,14 +13,25 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
-// +build !root
+//go:build !root
 
 package resources
 
 import (
-	"io/ioutil"
 	"os"
 	"testing"
 
@@ -65,7 +76,7 @@ var fstabWriteTests = []struct {
 }
 
 func (obj *MountRes) TestFstabWrite(t *testing.T) {
-	file, err := ioutil.TempFile("", "fstab")
+	file, err := os.CreateTemp("", "fstab")
 	if err != nil {
 		t.Errorf("error creating temp file: %v", err)
 		return
@@ -117,7 +128,7 @@ var fstabEntryAddTests = []struct {
 }
 
 func (obj *MountRes) TestFstabEntryAdd(t *testing.T) {
-	file, err := ioutil.TempFile("", "fstab")
+	file, err := os.CreateTemp("", "fstab")
 	if err != nil {
 		t.Errorf("error creating temp file: %v", err)
 		return
@@ -125,7 +136,7 @@ func (obj *MountRes) TestFstabEntryAdd(t *testing.T) {
 	defer os.Remove(file.Name())
 
 	for _, test := range fstabEntryAddTests {
-		if err := ioutil.WriteFile(file.Name(), test.fstabMock, 0644); err != nil {
+		if err := os.WriteFile(file.Name(), test.fstabMock, 0600); err != nil {
 			t.Errorf("error writing fstab file: %s: %v", file.Name(), err)
 			return
 		}
@@ -163,7 +174,7 @@ var fstabEntryRemoveTests = []struct {
 }
 
 func (obj *MountRes) TestFstabEntryRemove(t *testing.T) {
-	file, err := ioutil.TempFile("", "fstab")
+	file, err := os.CreateTemp("", "fstab")
 	if err != nil {
 		t.Errorf("error creating temp file: %v", err)
 		return
@@ -171,7 +182,7 @@ func (obj *MountRes) TestFstabEntryRemove(t *testing.T) {
 	defer os.Remove(file.Name())
 
 	for _, test := range fstabEntryRemoveTests {
-		if err := ioutil.WriteFile(file.Name(), test.fstabMock, 0644); err != nil {
+		if err := os.WriteFile(file.Name(), test.fstabMock, 0600); err != nil {
 			t.Errorf("error writing fstab file: %s: %v", file.Name(), err)
 			return
 		}
@@ -258,7 +269,7 @@ var fstabEntryExistsTests = []struct {
 }
 
 func TestFstabEntryExists(t *testing.T) {
-	file, err := ioutil.TempFile("", "fstab")
+	file, err := os.CreateTemp("", "fstab")
 	if err != nil {
 		t.Errorf("error creating temp file: %v", err)
 		return
@@ -266,7 +277,7 @@ func TestFstabEntryExists(t *testing.T) {
 	defer os.Remove(file.Name())
 
 	for _, test := range fstabEntryExistsTests {
-		if err := ioutil.WriteFile(file.Name(), test.fstabMock, 0644); err != nil {
+		if err := os.WriteFile(file.Name(), test.fstabMock, 0600); err != nil {
 			t.Errorf("error writing fstab file: %s: %v", file.Name(), err)
 			return
 		}

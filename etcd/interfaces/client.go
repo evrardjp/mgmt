@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,19 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package interfaces
 
@@ -31,7 +43,7 @@ type WatcherData struct {
 
 	// XXX: what goes here... this? or a more processed version?
 	Path   string // the path we're watching
-	Header pb.ResponseHeader
+	Header *pb.ResponseHeader
 	Events []*etcd.Event
 	Err    error
 }
@@ -44,9 +56,11 @@ type WatcherInfo struct {
 	Cancel func()
 
 	// Events returns a channel of any events that occur. This happens on
-	// watch startup, watch event, and watch failure. This channel closes
-	// when the Watcher shuts down. If you block on these reads, then you
-	// will block the entire Watcher which is usually not what you want.
+	// watch startup, watch event, and watch failure. A failure is always
+	// the last event before this channel closes. The channel only closes
+	// without a failure when the input ctx was cancelled, or when Cancel
+	// was called. If you block on these reads, then you will block the
+	// entire Watcher which is usually not what you want.
 	Events <-chan *WatcherData
 }
 
@@ -54,10 +68,15 @@ type WatcherInfo struct {
 // EmbdEtcd.MakeClient and client.Simple implement this.
 type Client interface {
 	GetClient() *etcd.Client
+	GetNamespace() string
+
 	Set(ctx context.Context, key, value string, opts ...etcd.OpOption) error
 	Get(ctx context.Context, path string, opts ...etcd.OpOption) (map[string]string, error)
 	Del(ctx context.Context, path string, opts ...etcd.OpOption) (int64, error)
 	Txn(ctx context.Context, ifCmps []etcd.Cmp, thenOps, elseOps []etcd.Op) (*etcd.TxnResponse, error)
 	Watcher(ctx context.Context, path string, opts ...etcd.OpOption) (chan error, error)
 	ComplexWatcher(ctx context.Context, path string, opts ...etcd.OpOption) (*WatcherInfo, error)
+
+	// WatchMembers returns a channel of changing members in the cluster.
+	WatchMembers(context.Context) (<-chan *MembersResult, error)
 }

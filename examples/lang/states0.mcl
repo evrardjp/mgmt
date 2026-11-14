@@ -2,23 +2,24 @@ import "world"
 
 $ns = "estate"
 $exchanged = world.kvlookup($ns)
-$state = maplookup($exchanged, $hostname, "default")
+$state = $exchanged[$hostname] <|> "default"
 
-if $state == "one" || $state == "default" {
+if $state == "one" or $state == "default" {
 
 	file "/tmp/mgmt/state" {
 		state => $const.res.file.state.exists,
 		content => "state: one\n",
 	}
 
-	exec "timer" {
+	exec "timer-${state}" {
 		cmd => "/usr/bin/sleep 1s",
 	}
 	kv "${ns}" {
 		key => $ns,
 		value => "two",
+		mapped => true,
 	}
-	Exec["timer"] -> Kv["${ns}"]
+	Exec["timer-${state}"] -> Kv["${ns}"]
 }
 if $state == "two" {
 
@@ -27,14 +28,15 @@ if $state == "two" {
 		content => "state: two\n",
 	}
 
-	exec "timer" {
+	exec "timer-${state}" {
 		cmd => "/usr/bin/sleep 1s",
 	}
 	kv "${ns}" {
 		key => $ns,
 		value => "three",
+		mapped => true,
 	}
-	Exec["timer"] -> Kv["${ns}"]
+	Exec["timer-${state}"] -> Kv["${ns}"]
 }
 if $state == "three" {
 
@@ -43,12 +45,13 @@ if $state == "three" {
 		content => "state: three\n",
 	}
 
-	exec "timer" {
+	exec "timer-${state}" {
 		cmd => "/usr/bin/sleep 1s",
 	}
 	kv "${ns}" {
 		key => $ns,
 		value => "one",
+		mapped => true,
 	}
-	Exec["timer"] -> Kv["${ns}"]
+	Exec["timer-${state}"] -> Kv["${ns}"]
 }

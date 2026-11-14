@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,17 +13,31 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 %{
 package parser
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/purpleidea/mgmt/lang/ast"
 	"github.com/purpleidea/mgmt/lang/funcs"
+	"github.com/purpleidea/mgmt/lang/funcs/operators"
 	"github.com/purpleidea/mgmt/lang/interfaces"
 	"github.com/purpleidea/mgmt/lang/types"
 	"github.com/purpleidea/mgmt/util"
@@ -43,14 +57,17 @@ func init() {
 	row int
 	col int
 
+	endRow int
+	endCol int
+
 	//err error // TODO: if we ever match ERROR in the parser
 
-	bool    bool
-	str     string
-	int     int64 // this is the .int as seen in lexer.nex
-	float   float64
+	bool  bool
+	str   string
+	int   int64 // this is the .int as seen in lexer.nex
+	float float64
 
-	typ   *types.Type
+	typ *types.Type
 
 	stmts []interfaces.Stmt
 	stmt interfaces.Stmt
@@ -76,23 +93,24 @@ func init() {
 	edgeHalf     *ast.StmtEdgeHalf
 }
 
+%token NEWLINE
 %token OPEN_CURLY CLOSE_CURLY
 %token OPEN_PAREN CLOSE_PAREN
 %token OPEN_BRACK CLOSE_BRACK
-%token IF ELSE
-%token STRING BOOL INTEGER FLOAT
+%token IF ELSE FOR FORKV
+%token BOOL STRING INTEGER FLOAT
 %token EQUALS DOLLAR
 %token COMMA COLON SEMICOLON
-%token ELVIS ROCKET ARROW DOT
-%token STR_IDENTIFIER BOOL_IDENTIFIER INT_IDENTIFIER FLOAT_IDENTIFIER
-%token MAP_IDENTIFIER STRUCT_IDENTIFIER VARIANT_IDENTIFIER VAR_IDENTIFIER
-%token VAR_IDENTIFIER_HX
-%token RES_IDENTIFIER
+%token ELVIS EXCEPT ROCKET ARROW DOT
+%token BOOL_IDENTIFIER STR_IDENTIFIER INT_IDENTIFIER FLOAT_IDENTIFIER
+%token MAP_IDENTIFIER STRUCT_IDENTIFIER VARIANT_IDENTIFIER
 %token IDENTIFIER CAPITALIZED_IDENTIFIER
 %token FUNC_IDENTIFIER
 %token CLASS_IDENTIFIER INCLUDE_IDENTIFIER
 %token IMPORT_IDENTIFIER AS_IDENTIFIER
 %token COMMENT ERROR
+%token COLLECT_IDENTIFIER
+%token PANIC_IDENTIFIER
 
 // precedence table
 // "Operator precedence is determined by the line ordering of the declarations;
@@ -100,23 +118,40 @@ func init() {
 // the higher the precedence."
 // From: https://www.gnu.org/software/bison/manual/html_node/Infix-Calc.html
 // FIXME: a yacc specialist should check the precedence and add more tests!
-%left AND OR
-%nonassoc LT GT LTE GTE EQ NEQ	// TODO: is %nonassoc correct for all of these?
+// STRUCT_LOOKUP must be below EXCEPT so that when the parser sees the EXCEPT
+// token after `expr ARROW IDENTIFIER`, it prefers to shift it (producing the
+// longer struct-lookup-optional production) instead of reducing early, which
+// would have wrapped the plain struct lookup in the generic except operator.
+%nonassoc STRUCT_LOOKUP
+%left EXCEPT // lowest expr precedence, matches left-first so we catch in order
+%left OR
+%left AND
+%nonassoc LT GT LTE GTE EQ NEQ IN	// TODO: is %nonassoc correct for all of these?
 %left PLUS MINUS
 %left MULTIPLY DIVIDE
 %right NOT
 //%right EXP	// exponentiation
-%nonassoc IN	// TODO: is %nonassoc correct for this?
+%nonassoc ARROW		// XXX: is %nonassoc correct for this?
+%nonassoc OPEN_BRACK	// XXX: is %nonassoc correct for this?
 
 %error IDENTIFIER STRING OPEN_CURLY IDENTIFIER ROCKET BOOL CLOSE_CURLY: errstrParseExpectingComma
 %error IDENTIFIER STRING OPEN_CURLY IDENTIFIER ROCKET STRING CLOSE_CURLY: errstrParseExpectingComma
 %error IDENTIFIER STRING OPEN_CURLY IDENTIFIER ROCKET INTEGER CLOSE_CURLY: errstrParseExpectingComma
 %error IDENTIFIER STRING OPEN_CURLY IDENTIFIER ROCKET FLOAT CLOSE_CURLY: errstrParseExpectingComma
+%error IDENTIFIER STRING OPEN_CURLY IDENTIFIER ROCKET expr CLOSE_CURLY: errstrParseExpectingComma
+// These are the same cases as above but the field is followed by a newline
+// (rather than the close curly) because the resource body now allows NEWLINE
+// tokens between fields.
+%error IDENTIFIER STRING OPEN_CURLY IDENTIFIER ROCKET BOOL NEWLINE: errstrParseExpectingComma
+%error IDENTIFIER STRING OPEN_CURLY IDENTIFIER ROCKET STRING NEWLINE: errstrParseExpectingComma
+%error IDENTIFIER STRING OPEN_CURLY IDENTIFIER ROCKET INTEGER NEWLINE: errstrParseExpectingComma
+%error IDENTIFIER STRING OPEN_CURLY IDENTIFIER ROCKET FLOAT NEWLINE: errstrParseExpectingComma
+%error IDENTIFIER STRING OPEN_CURLY IDENTIFIER ROCKET expr NEWLINE: errstrParseExpectingComma
 
-%error VAR_IDENTIFIER EQ BOOL: errstrParseAdditionalEquals
-%error VAR_IDENTIFIER EQ STRING: errstrParseAdditionalEquals
-%error VAR_IDENTIFIER EQ INTEGER: errstrParseAdditionalEquals
-%error VAR_IDENTIFIER EQ FLOAT: errstrParseAdditionalEquals
+%error var_identifier EQ BOOL: errstrParseAdditionalEquals
+%error var_identifier EQ STRING: errstrParseAdditionalEquals
+%error var_identifier EQ INTEGER: errstrParseAdditionalEquals
+%error var_identifier EQ FLOAT: errstrParseAdditionalEquals
 
 %%
 top:
@@ -130,6 +165,25 @@ top:
 		//lp := yylex.(*Lexer).parseResult
 		//lp.(*lexParseAST).ast = $1.stmt
 	}
+	// Allow a final stmt without a trailing newline (e.g. input that
+	// doesn't end with `\n`). A NEWLINE here would be handled by the
+	// `prog stmt NEWLINE` rule below, so this only fires at the $end.
+/*
+|	prog stmt
+	{
+		posLast(yylex, yyDollar) // our pos
+		if stmt, ok := $1.stmt.(*ast.StmtProg); ok {
+			stmts := stmt.Body
+			stmts = append(stmts, $2.stmt)
+			prog := &ast.StmtProg{
+				Body: stmts,
+			}
+			locate(yylex, $1, yyDollar[len(yyDollar)-1], prog)
+			lp := cast(yylex)
+			lp.ast = prog
+		}
+	}
+*/
 ;
 prog:
 	/* end of list */
@@ -139,7 +193,7 @@ prog:
 			Body: []interfaces.Stmt{},
 		}
 	}
-|	prog stmt
+|	prog stmt NEWLINE
 	{
 		posLast(yylex, yyDollar) // our pos
 		// TODO: should we just skip comments for now?
@@ -151,74 +205,141 @@ prog:
 			$$.stmt = &ast.StmtProg{
 				Body: stmts,
 			}
+			// We locate against the stmt and not the trailing
+			// NEWLINE, because the lexer stores the end of a
+			// newline token as the start of the next row, and that
+			// would spill this end position onto the next line.
+			locateOnly($1, $2, $$.stmt)
 		}
+	}
+// Skip over nil statements (like a newline)
+|	prog NEWLINE
+	{
+		// newline!
+		$$.stmt = $1.stmt
 	}
 ;
 stmt:
 	COMMENT
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.stmt = &ast.StmtComment{
 			Value: $1.str,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
 	}
 |	bind
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.stmt = $1.stmt
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
+	}
+|	panic
+	{
+		$$.stmt = $1.stmt
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
+	}
+|	collect
+	{
+		$$.stmt = $1.stmt
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
 	}
 |	resource
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.stmt = $1.stmt
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
 	}
 |	edge
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.stmt = $1.stmt
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
 	}
 |	IF expr OPEN_CURLY prog CLOSE_CURLY
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.stmt = &ast.StmtIf{
 			Condition:  $2.expr,
 			ThenBranch: $4.stmt,
 			//ElseBranch: nil,
 		}
+		relocate($3, $5, $4.stmt) // the block spans the braces
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
 	}
 |	IF expr OPEN_CURLY prog CLOSE_CURLY ELSE OPEN_CURLY prog CLOSE_CURLY
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.stmt = &ast.StmtIf{
 			Condition:  $2.expr,
 			ThenBranch: $4.stmt,
 			ElseBranch: $8.stmt,
 		}
+		relocate($3, $5, $4.stmt) // the blocks span the braces
+		relocate($7, $9, $8.stmt)
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
+	}
+	// iterate over lists
+	// `for $index, $value in $list { <body> }`
+|	FOR var_identifier COMMA var_identifier IN expr OPEN_CURLY prog CLOSE_CURLY
+	{
+		stmt := &ast.StmtFor{
+			Index: $2.str, // no $ prefix
+			Value: $4.str, // no $ prefix
+			Expr:  $6.expr, // XXX: name this List ?
+			Body:  $8.stmt,
+		}
+		// store the loop variable positions so errors can point at them
+		stmt.IndexTextarea.Locate($2.row, $2.col, $2.endRow, $2.endCol)
+		stmt.ValueTextarea.Locate($4.row, $4.col, $4.endRow, $4.endCol)
+		relocate($7, $9, $8.stmt) // the block spans the braces
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], stmt)
+		$$.stmt = stmt
+	}
+	// iterate over maps
+	// `forkv $key, $val in $map { <body> }`
+|	FORKV var_identifier COMMA var_identifier IN expr OPEN_CURLY prog CLOSE_CURLY
+	{
+		stmt := &ast.StmtForKV{
+			Key:  $2.str, // no $ prefix
+			Val:  $4.str, // no $ prefix
+			Expr: $6.expr, // XXX: name this Map ?
+			Body: $8.stmt,
+		}
+		// store the loop variable positions so errors can point at them
+		stmt.KeyTextarea.Locate($2.row, $2.col, $2.endRow, $2.endCol)
+		stmt.ValTextarea.Locate($4.row, $4.col, $4.endRow, $4.endCol)
+		relocate($7, $9, $8.stmt) // the block spans the braces
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], stmt)
+		$$.stmt = stmt
 	}
 	// this is the named version, iow, a user-defined function (statement)
 	// `func name() { <expr> }`
 	// `func name(<arg>) { <expr> }`
 	// `func name(<arg>, <arg>) { <expr> }`
-|	FUNC_IDENTIFIER IDENTIFIER OPEN_PAREN args CLOSE_PAREN OPEN_CURLY expr CLOSE_CURLY
+|	FUNC_IDENTIFIER IDENTIFIER OPEN_PAREN args CLOSE_PAREN OPEN_CURLY opt_newlines expr opt_newlines CLOSE_CURLY
 	{
-		posLast(yylex, yyDollar) // our pos
+		body := &ast.ExprBlock{
+			Inner: $8.expr,
+		}
+		relocate($6, $10, body) // the block spans the braces
 		$$.stmt = &ast.StmtFunc{
 			Name: $2.str,
 			Func: &ast.ExprFunc{
-				Args: $4.args,
-				//Return: nil,
-				Body: $7.expr,
+				Title:  $2.str,
+				Args:   $4.args,
+				Return: nil,
+				Body:   body,
 			},
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
 	}
 	// `func name(...) <type> { <expr> }`
-|	FUNC_IDENTIFIER IDENTIFIER OPEN_PAREN args CLOSE_PAREN type OPEN_CURLY expr CLOSE_CURLY
+|	FUNC_IDENTIFIER IDENTIFIER OPEN_PAREN args CLOSE_PAREN type OPEN_CURLY opt_newlines expr opt_newlines CLOSE_CURLY
 	{
-		posLast(yylex, yyDollar) // our pos
+		body := &ast.ExprBlock{
+			Inner: $9.expr,
+		}
+		relocate($7, $11, body) // the block spans the braces
 		fn := &ast.ExprFunc{
+			Title:  $2.str,
 			Args:   $4.args,
 			Return: $6.typ, // return type is known
-			Body:   $8.expr,
+			Body:   body,
 		}
 		isFullyTyped := $6.typ != nil // true if set
 		m := make(map[string]*types.Type)
@@ -232,13 +353,15 @@ stmt:
 			m[a.Name] = a.Type
 			ord = append(ord, a.Name)
 		}
+		var typ *types.Type
 		if isFullyTyped {
-			typ := &types.Type{
+			typ = &types.Type{
 				Kind: types.KindFunc,
 				Map:  m,
 				Ord:  ord,
 				Out:  $6.typ,
 			}
+			// XXX: We might still need to do this for now...
 			if err := fn.SetType(typ); err != nil {
 				// this will ultimately cause a parser error to occur...
 				yylex.Error(fmt.Sprintf("%s: %+v", ErrParseSetType, err))
@@ -247,272 +370,501 @@ stmt:
 		$$.stmt = &ast.StmtFunc{
 			Name: $2.str,
 			Func: fn,
+			Type: typ, // sam says add the type here instead...
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
 	}
 	// `class name { <prog> }`
-|	CLASS_IDENTIFIER IDENTIFIER OPEN_CURLY prog CLOSE_CURLY
+|	CLASS_IDENTIFIER colon_identifier OPEN_CURLY prog CLOSE_CURLY
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.stmt = &ast.StmtClass{
 			Name: $2.str,
 			Args: nil,
 			Body: $4.stmt,
 		}
+		relocate($3, $5, $4.stmt) // the block spans the braces
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
 	}
 	// `class name(<arg>) { <prog> }`
 	// `class name(<arg>, <arg>) { <prog> }`
-|	CLASS_IDENTIFIER IDENTIFIER OPEN_PAREN args CLOSE_PAREN OPEN_CURLY prog CLOSE_CURLY
+|	CLASS_IDENTIFIER colon_identifier OPEN_PAREN args CLOSE_PAREN OPEN_CURLY prog CLOSE_CURLY
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.stmt = &ast.StmtClass{
 			Name: $2.str,
 			Args: $4.args,
 			Body: $7.stmt,
 		}
+		relocate($6, $8, $7.stmt) // the block spans the braces
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
 	}
 	// `include name`
 |	INCLUDE_IDENTIFIER dotted_identifier
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.stmt = &ast.StmtInclude{
 			Name: $2.str,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
 	}
 	// `include name(...)`
-|	INCLUDE_IDENTIFIER dotted_identifier OPEN_PAREN call_args CLOSE_PAREN
+|	INCLUDE_IDENTIFIER dotted_identifier OPEN_PAREN callargs CLOSE_PAREN
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.stmt = &ast.StmtInclude{
 			Name: $2.str,
 			Args: $4.exprs,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
+	}
+	// `include name as foo`
+	// TODO: should we support: `include name as *`
+|	INCLUDE_IDENTIFIER dotted_identifier AS_IDENTIFIER IDENTIFIER
+	{
+		$$.stmt = &ast.StmtInclude{
+			Name:  $2.str,
+			Alias: $4.str,
+		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
+	}
+	// `include name(...) as foo`
+	// TODO: should we support: `include name(...) as *`
+|	INCLUDE_IDENTIFIER dotted_identifier OPEN_PAREN callargs CLOSE_PAREN AS_IDENTIFIER IDENTIFIER
+	{
+		$$.stmt = &ast.StmtInclude{
+			Name:  $2.str,
+			Args:  $4.exprs,
+			Alias: $7.str,
+		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
 	}
 	// `import "name"`
 |	IMPORT_IDENTIFIER STRING
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.stmt = &ast.StmtImport{
 			Name: $2.str,
 			//Alias: "",
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
 	}
 	// `import "name" as alias`
 |	IMPORT_IDENTIFIER STRING AS_IDENTIFIER IDENTIFIER
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.stmt = &ast.StmtImport{
 			Name:  $2.str,
 			Alias: $4.str,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
 	}
 	// `import "name" as *`
 |	IMPORT_IDENTIFIER STRING AS_IDENTIFIER MULTIPLY
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.stmt = &ast.StmtImport{
 			Name:  $2.str,
 			Alias: $4.str,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
 	}
 /*
 	// resource bind
 |	rbind
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.stmt = $1.stmt
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
 	}
 */
 ;
 expr:
 	BOOL
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.expr = &ast.ExprBool{
 			V: $1.bool,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 |	STRING
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.expr = &ast.ExprStr{
 			V: $1.str,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 |	INTEGER
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.expr = &ast.ExprInt{
 			V: $1.int,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 |	FLOAT
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.expr = &ast.ExprFloat{
 			V: $1.float,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 |	list
 	{
-		posLast(yylex, yyDollar) // our pos
 		// TODO: list could be squashed in here directly...
 		$$.expr = $1.expr
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 |	map
 	{
-		posLast(yylex, yyDollar) // our pos
 		// TODO: map could be squashed in here directly...
 		$$.expr = $1.expr
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 |	struct
 	{
-		posLast(yylex, yyDollar) // our pos
 		// TODO: struct could be squashed in here directly...
 		$$.expr = $1.expr
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 |	call
 	{
-		posLast(yylex, yyDollar) // our pos
 		// TODO: call could be squashed in here directly...
 		$$.expr = $1.expr
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 |	var
 	{
-		posLast(yylex, yyDollar) // our pos
 		// TODO: var could be squashed in here directly...
 		$$.expr = $1.expr
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 |	func
 	{
-		posLast(yylex, yyDollar) // our pos
 		// TODO: var could be squashed in here directly...
 		$$.expr = $1.expr
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
-|	IF expr OPEN_CURLY expr CLOSE_CURLY ELSE OPEN_CURLY expr CLOSE_CURLY
+|	IF expr OPEN_CURLY opt_newlines expr opt_newlines CLOSE_CURLY ELSE OPEN_CURLY opt_newlines expr opt_newlines CLOSE_CURLY
 	{
-		posLast(yylex, yyDollar) // our pos
+		thenBranch := &ast.ExprBlock{
+			Inner: $5.expr,
+		}
+		relocate($3, $7, thenBranch) // the blocks span the braces
+		elseBranch := &ast.ExprBlock{
+			Inner: $11.expr,
+		}
+		relocate($9, $13, elseBranch)
 		$$.expr = &ast.ExprIf{
 			Condition:  $2.expr,
-			ThenBranch: $4.expr,
-			ElseBranch: $8.expr,
+			ThenBranch: thenBranch,
+			ElseBranch: elseBranch,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 	// parenthesis wrap an expression for precedence
 |	OPEN_PAREN expr CLOSE_PAREN
 	{
-		posLast(yylex, yyDollar) // our pos
-		$$.expr = $2.expr
+		// We wrap it in ExprParen, which is a transient AST node that
+		// records where the explicit parenthesis were in the source
+		// code, so that tools like the code formatter can print them
+		// back out. It gets removed during the Interpolate step, since
+		// the parser already used it for expression precedence here.
+		$$.expr = &ast.ExprParen{
+			Inner: $2.expr,
+		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 ;
 list:
-	// `[42, 0, -13]`
-	OPEN_BRACK list_elements CLOSE_BRACK
+	list_single
 	{
 		posLast(yylex, yyDollar) // our pos
+		$$.expr = $1.expr
+	}
+|	list_multi
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.expr = $1.expr
+	}
+;
+list_single:
+	OPEN_BRACK CLOSE_BRACK
+	{
+		$$.expr = &ast.ExprList{
+			Elements: []interfaces.Expr{},
+		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
+	}
+	// `[42, 0, -13]`
+|	OPEN_BRACK list_single_elements CLOSE_BRACK
+	{
 		$$.expr = &ast.ExprList{
 			Elements: $2.exprs,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 ;
-list_elements:
+list_single_elements:
+	list_single_elements COMMA list_single_element
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.exprs = append($1.exprs, $3.expr)
+	}
+|	list_single_element
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.exprs = append($$.exprs, $1.expr)
+	}
+;
+list_single_element:
+	expr
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.expr = $1.expr
+	}
+;
+list_multi:
+	// `[
+	//	42,
+	//	0,
+	//	-13,
+	// ]`
+	OPEN_BRACK NEWLINE list_multi_elements CLOSE_BRACK
+	{
+		$$.expr = &ast.ExprList{
+			Elements: $3.exprs,
+		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
+	}
+;
+list_multi_elements:
 	/* end of list */
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.exprs = []interfaces.Expr{}
 	}
-|	list_elements list_element
+|	list_multi_elements list_multi_element
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.exprs = append($1.exprs, $2.expr)
 	}
+	// Skip over blank lines between elements.
+|	list_multi_elements NEWLINE
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.exprs = $1.exprs
+	}
 ;
-list_element:
-	expr COMMA
+list_multi_element:
+	expr COMMA NEWLINE
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.expr = $1.expr
 	}
 ;
 map:
-	// `{"hello" => "there", "world" => "big",}`
-	OPEN_CURLY map_kvs CLOSE_CURLY
+	map_single
 	{
 		posLast(yylex, yyDollar) // our pos
+		$$.expr = $1.expr
+	}
+|	map_multi
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.expr = $1.expr
+	}
+;
+map_single:
+	OPEN_CURLY CLOSE_CURLY
+	{
+		$$.expr = &ast.ExprMap{
+			KVs: []*ast.ExprMapKV{},
+		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
+	}
+	// `{"hello" => "there", "world" => "big"}`
+|	OPEN_CURLY map_single_kvs CLOSE_CURLY
+	{
 		$$.expr = &ast.ExprMap{
 			KVs: $2.mapKVs,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 ;
-map_kvs:
+map_single_kvs:
+	map_single_kvs COMMA map_single_kv
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.mapKVs = append($1.mapKVs, $3.mapKV)
+	}
+|	map_single_kv
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.mapKVs = append($$.mapKVs, $1.mapKV)
+	}
+;
+map_single_kv:
+	expr ROCKET expr
+	{
+		$$.mapKV = &ast.ExprMapKV{
+			Key: $1.expr,
+			Val: $3.expr,
+		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.mapKV)
+	}
+;
+map_multi:
+	// `{
+	//	"hello" => "there",
+	//	"world" => "big",
+	// }`
+	OPEN_CURLY NEWLINE map_multi_kvs CLOSE_CURLY
+	{
+		$$.expr = &ast.ExprMap{
+			KVs: $3.mapKVs,
+		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
+	}
+;
+map_multi_kvs:
 	/* end of list */
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.mapKVs = []*ast.ExprMapKV{}
 	}
-|	map_kvs map_kv
+|	map_multi_kvs map_multi_kv
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.mapKVs = append($1.mapKVs, $2.mapKV)
 	}
+	// Skip over blank lines between kvs.
+|	map_multi_kvs NEWLINE
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.mapKVs = $1.mapKVs
+	}
 ;
-map_kv:
-	expr ROCKET expr COMMA
+map_multi_kv:
+	expr ROCKET expr COMMA NEWLINE
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.mapKV = &ast.ExprMapKV{
 			Key: $1.expr,
 			Val: $3.expr,
 		}
+		// We locate against the comma and not the trailing NEWLINE,
+		// because the lexer stores the end of a newline token as the
+		// start of the next row, and that would spill this end position
+		// onto the next line.
+		locateOnly($1, $4, $$.mapKV)
 	}
 ;
 struct:
-	// `struct{answer => 0, truth => false, hello => "world",}`
-	STRUCT_IDENTIFIER OPEN_CURLY struct_fields CLOSE_CURLY
+	struct_single
 	{
 		posLast(yylex, yyDollar) // our pos
+		$$.expr = $1.expr
+	}
+|	struct_multi
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.expr = $1.expr
+	}
+;
+struct_single:
+	STRUCT_IDENTIFIER OPEN_CURLY CLOSE_CURLY
+	{
+		$$.expr = &ast.ExprStruct{
+			Fields: []*ast.ExprStructField{},
+		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
+	}
+	// `struct{answer => 0, truth => false, hello => "world"}`
+|	STRUCT_IDENTIFIER OPEN_CURLY struct_single_fields CLOSE_CURLY
+	{
 		$$.expr = &ast.ExprStruct{
 			Fields: $3.structFields,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 ;
-struct_fields:
+struct_single_fields:
+	struct_single_fields COMMA struct_single_field
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.structFields = append($1.structFields, $3.structField)
+	}
+|	struct_single_field
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.structFields = append($$.structFields, $1.structField)
+	}
+;
+struct_single_field:
+	IDENTIFIER ROCKET expr
+	{
+		$$.structField = &ast.ExprStructField{
+			Name:  $1.str,
+			Value: $3.expr,
+		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.structField)
+	}
+;
+struct_multi:
+	// `struct{
+	//	answer => 0,
+	//	truth => false,
+	//	hello => "world"
+	//}`
+	STRUCT_IDENTIFIER OPEN_CURLY NEWLINE struct_multi_fields CLOSE_CURLY
+	{
+		$$.expr = &ast.ExprStruct{
+			Fields: $4.structFields,
+		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
+	}
+;
+struct_multi_fields:
 	/* end of list */
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.structFields = []*ast.ExprStructField{}
 	}
-|	struct_fields struct_field
+|	struct_multi_fields struct_multi_field
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.structFields = append($1.structFields, $2.structField)
 	}
+	// Skip over blank lines between fields.
+|	struct_multi_fields NEWLINE
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.structFields = $1.structFields
+	}
 ;
-struct_field:
-	IDENTIFIER ROCKET expr COMMA
+struct_multi_field:
+	IDENTIFIER ROCKET expr COMMA NEWLINE
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.structField = &ast.ExprStructField{
 			Name:  $1.str,
 			Value: $3.expr,
 		}
+		// We locate against the comma and not the trailing NEWLINE,
+		// because the lexer stores the end of a newline token as the
+		// start of the next row, and that would spill this end position
+		// onto the next line.
+		locateOnly($1, $4, $$.structField)
 	}
 ;
 call:
 	// fmt.printf(...)
-	dotted_identifier OPEN_PAREN call_args CLOSE_PAREN
+	// iter.map(...)
+	dotted_identifier OPEN_PAREN callargs CLOSE_PAREN
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.expr = &ast.ExprCall{
 			Name: $1.str,
 			Args: $3.exprs,
 			//Var: false, // default
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 	// calling a function that's stored in a variable (a lambda)
 	// `$foo(4, "hey")` # call function value
-|	VAR_IDENTIFIER OPEN_PAREN call_args CLOSE_PAREN
+|	dotted_var_identifier OPEN_PAREN callargs CLOSE_PAREN
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.expr = &ast.ExprCall{
 			Name: $1.str,
 			Args: $3.exprs,
@@ -520,26 +872,36 @@ call:
 			// prefix to the Name, but I felt this was more elegant.
 			Var: true, // lambda
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
+	}
+	// calling an inline function
+|	func OPEN_PAREN callargs CLOSE_PAREN
+	{
+		$$.expr = &ast.ExprCall{
+			Name: "", // anonymous!
+			Args: $3.exprs,
+			Anon: $1.expr,
+		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 |	expr PLUS expr
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.expr = &ast.ExprCall{
-			Name: funcs.OperatorFuncName,
+			Name: operators.OperatorFuncName,
 			Args: []interfaces.Expr{
-				&ast.ExprStr{          // operator first
-					V: $2.str,     // for PLUS this is a `+` character
+				&ast.ExprStr{      // operator first
+					V: $2.str, // for PLUS this is a `+` character
 				},
 				$1.expr,
 				$3.expr,
 			},
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 |	expr MINUS expr
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.expr = &ast.ExprCall{
-			Name: funcs.OperatorFuncName,
+			Name: operators.OperatorFuncName,
 			Args: []interfaces.Expr{
 				&ast.ExprStr{ // operator first
 					V: $2.str,
@@ -548,12 +910,12 @@ call:
 				$3.expr,
 			},
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 |	expr MULTIPLY expr
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.expr = &ast.ExprCall{
-			Name: funcs.OperatorFuncName,
+			Name: operators.OperatorFuncName,
 			Args: []interfaces.Expr{
 				&ast.ExprStr{ // operator first
 					V: $2.str,
@@ -562,12 +924,12 @@ call:
 				$3.expr,
 			},
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 |	expr DIVIDE expr
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.expr = &ast.ExprCall{
-			Name: funcs.OperatorFuncName,
+			Name: operators.OperatorFuncName,
 			Args: []interfaces.Expr{
 				&ast.ExprStr{ // operator first
 					V: $2.str,
@@ -576,12 +938,12 @@ call:
 				$3.expr,
 			},
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 |	expr EQ expr
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.expr = &ast.ExprCall{
-			Name: funcs.OperatorFuncName,
+			Name: operators.OperatorFuncName,
 			Args: []interfaces.Expr{
 				&ast.ExprStr{ // operator first
 					V: $2.str,
@@ -590,12 +952,12 @@ call:
 				$3.expr,
 			},
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 |	expr NEQ expr
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.expr = &ast.ExprCall{
-			Name: funcs.OperatorFuncName,
+			Name: operators.OperatorFuncName,
 			Args: []interfaces.Expr{
 				&ast.ExprStr{ // operator first
 					V: $2.str,
@@ -604,12 +966,12 @@ call:
 				$3.expr,
 			},
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 |	expr LT expr
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.expr = &ast.ExprCall{
-			Name: funcs.OperatorFuncName,
+			Name: operators.OperatorFuncName,
 			Args: []interfaces.Expr{
 				&ast.ExprStr{ // operator first
 					V: $2.str,
@@ -618,12 +980,12 @@ call:
 				$3.expr,
 			},
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 |	expr GT expr
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.expr = &ast.ExprCall{
-			Name: funcs.OperatorFuncName,
+			Name: operators.OperatorFuncName,
 			Args: []interfaces.Expr{
 				&ast.ExprStr{ // operator first
 					V: $2.str,
@@ -632,12 +994,12 @@ call:
 				$3.expr,
 			},
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 |	expr LTE expr
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.expr = &ast.ExprCall{
-			Name: funcs.OperatorFuncName,
+			Name: operators.OperatorFuncName,
 			Args: []interfaces.Expr{
 				&ast.ExprStr{ // operator first
 					V: $2.str,
@@ -646,12 +1008,12 @@ call:
 				$3.expr,
 			},
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 |	expr GTE expr
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.expr = &ast.ExprCall{
-			Name: funcs.OperatorFuncName,
+			Name: operators.OperatorFuncName,
 			Args: []interfaces.Expr{
 				&ast.ExprStr{ // operator first
 					V: $2.str,
@@ -660,12 +1022,12 @@ call:
 				$3.expr,
 			},
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 |	expr AND expr
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.expr = &ast.ExprCall{
-			Name: funcs.OperatorFuncName,
+			Name: operators.OperatorFuncName,
 			Args: []interfaces.Expr{
 				&ast.ExprStr{ // operator first
 					V: $2.str,
@@ -674,12 +1036,12 @@ call:
 				$3.expr,
 			},
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 |	expr OR expr
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.expr = &ast.ExprCall{
-			Name: funcs.OperatorFuncName,
+			Name: operators.OperatorFuncName,
 			Args: []interfaces.Expr{
 				&ast.ExprStr{ // operator first
 					V: $2.str,
@@ -688,12 +1050,12 @@ call:
 				$3.expr,
 			},
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 |	NOT expr
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.expr = &ast.ExprCall{
-			Name: funcs.OperatorFuncName,
+			Name: operators.OperatorFuncName,
 			Args: []interfaces.Expr{
 				&ast.ExprStr{ // operator first
 					V: $1.str,
@@ -701,44 +1063,72 @@ call:
 				$2.expr,
 			},
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
-|	VAR_IDENTIFIER_HX
-	// get the N-th historical value, eg: $foo{3} is equivalent to: history($foo, 3)
+	// lookup an index in a list or a key in a map
+	// lookup($foo, $key)
+	// `$foo[$key]` // no default specifier
+|	expr OPEN_BRACK expr CLOSE_BRACK
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.expr = &ast.ExprCall{
-			Name: funcs.HistoryFuncName,
+			Name: funcs.LookupFuncName,
 			Args: []interfaces.Expr{
-				&ast.ExprVar{
-					Name: $1.str,
-				},
-				&ast.ExprInt{
-					V: $1.int,
+				$1.expr, // the list or map
+				$3.expr, // the index or key is an expr
+				//$6.expr, // the default
+			},
+		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
+	}
+	// lookup a field in a struct
+	// _struct_lookup($foo, "field")
+	// `$foo->field`
+|	expr ARROW IDENTIFIER %prec STRUCT_LOOKUP
+	{
+		$$.expr = &ast.ExprCall{
+			Name: funcs.StructLookupFuncName,
+			Args: []interfaces.Expr{
+				$1.expr, // the struct
+				&ast.ExprStr{
+					V: $3.str, // the field is always an str
 				},
 			},
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
-// TODO: fix conflicts with this method, and replace the above VAR_IDENTIFIER_HX
-// TODO: allow $pkg.ns.foo{4}, instead of $foo = $pkg.ns.foo ; $foo{4}
-// TODO: use this: dotted_var_identifier OPEN_BRACK INTEGER CLOSE_BRACK instead?
-//|	dotted_var_identifier OPEN_CURLY INTEGER CLOSE_CURLY
-//	{
-//		posLast(yylex, yyDollar) // our pos
-//		$$.expr = &ast.ExprCall{
-//			Name: funcs.HistoryFuncName,
-//			Args: []interfaces.Expr{
-//				&ast.ExprVar{
-//					Name: $1.str,
-//				},
-//				&ast.ExprInt{
-//					V: $3.int,
-//				},
-//			},
-//		}
-//	}
+	// lookup a field in a struct with a default
+	// _struct_lookup_optional($foo, "field", "default")
+	// `$foo->field <|> "default"`
+	// NOTE: This is different from the generic except operator below, since
+	// whether the field is present or not is determined statically from the
+	// struct type at compile time, it is not a runtime error to catch.
+|	expr ARROW IDENTIFIER EXCEPT expr
+	{
+		$$.expr = &ast.ExprCall{
+			Name: funcs.StructLookupOptionalFuncName,
+			Args: []interfaces.Expr{
+				$1.expr, // the struct
+				&ast.ExprStr{
+					V: $3.str, // the field is always an str
+				},
+				$5.expr, // the default
+			},
+		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
+	}
+	// the except operator provides a fallback value if an expression errors
+	// `expr <|> $fallback`
+	// eg: `list.lookup($list, 42) <|> "default"`
+|	expr EXCEPT expr
+	{
+		$$.expr = &ast.ExprExcept{
+			Expr:   $1.expr, // the main expression
+			Except: $3.expr, // the fallback if the main expr errors
+		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
+	}
 |	expr IN expr
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.expr = &ast.ExprCall{
 			Name: funcs.ContainsFuncName,
 			Args: []interfaces.Expr{
@@ -746,35 +1136,98 @@ call:
 				$3.expr,
 			},
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 ;
 // list order gets us the position of the arg, but named params would work too!
 // this is also used by the include statement when the called class uses args!
-call_args:
+callargs:
 	/* end of list */
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.exprs = []interfaces.Expr{}
 	}
+|	callargs_single
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.exprs = $1.exprs
+	}
+|	callargs_multi
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.exprs = $1.exprs
+	}
+;
+callargs_single:
+	// `42, "hello", true`
+	callargs_single_args
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.exprs = $1.exprs
+	}
+;
+callargs_single_args:
 	// seems that "left recursion" works here... thanks parser generator!
-|	call_args COMMA expr
+	callargs_single_args COMMA callargs_single_arg
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.exprs = append($1.exprs, $3.expr)
 	}
-|	expr
+|	callargs_single_arg
 	{
 		posLast(yylex, yyDollar) // our pos
-		$$.exprs = append([]interfaces.Expr{}, $1.expr)
+		$$.exprs = append($$.exprs, $1.expr)
+	}
+;
+callargs_single_arg:
+	expr
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.expr = $1.expr
+	}
+;
+callargs_multi:
+	// 42,
+	// "hello",
+	// true,
+	NEWLINE callargs_multi_args
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.exprs = $2.exprs
+	}
+;
+callargs_multi_args:
+	/* end of list */
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.exprs = []interfaces.Expr{}
+	}
+|	callargs_multi_args callargs_multi_arg
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.exprs = append($1.exprs, $2.expr)
+	}
+	// Skip over blank lines between args.
+|	callargs_multi_args NEWLINE
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.exprs = $1.exprs
+	}
+;
+callargs_multi_arg:
+	expr COMMA NEWLINE
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.expr = $1.expr
 	}
 ;
 var:
 	dotted_var_identifier
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.expr = &ast.ExprVar{
 			Name: $1.str,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 ;
 func:
@@ -782,23 +1235,30 @@ func:
 	// `func() { <expr> }`
 	// `func(<arg>) { <expr> }`
 	// `func(<arg>, <arg>) { <expr> }`
-	FUNC_IDENTIFIER OPEN_PAREN args CLOSE_PAREN OPEN_CURLY expr CLOSE_CURLY
+	FUNC_IDENTIFIER OPEN_PAREN args CLOSE_PAREN OPEN_CURLY opt_newlines expr opt_newlines CLOSE_CURLY
 	{
-		posLast(yylex, yyDollar) // our pos
+		body := &ast.ExprBlock{
+			Inner: $7.expr,
+		}
+		relocate($5, $9, body) // the block spans the braces
 		$$.expr = &ast.ExprFunc{
 			Args: $3.args,
 			//Return: nil,
-			Body: $6.expr,
+			Body: body,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 	// `func(...) <type> { <expr> }`
-|	FUNC_IDENTIFIER OPEN_PAREN args CLOSE_PAREN type OPEN_CURLY expr CLOSE_CURLY
+|	FUNC_IDENTIFIER OPEN_PAREN args CLOSE_PAREN type OPEN_CURLY opt_newlines expr opt_newlines CLOSE_CURLY
 	{
-		posLast(yylex, yyDollar) // our pos
+		body := &ast.ExprBlock{
+			Inner: $8.expr,
+		}
+		relocate($6, $10, body) // the block spans the braces
 		$$.expr = &ast.ExprFunc{
 			Args:   $3.args,
 			Return: $5.typ, // return type is known
-			Body:   $7.expr,
+			Body:   body,
 		}
 		isFullyTyped := $5.typ != nil // true if set
 		m := make(map[string]*types.Type)
@@ -824,58 +1284,125 @@ func:
 				yylex.Error(fmt.Sprintf("%s: %+v", ErrParseSetType, err))
 			}
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 ;
+// list order gets us the position of the arg, but named params would work too!
+// this is used by function definitions (named and lambda) and class definitions.
 args:
 	/* end of list */
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.args = []*interfaces.Arg{}
 	}
-|	args COMMA arg
+|	args_single
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = $1.args
+	}
+|	args_multi
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = $1.args
+	}
+;
+args_single:
+	// `$a, $b, $c`
+	args_single_list
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = $1.args
+	}
+;
+args_single_list:
+	args_single_list COMMA args_single_arg
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.args = append($1.args, $3.arg)
 	}
-|	arg
+|	args_single_arg
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.args = append([]*interfaces.Arg{}, $1.arg)
 	}
 ;
+args_single_arg:
+	arg
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.arg = $1.arg
+	}
+;
+args_multi:
+	// $a,
+	// $b,
+	// $c,
+	NEWLINE args_multi_list
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = $2.args
+	}
+;
+args_multi_list:
+	/* end of list */
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = []*interfaces.Arg{}
+	}
+|	args_multi_list args_multi_arg
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = append($1.args, $2.arg)
+	}
+	// Skip over blank lines between args.
+|	args_multi_list NEWLINE
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = $1.args
+	}
+;
+args_multi_arg:
+	arg COMMA NEWLINE
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.arg = $1.arg
+	}
+;
 arg:
 	// `$x`
-	VAR_IDENTIFIER
+	var_identifier
 	{
 		$$.arg = &interfaces.Arg{
 			Name: $1.str,
 		}
+		locateOnly($1, yyDollar[len(yyDollar)-1], $$.arg)
 	}
 	// `$x <type>`
-|	VAR_IDENTIFIER type
+|	var_identifier type
 	{
 		$$.arg = &interfaces.Arg{
 			Name: $1.str,
 			Type: $2.typ,
 		}
+		locateOnly($1, yyDollar[len(yyDollar)-1], $$.arg)
 	}
 ;
 bind:
 	// `$s = "hey"`
-	VAR_IDENTIFIER EQUALS expr
+	var_identifier EQUALS expr
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.stmt = &ast.StmtBind{
 			Ident: $1.str,
 			Value: $3.expr,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
 	}
 	// `$x bool = true`
 	// `$x int = if true { 42 } else { 13 }`
-|	VAR_IDENTIFIER type EQUALS expr
+|	var_identifier type EQUALS expr
 	{
-		posLast(yylex, yyDollar) // our pos
 		var expr interfaces.Expr = $4.expr
+		// XXX: We still need to do this for now it seems...
 		if err := expr.SetType($2.typ); err != nil {
 			// this will ultimately cause a parser error to occur...
 			yylex.Error(fmt.Sprintf("%s: %+v", ErrParseSetType, err))
@@ -883,15 +1410,91 @@ bind:
 		$$.stmt = &ast.StmtBind{
 			Ident: $1.str,
 			Value: expr,
+			Type:  $2.typ, // sam says add the type here instead...
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
+	}
+;
+panic:
+	// panic("some error")
+	// generates:
+	// `if panic("some error") {
+	//	_panic "_panic" {} # resource
+	//}`
+	PANIC_IDENTIFIER OPEN_PAREN callargs CLOSE_PAREN
+	{
+		funcName := $1.str // funcs.PanicFuncName
+		if len($3.exprs) == 2 {
+			funcName = funcs.PanicDebugFuncName
+		}
+		call := &ast.ExprCall{
+			Name: funcName, // the function name
+			Args: $3.exprs,
+			//Var: false, // default
+		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], call)
+		name := &ast.ExprStr{
+			V: $1.str, // any constant, non-empty name
+		}
+		res := &ast.StmtRes{
+			Kind:     interfaces.PanicResKind,
+			Name:     name,
+			Contents: []ast.StmtResContents{},
+		}
+		$$.stmt = &ast.StmtIf{
+			Condition:  call,
+			ThenBranch: res,
+			//ElseBranch: nil,
+		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
+	}
+;
+collect:
+	// `collect file "/tmp/hello" { ... }`
+	// `collect file ["/tmp/hello", ..., ...] { ... }`
+	// `collect file [struct{name => "/tmp/hello", host => "foo"}, ..., ...] { ... }`
+	COLLECT_IDENTIFIER resource
+	{
+		// A "collect" stmt is exactly a regular "res" statement, except
+		// it has the boolean "Collect" field set to true, and it also
+		// has a special "resource body" entry which accepts the special
+		// collected data from the function graph.
+		$$.stmt = $2.stmt // it's us now
+		kind := $2.stmt.(*ast.StmtRes).Kind
+		res := $$.stmt.(*ast.StmtRes)
+		res.Collect = true
+		// We are secretly adding a special field to the res contents,
+		// which receives all of the exported data so that we have it
+		// arrive in our function graph in the standard way. We'd need
+		// to have this data to be able to build the resources we want!
+		call := &ast.ExprCall{
+			// function name to lookup special values from that kind
+			Name: funcs.CollectFuncName,
+			Args: []interfaces.Expr{
+				&ast.ExprStr{      // magic operator first
+					V: kind,   // tell it what we're reading
+				},
+				// names to collect
+				// XXX: Can we copy the same AST nodes to here?
+				// XXX: Do I need to run .Copy() on them ?
+				// str, []str, or []struct{name str; host str}
+				res.Name, // expr (hopefully one of those types)
+			},
+		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], call)
+		collect := &ast.StmtResCollect{ // special field
+			Kind:  kind, // might as well tell it directly
+			Value: call,
+		}
+		res.Contents = append(res.Contents, collect)
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
 	}
 ;
 /* TODO: do we want to include this?
 // resource bind
 rbind:
-	VAR_IDENTIFIER EQUALS resource
+	var_identifier EQUALS resource
 	{
-		posLast(yylex, yyDollar) // our pos
 		// XXX: this kind of bind is different than the others, because
 		// it can only really be used for send->recv stuff, eg:
 		// foo.SomeString -> bar.SomeOtherString
@@ -899,30 +1502,20 @@ rbind:
 			Ident: $1.str,
 			Value: $3.stmt,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.expr)
 	}
 ;
 */
 resource:
 	// `file "/tmp/hello" { ... }` or `aws:ec2 "/tmp/hello" { ... }`
-	RES_IDENTIFIER expr OPEN_CURLY resource_body CLOSE_CURLY
+	colon_identifier expr OPEN_CURLY resource_body CLOSE_CURLY
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.stmt = &ast.StmtRes{
 			Kind:     $1.str,
 			Name:     $2.expr,
 			Contents: $4.resContents,
 		}
-	}
-	// note: this is a simplified version of the above if the lexer picks it
-	// note: must not include underscores, but that is checked after parsing
-|	IDENTIFIER expr OPEN_CURLY resource_body CLOSE_CURLY
-	{
-		posLast(yylex, yyDollar) // our pos
-		$$.stmt = &ast.StmtRes{
-			Kind:     $1.str,
-			Name:     $2.expr,
-			Contents: $4.resContents,
-		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
 	}
 ;
 resource_body:
@@ -971,57 +1564,62 @@ resource_body:
 		posLast(yylex, yyDollar) // our pos
 		$$.resContents = append($1.resContents, $2.resMeta)
 	}
+// Skip over bare newlines between resource body elements.
+|	resource_body NEWLINE
+	{
+		// newline!
+		$$.resContents = $1.resContents
+	}
 ;
 resource_field:
 	IDENTIFIER ROCKET expr COMMA
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.resField = &ast.StmtResField{
 			Field: $1.str,
 			Value: $3.expr,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.resField)
 	}
 ;
 conditional_resource_field:
 	// content => $present ?: "hello",
 	IDENTIFIER ROCKET expr ELVIS expr COMMA
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.resField = &ast.StmtResField{
 			Field:     $1.str,
 			Value:     $5.expr,
 			Condition: $3.expr,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.resField)
 	}
 ;
 resource_edge:
 	// Before => Test["t1"],
 	CAPITALIZED_IDENTIFIER ROCKET edge_half COMMA
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.resEdge = &ast.StmtResEdge{
 			Property: $1.str,
 			EdgeHalf: $3.edgeHalf,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.resEdge)
 	}
 ;
 conditional_resource_edge:
 	// Before => $present ?: Test["t1"],
 	CAPITALIZED_IDENTIFIER ROCKET expr ELVIS edge_half COMMA
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.resEdge = &ast.StmtResEdge{
 			Property:  $1.str,
 			EdgeHalf:  $5.edgeHalf,
 			Condition: $3.expr,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.resEdge)
 	}
 ;
 resource_meta:
 	// Meta:noop => true,
 	CAPITALIZED_IDENTIFIER COLON IDENTIFIER ROCKET expr COMMA
 	{
-		posLast(yylex, yyDollar) // our pos
 		if strings.ToLower($1.str) != strings.ToLower(ast.MetaField) {
 			// this will ultimately cause a parser error to occur...
 			yylex.Error(fmt.Sprintf("%s: %s", ErrParseResFieldInvalid, $1.str))
@@ -1030,6 +1628,7 @@ resource_meta:
 			Property: $3.str,
 			MetaExpr: $5.expr,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.resMeta)
 	}
 ;
 conditional_resource_meta:
@@ -1046,13 +1645,13 @@ conditional_resource_meta:
 			MetaExpr:  $7.expr,
 			Condition: $5.expr,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.resMeta)
 	}
 ;
 resource_meta_struct:
-	// Meta => struct{meta => true, retry => 3,},
+	// Meta => struct{meta => true, retry => 3},
 	CAPITALIZED_IDENTIFIER ROCKET expr COMMA
 	{
-		posLast(yylex, yyDollar) // our pos
 		if strings.ToLower($1.str) != strings.ToLower(ast.MetaField) {
 			// this will ultimately cause a parser error to occur...
 			yylex.Error(fmt.Sprintf("%s: %s", ErrParseResFieldInvalid, $1.str))
@@ -1061,13 +1660,13 @@ resource_meta_struct:
 			Property: $1.str,
 			MetaExpr: $3.expr,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.resMeta)
 	}
 ;
 conditional_resource_meta_struct:
-	// Meta => $present ?: struct{poll => 60, sema => ["foo:1", "bar:3",],},
+	// Meta => $present ?: struct{poll => 60, sema => ["foo:1", "bar:3"]},
 	CAPITALIZED_IDENTIFIER ROCKET expr ELVIS expr COMMA
 	{
-		posLast(yylex, yyDollar) // our pos
 		if strings.ToLower($1.str) != strings.ToLower(ast.MetaField) {
 			// this will ultimately cause a parser error to occur...
 			yylex.Error(fmt.Sprintf("%s: %s", ErrParseResFieldInvalid, $1.str))
@@ -1077,6 +1676,7 @@ conditional_resource_meta_struct:
 			MetaExpr:  $5.expr,
 			Condition: $3.expr,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.resMeta)
 	}
 ;
 edge:
@@ -1085,23 +1685,27 @@ edge:
 	// Test["t1"] -> Test["t2"] -> Test["t3"] # chain or pair
 	edge_half_list
 	{
-		posLast(yylex, yyDollar) // our pos
-		$$.stmt = &ast.StmtEdge{
+		edge := &ast.StmtEdge{
 			EdgeHalfList: $1.edgeHalfList,
 			//Notify: false, // unused here
 		}
+		$$.stmt = edge
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
+		locateEdge(edge) // span the full edge, not just its first half
 	}
 	// Test["t1"].foo_send -> Test["t2"].blah_recv # send/recv
 |	edge_half_sendrecv ARROW edge_half_sendrecv
 	{
-		posLast(yylex, yyDollar) // our pos
-		$$.stmt = &ast.StmtEdge{
+		edge := &ast.StmtEdge{
 			EdgeHalfList: []*ast.StmtEdgeHalf{
 				$1.edgeHalf,
 				$3.edgeHalf,
 			},
 			//Notify: false, // unused here, it is implied (i think)
 		}
+		$$.stmt = edge
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.stmt)
+		locateEdge(edge) // span the full edge, not just its first half
 	}
 ;
 edge_half_list:
@@ -1120,24 +1724,24 @@ edge_half:
 	// eg: Test["t1"]
 	capitalized_res_identifier OPEN_BRACK expr CLOSE_BRACK
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.edgeHalf = &ast.StmtEdgeHalf{
 			Kind: $1.str,
 			Name: $3.expr,
 			//SendRecv: "", // unused
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.edgeHalf)
 	}
 ;
 edge_half_sendrecv:
 	// eg: Test["t1"].foo_send
 	capitalized_res_identifier OPEN_BRACK expr CLOSE_BRACK DOT IDENTIFIER
 	{
-		posLast(yylex, yyDollar) // our pos
 		$$.edgeHalf = &ast.StmtEdgeHalf{
 			Kind: $1.str,
 			Name: $3.expr,
 			SendRecv: $6.str,
 		}
+		locate(yylex, $1, yyDollar[len(yyDollar)-1], $$.edgeHalf)
 	}
 ;
 type:
@@ -1173,8 +1777,14 @@ type:
 		posLast(yylex, yyDollar) // our pos
 		$$.typ = types.NewType(fmt.Sprintf("map{%s: %s}", $3.typ.String(), $5.typ.String()))
 	}
+|	STRUCT_IDENTIFIER OPEN_CURLY CLOSE_CURLY
+	// struct: struct{}
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.typ = types.NewType(fmt.Sprintf("%s{}", $1.str))
+	}
 |	STRUCT_IDENTIFIER OPEN_CURLY type_struct_fields CLOSE_CURLY
-	// struct: struct{} or struct{a bool} or struct{a bool; bb int}
+	// struct: struct{a bool} or struct{a bool; bb int}
 	{
 		posLast(yylex, yyDollar) // our pos
 
@@ -1214,7 +1824,13 @@ type:
 			}
 			name := a.Name
 			if name == "" {
-				name = util.NumToAlpha(i) // if unspecified...
+				// Digit names can't collide with user-written
+				// names (identifiers start with a letter) and
+				// match the types.NewType convention, so the
+				// formatter can tell them apart and omit them.
+				// We are storing the digit as a "hack" to
+				// represent the "name was omitted here" signal.
+				name = strconv.Itoa(i) // if unspecified...
 			}
 			if util.StrInList(name, ord) {
 				// duplicate arg name used
@@ -1241,12 +1857,7 @@ type:
 	}
 ;
 type_struct_fields:
-	/* end of list */
-	{
-		posLast(yylex, yyDollar) // our pos
-		$$.args = []*interfaces.Arg{}
-	}
-|	type_struct_fields SEMICOLON type_struct_field
+	type_struct_fields SEMICOLON type_struct_field
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.args = append($1.args, $3.arg)
@@ -1261,28 +1872,92 @@ type_struct_field:
 	IDENTIFIER type
 	{
 		posLast(yylex, yyDollar) // our pos
-		$$.arg = &interfaces.Arg{ // re-use the Arg struct
+		$$.arg = &interfaces.Arg{ // reuse the Arg struct
 			Name: $1.str,
 			Type: $2.typ,
 		}
 	}
 ;
+// type_func_args is the arg list inside a function type signature, e.g.
+// `func(int, str) str` or `func(a int, b str) str`. Same single/multi split
+// pattern as `args`: single line forbids a trailing comma, multi line
+// requires one after every arg (including the last).
 type_func_args:
 	/* end of list */
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.args = []*interfaces.Arg{}
 	}
-|	type_func_args COMMA type_func_arg
+|	type_func_args_single
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = $1.args
+	}
+|	type_func_args_multi
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = $1.args
+	}
+;
+type_func_args_single:
+	// `int, str` or `a int, b str`
+	type_func_args_single_list
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = $1.args
+	}
+;
+type_func_args_single_list:
+	type_func_args_single_list COMMA type_func_args_single_arg
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.args = append($1.args, $3.arg)
 	}
-|	type_func_arg
+|	type_func_args_single_arg
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.args = append([]*interfaces.Arg{}, $1.arg)
-		//$$.args = []*interfaces.Arg{$1.arg} // TODO: is this equivalent?
+	}
+;
+type_func_args_single_arg:
+	type_func_arg
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.arg = $1.arg
+	}
+;
+type_func_args_multi:
+	// int,
+	// str,
+	NEWLINE type_func_args_multi_list
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = $2.args
+	}
+;
+type_func_args_multi_list:
+	/* end of list */
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = []*interfaces.Arg{}
+	}
+|	type_func_args_multi_list type_func_args_multi_arg
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = append($1.args, $2.arg)
+	}
+	// Skip over blank lines between args.
+|	type_func_args_multi_list NEWLINE
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = $1.args
+	}
+;
+type_func_args_multi_arg:
+	type_func_arg COMMA NEWLINE
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.arg = $1.arg
 	}
 ;
 type_func_arg:
@@ -1295,7 +1970,7 @@ type_func_arg:
 	}
 	// `$x <type>`
 	// XXX: should we allow specifying the arg name here?
-|	VAR_IDENTIFIER type
+|	var_identifier type
 	{
 		$$.arg = &interfaces.Arg{
 			Name: $1.str,
@@ -1303,13 +1978,56 @@ type_func_arg:
 		}
 	}
 ;
-dotted_identifier:
+undotted_identifier:
 	IDENTIFIER
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.str = $1.str
 	}
-|	dotted_identifier DOT IDENTIFIER
+	// a function could be named map()!
+|	MAP_IDENTIFIER
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.str = $1.str
+	}
+	// a function could be named collect.res()!
+|	COLLECT_IDENTIFIER
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.str = $1.str
+	}
+;
+var_identifier:
+	// eg: $ foo (dollar prefix + identifier)
+	DOLLAR undotted_identifier
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.str = $2.str // don't include the leading $
+		$$.endRow = $2.endRow // propagate end position from identifier
+		$$.endCol = $2.endCol
+	}
+;
+colon_identifier:
+	// eg: `foo`
+	IDENTIFIER
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.str = $1.str
+	}
+	// eg: `foo:bar` (used in `docker:image` or `class base:inner:deeper`)
+|	colon_identifier COLON IDENTIFIER
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.str = $1.str + $2.str + $3.str
+	}
+;
+dotted_identifier:
+	undotted_identifier
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.str = $1.str
+	}
+|	dotted_identifier DOT undotted_identifier
 	{
 		posLast(yylex, yyDollar) // our pos
 		$$.str = $1.str + interfaces.ModuleSep + $3.str
@@ -1317,23 +2035,13 @@ dotted_identifier:
 ;
 // there are different ways the lexer/parser might choose to represent this...
 dotted_var_identifier:
-	// eg: $foo (no dots)
-	VAR_IDENTIFIER
-	{
-		posLast(yylex, yyDollar) // our pos
-		$$.str = $1.str
-	}
-	// eg: $foo . bar.baz (identifier + dotted identifier)
-|	VAR_IDENTIFIER DOT dotted_identifier
-	{
-		posLast(yylex, yyDollar) // our pos
-		$$.str = $1.str + interfaces.ModuleSep + $3.str
-	}
 	// eg: $ foo.bar.baz (dollar prefix + dotted identifier)
-|	DOLLAR dotted_identifier
+	DOLLAR dotted_identifier
 	{
 		posLast(yylex, yyDollar) // our pos
-		$$.str = $2.str
+		$$.str = $2.str // don't include the leading $
+		$$.endRow = $2.endRow // propagate end position from identifier
+		$$.endCol = $2.endCol
 	}
 ;
 capitalized_res_identifier:
@@ -1342,10 +2050,24 @@ capitalized_res_identifier:
 		posLast(yylex, yyDollar) // our pos
 		$$.str = $1.str
 	}
-|	capitalized_res_identifier COLON IDENTIFIER
+|	capitalized_res_identifier COLON CAPITALIZED_IDENTIFIER
 	{
 		posLast(yylex, yyDollar) // our pos
-		$$.str = $1.str + ":" + $3.str
+		$$.str = $1.str + $2.str + $3.str
+	}
+;
+// opt_newlines consumes zero or more NEWLINE tokens and produces nothing. It is
+// used to allow optional newlines around an expr inside curly brace constructs
+// (eg: lambda bodies, named func bodies, and if-expression branches) so that
+// the same rule can accept both single line and multi line forms.
+opt_newlines:
+	/* empty */
+	{
+		// no newline
+	}
+|	opt_newlines NEWLINE
+	{
+		// newline!
 	}
 ;
 %%
@@ -1361,17 +2083,63 @@ func pos(y yyLexer, dollar yySymType) {
 	return
 }
 
+// posLast runs pos on the last token of the current stmt/expr.
+func posLast(y yyLexer, dollars []yySymType) {
+	// pick the last token in the set matched by the parser
+	pos(y, dollars[len(dollars)-1]) // our pos
+}
+
+// locate should be called after creating AST nodes from lexer tokens to store
+// the positions of the involved tokens in the AST node.
+func locate(y yyLexer, first yySymType, last yySymType, node interface{}) {
+	pos(y, last)
+	// Only run Locate on nodes that look like they have not received
+	// locations yet otherwise the parser will come back and overwrite them
+	// with invalid ending positions.
+	locateOnly(first, last, node)
+}
+
+// locateOnly is like locate, but it doesn't update the row/col position state
+// that the error messages use, so that storing positions on small nodes can't
+// change any of the reported error positions.
+func locateOnly(first yySymType, last yySymType, node interface{}) {
+	if pn, ok := node.(interfaces.PositionableNode); ok && !pn.IsSet() {
+		//pn.Locate(first.row, first.col, last.endRow, last.endCol)
+		relocate(first, last, node)
+	}
+}
+
+// relocate is like locateOnly, but it overwrites any previously stored
+// position. It is used by rules which wrap a curly brace region around an
+// already located node, so that the node's position becomes the exact span of
+// the region, brace to brace, which tools such as the code formatter rely on.
+func relocate(first yySymType, last yySymType, node interface{}) {
+	if pn, ok := node.(interfaces.PositionableNode); ok {
+		//fmt.Printf("LOCATE(%v): %v, %v, %v, %v\n", node, first.row, first.col, last.endRow, last.endCol)
+		pn.Locate(first.row, first.col, last.endRow, last.endCol)
+	}
+}
+
+// locateEdge stamps an StmtEdge's position to the exact span of its edge
+// halves. The edge grammar's trailing symbol is a non-terminal (an edge half or
+// list of them) whose parser symbol only carries its first token's end, so a
+// plain locate would truncate the edge. The edge half nodes themselves are
+// located across their full extent, so we span from the first to the last.
+func locateEdge(edge *ast.StmtEdge) {
+	n := len(edge.EdgeHalfList)
+	if n == 0 {
+		return
+	}
+	startLine, startCol := edge.EdgeHalfList[0].Pos()
+	endLine, endCol := edge.EdgeHalfList[n-1].End()
+	edge.Locate(startLine, startCol, endLine, endCol)
+}
+
 // cast is used to pull out the parser run-specific struct we store our AST in.
 // this is usually called in the parser.
 func cast(y yyLexer) *lexParseAST {
 	x := y.(*Lexer).parseResult
 	return x.(*lexParseAST)
-}
-
-// postLast pulls out the "last token" and does a pos with that. This is a hack!
-func posLast(y yyLexer, dollars []yySymType) {
-	// pick the last token in the set matched by the parser
-	pos(y, dollars[len(dollars)-1]) // our pos
 }
 
 // cast is used to pull out the parser run-specific struct we store our AST in.
@@ -1384,8 +2152,17 @@ func (yylex *Lexer) cast() *lexParseAST {
 func (yylex *Lexer) pos(lval *yySymType) {
 	lval.row = yylex.Line()
 	lval.col = yylex.Column()
-	// TODO: we could use: `s := yylex.Text()` to calculate a delta length!
-	//log.Printf("lexer: %d x %d", lval.row, lval.col)
+
+	// use: `yylex.Text()` to calculate a delta length!
+	text := yylex.Text()
+	lines := strings.Split(text, "\n")
+
+	lval.endRow = lval.row + len(lines) - 1 // add delta lines
+	if len(lines) > 1 {
+		lval.endCol = len(lines[len(lines)-1])  // add pos of last line
+	} else {
+		lval.endCol = lval.col + len(text) // moved over this many chars
+	}
 }
 
 // Error is the error handler which gets called on a parsing error.
@@ -1396,20 +2173,30 @@ func (yylex *Lexer) Error(str string) {
 		// the lexer fails, because it ends up generating ERROR tokens,
 		// which most parsers usually don't match and store in the AST.
 		err := ErrParseError // TODO: add more specific types...
+		// By default, point at the lexer's current position, which is
+		// the offending lookahead token that triggered the error. This
+		// is accurate for the generic "unexpected token" errors.
+		row, col := yylex.Line(), yylex.Column()
 		if strings.HasSuffix(str, ErrParseAdditionalEquals.Error()) {
 			err = ErrParseAdditionalEquals
+			// These come from the %error patterns below, where the
+			// offending lookahead token is a trailing NEWLINE or
+			// CLOSE_CURLY. Point at the parser's last tracked
+			// position instead, which sits on the meaningful token
+			// (eg: the value that is missing a comma after it).
+			row, col = lp.row, lp.col
 		} else if strings.HasSuffix(str, ErrParseExpectingComma.Error()) {
 			err = ErrParseExpectingComma
+			row, col = lp.row, lp.col
 		} else if strings.HasPrefix(str, ErrParseSetType.Error()) {
 			err = ErrParseSetType
+			row, col = lp.row, lp.col
 		}
 		lp.parseErr = &LexParseErr{
 			Err: err,
 			Str: str,
-			// FIXME: get these values, by tracking pos in parser...
-			// FIXME: currently, the values we get are mostly wrong!
-			Row: lp.row, //lp.row[len(lp.row)-1],
-			Col: lp.col, //lp.col[len(lp.col)-1],
+			Row: row,
+			Col: col,
 		}
 	}
 }

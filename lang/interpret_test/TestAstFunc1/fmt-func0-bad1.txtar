@@ -1,0 +1,17 @@
+-- CONFIG --
+{
+	"nofmt": true
+}
+-- main.mcl --
+func foo($a, $b,) { # bad
+	$a + $b + "\n"
+}
+
+test "foo" {
+	comment => foo( # good
+		"a",
+		"b",
+	),
+}
+-- OUTPUT --
+# err: errLexParse: parser: `syntax error: unexpected CLOSE_PAREN, expecting DOLLAR`: /main.mcl @ 1:17-1:18

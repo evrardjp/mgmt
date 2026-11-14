@@ -1,0 +1,30 @@
+-- main.mcl --
+class c1($b) {
+	test "t1" {}
+	if $b {
+		test "t2" {}
+	} else {
+		test "t3" {}
+	}
+	$f1 = func() {
+		if $b {
+			"hello"
+		} else {
+			"goodbye"
+		}
+	}
+}
+include c1(true) as i1
+include c1(false) as i2
+
+$name1 = $i1.f1()
+$name2 = $i2.f1()
+
+test "${name1}" {}
+test "${name2}" {}
+-- OUTPUT --
+Vertex: test[hello]
+Vertex: test[goodbye]
+Vertex: test[t1]
+Vertex: test[t2]
+Vertex: test[t3]

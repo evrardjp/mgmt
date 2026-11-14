@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,17 +13,33 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
-// +build !root
+//go:build !root
 
 package util
 
 import (
+	"context"
 	"os/user"
 	"reflect"
 	"strconv"
 	"testing"
+
+	"github.com/purpleidea/mgmt/engine"
+	"github.com/purpleidea/mgmt/lang/types"
 )
 
 func TestUnknownGroup(t *testing.T) {
@@ -163,4 +179,70 @@ func TestStructTagToFieldName2(t *testing.T) {
 	}
 	t.Logf("got output: %+v", m)
 	t.Logf("got error: %+v", err)
+}
+
+type testEngineRes struct {
+	PublicProp1  string                      `lang:"PublicProp1" yaml:"PublicProp1"`
+	PublicProp2  map[string][]map[string]int `lang:"PublicProp2" yaml:"PublicProp2"`
+	privateProp1 bool
+	privateProp2 []int
+}
+
+func (obj *testEngineRes) CheckApply(context.Context, bool) (bool, error) { return false, nil }
+
+func (obj *testEngineRes) Cleanup() error { return nil }
+
+func (obj *testEngineRes) Cmp(engine.Res) error { return nil }
+
+func (obj *testEngineRes) Default() engine.Res { return obj }
+
+func (obj *testEngineRes) Init(*engine.Init) error { return nil }
+
+func (obj *testEngineRes) Kind() string { return "test-kind" }
+
+func (obj *testEngineRes) MetaParams() *engine.MetaParams { return nil }
+
+func (obj *testEngineRes) Name() string { return "test-name" }
+
+func (obj *testEngineRes) SetKind(string) {}
+
+func (obj *testEngineRes) SetMetaParams(*engine.MetaParams) {}
+
+func (obj *testEngineRes) SetName(string) {}
+
+func (obj *testEngineRes) String() string { return "test-string" }
+
+func (obj *testEngineRes) Validate() error { return nil }
+
+func (obj *testEngineRes) Watch(context.Context) error { return nil }
+
+func TestLangFieldNameToStructType(t *testing.T) {
+	k := "test-kind"
+
+	engine.RegisterResource(k, func() engine.Res { return &testEngineRes{} })
+	res, err := LangFieldNameToStructType(k)
+
+	expected := map[string]*types.Type{
+		"PublicProp1": types.TypeStr,
+		"PublicProp2": {
+			Kind: types.KindMap,
+			Key:  types.TypeStr,
+			Val: &types.Type{
+				Kind: types.KindList,
+				Val: &types.Type{
+					Kind: types.KindMap,
+					Key:  types.TypeStr,
+					Val:  types.TypeInt,
+				},
+			},
+		},
+	}
+	if err != nil {
+		t.Errorf("error trying to get the field name type map: %s", err.Error())
+		return
+	}
+	if !reflect.DeepEqual(res, expected) {
+		t.Errorf("unexpected result: %+v", res)
+		return
+	}
 }

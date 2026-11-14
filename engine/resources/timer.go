@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,11 +13,24 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package resources
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -37,7 +50,8 @@ type TimerRes struct {
 
 	init *engine.Init
 
-	Interval uint32 `yaml:"interval"` // interval between runs in seconds
+	// Interval between runs in seconds.
+	Interval uint32 `lang:"interval" yaml:"interval"`
 
 	ticker *time.Ticker
 }
@@ -59,8 +73,8 @@ func (obj *TimerRes) Init(init *engine.Init) error {
 	return nil
 }
 
-// Close is run by the engine to clean up after the resource is done.
-func (obj *TimerRes) Close() error {
+// Cleanup is run by the engine to clean up after the resource is done.
+func (obj *TimerRes) Cleanup() error {
 	return nil
 }
 
@@ -70,33 +84,32 @@ func (obj *TimerRes) newTicker() *time.Ticker {
 }
 
 // Watch is the primary listener for this resource and it outputs events.
-func (obj *TimerRes) Watch() error {
+func (obj *TimerRes) Watch(ctx context.Context) error {
 	// create a time.Ticker for the given interval
 	obj.ticker = obj.newTicker()
 	defer obj.ticker.Stop()
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
-	var send = false // send event?
 	for {
 		select {
 		case <-obj.ticker.C: // received the timer event
-			send = true
 			obj.init.Logf("received tick")
 
-		case <-obj.init.Done: // closed by the engine to signal shutdown
-			return nil
+		case <-ctx.Done(): // closed by the engine to signal shutdown
+			return ctx.Err()
 		}
 
-		if send {
-			send = false
-			obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
 		}
 	}
 }
 
 // CheckApply method for Timer resource. Triggers a timer reset on notify.
-func (obj *TimerRes) CheckApply(apply bool) (bool, error) {
+func (obj *TimerRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 	// because there are no checks to run, this resource has a less
 	// traditional pattern than what is seen in most resources...
 	if !obj.init.Refresh() { // this works for apply || !apply

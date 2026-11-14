@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,19 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package resources
 
@@ -23,11 +35,12 @@ import (
 	"strings"
 
 	"github.com/purpleidea/mgmt/engine"
-	engineUtil "github.com/purpleidea/mgmt/engine/util"
 	"github.com/purpleidea/mgmt/etcd/interfaces"
-	"github.com/purpleidea/mgmt/util"
+	"github.com/purpleidea/mgmt/util/errwrap"
 
 	etcd "go.etcd.io/etcd/client/v3"
+	clientv3Util "go.etcd.io/etcd/client/v3/clientv3util"
+	//pb "go.etcd.io/etcd/api/v3/etcdserverpb"
 )
 
 const (
@@ -38,94 +51,74 @@ const (
 // change.
 // TODO: Filter our watch (on the server side if possible) based on the
 // collection prefixes and filters that we care about...
-func WatchResources(ctx context.Context, client interfaces.Client) (chan error, error) {
-	path := fmt.Sprintf("%s/exported/", ns)
-	return client.Watcher(ctx, path, etcd.WithPrefix())
-}
+// XXX: filter based on kind as well, we don't do that currently... See:
+// https://github.com/etcd-io/etcd/issues/19667
+// TODO: do the star (*) hostname matching catch-all if we have WithStar option.
+func WatchResources(ctx context.Context, client interfaces.Client, hostname, kind string) (chan error, error) {
+	// key structure is $NS/exported/$hostname:to/$hostname:from/$kind/$name = $data
+	ctx, cancel := context.WithCancel(ctx) // wrap
 
-// SetResources exports all of the resources which we pass in to etcd.
-func SetResources(ctx context.Context, client interfaces.Client, hostname string, resourceList []engine.Res) error {
-	// key structure is $NS/exported/$hostname/resources/$uid = $data
-
-	var kindFilter []string // empty to get from everyone
-	hostnameFilter := []string{hostname}
-	// this is not a race because we should only be reading keys which we
-	// set, and there should not be any contention with other hosts here!
-	originals, err := GetResources(ctx, client, hostnameFilter, kindFilter)
+	path := fmt.Sprintf("%s/exported/%s/", ns, hostname)
+	ch1, err := client.Watcher(ctx, path, etcd.WithPrefix())
 	if err != nil {
-		return err
+		cancel()
+		return nil, err
 	}
 
-	if len(originals) == 0 && len(resourceList) == 0 { // special case of no add or del
-		return nil
+	star := fmt.Sprintf("%s/exported/%s/", ns, "*")
+	ch2, err := client.Watcher(ctx, star, etcd.WithPrefix())
+	if err != nil {
+		cancel()
+		return nil, err
 	}
 
-	ifs := []etcd.Cmp{} // list matching the desired state
-	ops := []etcd.Op{}  // list of ops in this transaction
-	for _, res := range resourceList {
-		if res.Kind() == "" {
-			return fmt.Errorf("empty kind: %s", res.Name())
-		}
-		uid := fmt.Sprintf("%s/%s", res.Kind(), res.Name())
-		path := fmt.Sprintf("%s/exported/%s/resources/%s", ns, hostname, uid)
-		if data, err := engineUtil.ResToB64(res); err == nil {
-			ifs = append(ifs, etcd.Compare(etcd.Value(path), "=", data)) // desired state
-			ops = append(ops, etcd.OpPut(path, data))
-		} else {
-			return fmt.Errorf("can't convert to B64: %v", err)
-		}
-	}
+	// Multiplex the two together. A failure is the last event before the
+	// channel closes and it only closes without one when ctx was cancelled.
+	ch := make(chan error)
+	go func() {
+		defer close(ch)
+		defer cancel() // if one of them fails, stop the other one too
+		for ch1 != nil || ch2 != nil {
+			var e error
+			var ok bool
+			select {
+			case e, ok = <-ch1:
+				if !ok {
+					ch1 = nil // closed because ctx was cancelled
+					continue
+				}
+			case e, ok = <-ch2:
+				if !ok {
+					ch2 = nil // closed because ctx was cancelled
+					continue
+				}
+			}
 
-	match := func(res engine.Res, resourceList []engine.Res) bool { // helper lambda
-		for _, x := range resourceList {
-			if res.Kind() == x.Kind() && res.Name() == x.Name() {
-				return true
+			select {
+			case ch <- e:
+			case <-ctx.Done():
+				return
+			}
+			if e != nil {
+				return // that watch is over
 			}
 		}
-		return false
-	}
+	}()
 
-	hasDeletes := false
-	// delete old, now unused resources here...
-	for _, res := range originals {
-		if res.Kind() == "" {
-			return fmt.Errorf("empty kind: %s", res.Name())
-		}
-		uid := fmt.Sprintf("%s/%s", res.Kind(), res.Name())
-		path := fmt.Sprintf("%s/exported/%s/resources/%s", ns, hostname, uid)
-
-		if match(res, resourceList) { // if we match, no need to delete!
-			continue
-		}
-
-		ops = append(ops, etcd.OpDelete(path))
-
-		hasDeletes = true
-	}
-
-	// if everything is already correct, do nothing, otherwise, run the ops!
-	// it's important to do this in one transaction, and atomically, because
-	// this way, we only generate one watch event, and only when it's needed
-	if hasDeletes { // always run, ifs don't matter
-		_, err = client.Txn(ctx, nil, ops, nil) // TODO: does this run? it should!
-	} else {
-		_, err = client.Txn(ctx, ifs, nil, ops) // TODO: do we need to look at response?
-	}
-	return err
+	return ch, nil
 }
 
-// GetResources collects all of the resources which match a filter from etcd. If
-// the kindfilter or hostnameFilter is empty, then it assumes no filtering...
-// TODO: Expand this with a more powerful filter based on what we eventually
-// support in our collect DSL. Ideally a server side filter like WithFilter()
-// could do this if the pattern was $NS/exported/$kind/$hostname/$uid = $data.
-func GetResources(ctx context.Context, client interfaces.Client, hostnameFilter, kindFilter []string) ([]engine.Res, error) {
-	// key structure is $NS/exported/$hostname/resources/$uid = $data
+// GetResources reads the resources sent to the input hostname, and also applies
+// the filters to ensure we get a limited selection.
+// XXX: We'd much rather filter server side if etcd had better filtering API's.
+// See: https://github.com/etcd-io/etcd/issues/19667
+func GetResources(ctx context.Context, client interfaces.Client, hostname string, filters []*engine.ResFilter) ([]*engine.ResOutput, error) {
+	// key structure is $NS/exported/$hostname:to/$hostname:from/$kind/$name = $data
 	path := fmt.Sprintf("%s/exported/", ns)
-	resourceList := []engine.Res{}
+	output := []*engine.ResOutput{}
 	keyMap, err := client.Get(ctx, path, etcd.WithPrefix(), etcd.WithSort(etcd.SortByKey, etcd.SortAscend))
 	if err != nil {
-		return nil, fmt.Errorf("could not get resources: %v", err)
+		return nil, errwrap.Wrapf(err, "could not get resources")
 	}
 	for key, val := range keyMap {
 		if !strings.HasPrefix(key, path) { // sanity check
@@ -133,35 +126,116 @@ func GetResources(ctx context.Context, client interfaces.Client, hostnameFilter,
 		}
 
 		str := strings.Split(key[len(path):], "/")
-		if len(str) != 4 {
-			return nil, fmt.Errorf("unexpected chunk count")
+		if len(str) < 4 {
+			return nil, fmt.Errorf("unexpected chunk count of: %d", len(str))
 		}
-		hostname, r, kind, name := str[0], str[1], str[2], str[3]
-		if r != "resources" {
-			return nil, fmt.Errorf("unexpected chunk pattern")
+		// The name may contain slashes, so join all those pieces back!
+		hostnameTo, hostnameFrom, kind, name := str[0], str[1], str[2], strings.Join(str[3:], "/")
+		if hostnameTo == "" || hostnameFrom == "" {
+			return nil, fmt.Errorf("unexpected empty hostname")
 		}
 		if kind == "" {
-			return nil, fmt.Errorf("unexpected kind chunk")
+			return nil, fmt.Errorf("unexpected empty kind")
 		}
-		if name == "" { // TODO: should I check this?
+		if name == "" {
 			return nil, fmt.Errorf("unexpected empty name")
 		}
-		// FIXME: ideally this would be a server side filter instead!
-		if len(hostnameFilter) > 0 && !util.StrInList(hostname, hostnameFilter) {
+
+		// XXX: Do we want to include this catch-all match?
+		if hostnameTo != hostname && hostnameTo != "*" { // star is any
 			continue
 		}
 
-		// FIXME: ideally this would be a server side filter instead!
-		if len(kindFilter) > 0 && !util.StrInList(kind, kindFilter) {
-			continue
+		// TODO: I'd love to avoid this O(N^2) matching if possible...
+		if err := engine.MatchFilters(filters, kind, name, hostnameFrom); err != nil {
+			continue // did not match any of these
 		}
 
-		if res, err := engineUtil.B64ToRes(val); err == nil {
-			//obj.Logf("Get: (Hostname, Kind, Name): (%s, %s, %s)", hostname, kind, name)
-			resourceList = append(resourceList, res)
-		} else {
-			return nil, fmt.Errorf("can't convert from B64: %v", err)
+		ro := &engine.ResOutput{
+			Kind: kind,
+			Name: name,
+			Host: hostnameFrom, // from this host
+			Data: val,          // encoded res data
 		}
+		output = append(output, ro)
 	}
-	return resourceList, nil
+
+	return output, nil
+}
+
+// SetResources stores some resource data for export in etcd. It returns an
+// error if anything goes wrong. If it didn't need to make a changes because the
+// data was already correct in the database, it returns (true, nil). Otherwise
+// it returns (false, nil).
+func SetResources(ctx context.Context, client interfaces.Client, hostname string, resourceExports []*engine.ResExport) (bool, error) {
+	// key structure is $NS/exported/$hostname:to/$hostname:from/$kind/$name = $data
+
+	// XXX: We run each export one at a time, because there's a bug if we
+	// group them, See: https://github.com/etcd-io/etcd/issues/19678
+	b := true
+	for _, re := range resourceExports {
+		ifs := []etcd.Cmp{} // list matching the desired state
+		thn := []etcd.Op{}  // list of ops in this transaction (then)
+		els := []etcd.Op{}  // list of ops in this transaction (else)
+
+		host := re.Host
+		if host == "" {
+			host = "*" // XXX: use whatever means "all"
+		}
+
+		path := fmt.Sprintf("%s/exported/%s/%s/%s/%s", ns, host, hostname, re.Kind, re.Name)
+		ifs = append(ifs, etcd.Compare(etcd.Value(path), "=", re.Data))
+		els = append(els, etcd.OpPut(path, re.Data))
+
+		// it's important to do this in one transaction, and atomically, because
+		// this way, we only generate one watch event, and only when it's needed
+		out, err := client.Txn(ctx, ifs, thn, els)
+		if err != nil {
+			return false, err
+		}
+
+		b = b && !out.Succeeded // collect the true/false responses...
+	}
+
+	// false means something changed
+	return b, nil
+}
+
+// DelResources deletes some exported resource data from etcd. It returns an
+// error if anything goes wrong. If it didn't need to make a changes because the
+// data was already correct in the database, it returns (true, nil). Otherwise
+// it returns (false, nil).
+func DelResources(ctx context.Context, client interfaces.Client, hostname string, resourceDeletes []*engine.ResDelete) (bool, error) {
+	// key structure is $NS/exported/$hostname:to/$hostname:from/$kind/$name = $data
+
+	// XXX: We run each delete one at a time, because there's a bug if we
+	// group them, See: https://github.com/etcd-io/etcd/issues/19678
+	b := true
+	for _, rd := range resourceDeletes {
+
+		ifs := []etcd.Cmp{} // list matching the desired state
+		thn := []etcd.Op{}  // list of ops in this transaction (then)
+		els := []etcd.Op{}  // list of ops in this transaction (else)
+
+		host := rd.Host
+		if host == "" {
+			host = "*" // XXX: use whatever means "all"
+		}
+
+		path := fmt.Sprintf("%s/exported/%s/%s/%s/%s", ns, host, hostname, rd.Kind, rd.Name)
+		ifs = append(ifs, clientv3Util.KeyExists(path))
+		thn = append(thn, etcd.OpDelete(path))
+
+		// it's important to do this in one transaction, and atomically, because
+		// this way, we only generate one watch event, and only when it's needed
+		out, err := client.Txn(ctx, ifs, thn, els)
+		if err != nil {
+			return false, err
+		}
+
+		b = b && out.Succeeded // collect the true/false responses...
+	}
+
+	// false means something changed
+	return b, nil
 }

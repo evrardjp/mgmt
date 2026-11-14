@@ -1,0 +1,18 @@
+-- CONFIG --
+{
+	"nofmt": true
+}
+-- main.mcl --
+$list0 = [
+	"a",
+	"b",
+	"c",
+	"d",
+	"e" # bad
+]
+
+test "foo" {
+	slicestring => $list0,
+}
+-- OUTPUT --
+# err: errLexParse: parser: `syntax error: unexpected NEWLINE`: /main.mcl @ 6:11-6:12

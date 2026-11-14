@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,18 +13,32 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package etcd
 
 import (
+	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"path"
 	"strings"
 	"time"
 
-	"github.com/purpleidea/mgmt/util"
+	etcdUtil "github.com/purpleidea/mgmt/etcd/util"
 	"github.com/purpleidea/mgmt/util/errwrap"
 
 	etcdTransport "go.etcd.io/etcd/client/pkg/v3/transport"
@@ -33,10 +47,10 @@ import (
 )
 
 const (
-	// MaxServerStartTimeout is the amount of time to wait for the server
-	// to start before considering it a failure. If you hit this timeout,
-	// let us know so that we can analyze the situation, and increase this
-	// if necessary.
+	// MaxServerStartTimeout is the amount of time to wait for the server to
+	// start before considering it a failure. If you hit this timeout, let
+	// us know so that we can analyze the situation, and increase this if
+	// necessary.
 	MaxServerStartTimeout = 60 * time.Second
 
 	// MaxServerCloseTimeout is the maximum amount of time we'll wait for
@@ -52,56 +66,16 @@ const (
 	ServerRetryWait = 500 * time.Millisecond
 )
 
-// serverAction represents the desired server state.
-type serverAction uint8
-
-const (
-	serverActionStop serverAction = iota
-	serverActionStart
-)
-
-// serverAction returns whether we should do the action requested. The action is
-// either start (true) or stop (false) as input. For example, if we run this as:
-// true -> true, it means we asked if we should start, and the answer is yes.
-func (obj *EmbdEtcd) serverAction(action serverAction) bool {
-	// check if i have actually volunteered first of all...
-	if obj.NoServer || len(obj.ServerURLs) == 0 {
-		obj.Logf("inappropriately nominated, rogue or stale server?")
-		return false // no action
-	}
-
-	_, exists := obj.nominated[obj.Hostname] // am i nominated?
-
-	// if there are no other peers, we create a new server
-	// TODO: do we need an || len(obj.nominated) == 0 if we're the first?
-	newCluster := len(obj.nominated) == 1 && exists
-
-	switch action {
-	case serverActionStart:
-		// we start if...
-		return obj.server == nil && (exists || newCluster)
-
-	case serverActionStop:
-		// we stop if...
-		return obj.server != nil && !exists
-	}
-
-	return false // no action needed
-}
-
 // runServer kicks of a new embedded etcd server. It exits when the server shuts
-// down. The exit can be triggered at any time by running destroyServer or if it
+// down. The exit can be triggered at any time by cancelling the ctx or if it
 // exits due to some condition like an error.
-// FIXME: should peerURLsMap just use obj.nominated instead?
-func (obj *EmbdEtcd) runServer(newCluster bool, peerURLsMap etcdtypes.URLsMap) (reterr error) {
+func (obj *EmbdEtcd) runServer(ctx context.Context, newCluster bool, peerURLsMap etcdtypes.URLsMap) (reterr error) {
+	// XXX: use a mutex here?
 	obj.Logf("server: runServer: (newCluster=%t): %+v", newCluster, peerURLsMap)
 	defer obj.Logf("server: runServer: done!")
-	//obj.serverwg.Wait() // bonus, but instead, a mutex would be race free!
-	obj.serverwg.Add(1)
-	defer obj.serverwg.Done()
 	defer obj.serverExitsSignal.Send()
 	dataDir := fmt.Sprintf("%s/", path.Join(obj.Prefix, "server"))
-	if err := os.MkdirAll(dataDir, 0770); err != nil {
+	if err := os.MkdirAll(dataDir, 0700); err != nil { // etcd wants 0700
 		return errwrap.Wrapf(err, "couldn't mkdir: %s", dataDir)
 	}
 
@@ -116,7 +90,7 @@ func (obj *EmbdEtcd) runServer(newCluster bool, peerURLsMap etcdtypes.URLsMap) (
 	if len(obj.ServerURLs) > 0 {
 		peerURLs = obj.ServerURLs
 	}
-	initialPeerURLsMap, err := copyURLsMap(peerURLsMap)
+	initialPeerURLsMap, err := etcdUtil.CopyURLsMap(peerURLsMap)
 	if err != nil {
 		return errwrap.Wrapf(err, "error copying URLsMap")
 	}
@@ -140,10 +114,16 @@ func (obj *EmbdEtcd) runServer(newCluster bool, peerURLsMap etcdtypes.URLsMap) (
 	cfg := embed.NewConfig()
 	cfg.Name = memberName // hostname
 	cfg.Dir = dataDir
-	cfg.LPUrls = peerURLs
-	cfg.LCUrls = obj.ClientURLs
-	cfg.APUrls = aPUrls
-	cfg.ACUrls = aCUrls
+	cfg.ListenPeerUrls = peerURLs
+	if obj.NoNetwork {
+		// A single member doesn't need a peer listener. We can't use a
+		// unix socket here anyways, since etcd ignores the path and
+		// net.Listen then autobinds an unprotected abstract socket.
+		cfg.ListenPeerUrls = []url.URL{}
+	}
+	cfg.ListenClientUrls = obj.ClientURLs
+	cfg.AdvertisePeerUrls = aPUrls
+	cfg.AdvertiseClientUrls = aCUrls
 	cfg.StrictReconfigCheck = false // XXX: workaround https://github.com/etcd-io/etcd/issues/6305
 	cfg.MaxTxnOps = DefaultMaxTxnOps
 	cfg.Logger = "zap"
@@ -244,14 +224,14 @@ func (obj *EmbdEtcd) runServer(newCluster bool, peerURLsMap etcdtypes.URLsMap) (
 		return err
 	}
 
-	obj.serverID = uint64(obj.server.Server.ID()) // store member id for internal use
+	obj.serverID = uint64(obj.server.Server.MemberID()) // store member id for internal use
 	defer func() {
 		obj.serverID = 0 // reset
 	}()
-	obj.addSelfState() // add to endpoints list so self client can connect!
-	obj.setEndpoints() // sync client with new endpoints
-	defer obj.setEndpoints()
-	defer obj.rmMemberState(obj.Hostname)
+	//obj.addSelfState() // add to endpoints list so self client can connect!
+	//obj.setEndpoints() // sync client with new endpoints
+	//defer obj.setEndpoints()
+	//defer obj.rmMemberState(obj.Hostname)
 
 	obj.serverReadySignal.Send() // send a signal, and then reset the signal
 
@@ -259,38 +239,18 @@ func (obj *EmbdEtcd) runServer(newCluster bool, peerURLsMap etcdtypes.URLsMap) (
 		select {
 		case err, ok := <-obj.server.Err():
 			if !ok { // server shut down
-				return errwrap.Wrapf(err, "server shutdown error")
+				return nil
+			}
+			if err != nil {
+				return errwrap.Wrapf(err, "server error")
 			}
 
-		case <-obj.serverExit.Signal():
-			return errwrap.Wrapf(obj.serverExit.Error(), "server signal exit")
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 
 	//return nil // unreachable
-}
-
-// destroyServer shuts down the embedded etcd server portion.
-func (obj *EmbdEtcd) destroyServer() error {
-	// This function must be thread-safe because a destroy request will
-	// cause runServer to return, which then runs the defer of this function
-	// which is meant to clean up when an independent, normal runServer
-	// return happens. Add the mutex to protect against races on this call.
-	obj.servermu.Lock()
-	defer obj.servermu.Unlock()
-	if obj.server == nil {
-		return nil // don't error on redundant calls
-	}
-	obj.Logf("server: destroyServer...")
-	defer obj.Logf("server: destroyServer: done!")
-
-	obj.serverExit.Done(nil) // trigger an exit
-
-	obj.serverwg.Wait() // wait for server to finish shutting down
-	defer func() {
-		obj.serverExit = util.NewEasyExit() // reset
-	}()
-	return obj.serverExit.Error()
 }
 
 // ServerReady returns a channel that closes when we're up and running. This

@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,9 +13,21 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
-// +build !darwin
+//go:build !darwin
 
 // Package socketset is in API for creating a select style netlink socket to
 // receive events from the kernel.
@@ -33,6 +45,13 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+// socketRcvbufSize is the size in bytes we request for the netlink socket
+// receive buffer. A larger buffer helps avoid dropping events (and the
+// resulting ENOBUFS errors) during bursts of netlink messages. The kernel may
+// double this value for bookkeeping, and will cap it at net.core.rmem_max
+// unless the SO_RCVBUFFORCE option (which needs CAP_NET_ADMIN) is used.
+const socketRcvbufSize = 8 * 1024 * 1024 // 8 MiB
 
 // SocketSet is used to receive events from a socket and shut it down cleanly
 // when asked. It contains a socket for events and a pipe socket to unblock
@@ -54,9 +73,22 @@ func NewSocketSet(groups uint32, name string, proto int) (*SocketSet, error) {
 	if err := unix.Bind(fdEvents, &unix.SockaddrNetlink{
 		Family: unix.AF_NETLINK,
 		Groups: groups,
-		Pid:    uint32(os.Getpid()), // set PID to our process
+		//nolint:gosec // G115: a process ID is always non-negative and fits
+		Pid: uint32(os.Getpid()), // set PID to our process
 	}); err != nil {
 		return nil, errwrap.Wrapf(err, "error binding netlink socket")
+	}
+
+	// Increase the size of the socket receive buffer to help avoid dropping
+	// events (and getting ENOBUFS) when a large burst of messages arrives
+	// faster than we can read them. We try SO_RCVBUFFORCE first since it
+	// ignores the rmem_max limit (but needs CAP_NET_ADMIN) and fall back to
+	// the regular SO_RCVBUF which is capped by rmem_max. This is
+	// best-effort, so we ignore any errors and carry on with the default
+	// buffer size.
+	if err := unix.SetsockoptInt(fdEvents, unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, socketRcvbufSize); err != nil {
+		// ignore the error and fall back to the non-privileged option
+		_ = unix.SetsockoptInt(fdEvents, unix.SOL_SOCKET, unix.SO_RCVBUF, socketRcvbufSize)
 	}
 
 	// this pipe unblocks unix.Select upon closing
@@ -83,6 +115,10 @@ func NewSocketSet(groups uint32, name string, proto int) (*SocketSet, error) {
 // to the message length. It will block until an event is produced, or shutdown
 // is called.
 func (obj *SocketSet) ReceiveBytes() ([]byte, error) {
+	if obj == nil {
+		return nil, fmt.Errorf("nil object") // caller used this incorrectly
+	}
+
 	// Select will return when any fd in fdSet (fdEvents and fdPipe) is ready
 	// to read.
 	_, err := unix.Select(obj.nfd(), obj.fdSet(), nil, nil, nil)
@@ -99,6 +135,14 @@ func (obj *SocketSet) ReceiveBytes() ([]byte, error) {
 	if err != nil {
 		// if fdEvents is closed
 		if err == unix.EBADF { // bad file descriptor
+			return nil, nil
+		}
+		// The kernel ran out of buffer space and dropped one or more
+		// events. This is recoverable: the socket is still usable, we
+		// have just lost some messages. Return empty (like the EINTR
+		// case) so the caller resyncs its state on the next pass rather
+		// than treating this as a fatal error.
+		if err == unix.ENOBUFS { // no buffer space available
 			return nil, nil
 		}
 		return nil, errwrap.Wrapf(err, "error receiving messages")
@@ -135,7 +179,7 @@ type UEvent struct {
 }
 
 // ReceiveUEvent is a wrapper around ReceiveBytes. Parses the UEvent data
-// receieved from the socket and puts it into a UEvent struct.
+// received from the socket and puts it into a UEvent struct.
 func (obj *SocketSet) ReceiveUEvent() (*UEvent, error) {
 	// TODO: can multiple events come in the same socket?
 	event := &UEvent{Data: map[string]string{}}
@@ -180,6 +224,10 @@ Loop:
 // message to the pipe file descriptor. It must be called before close, and
 // should only be called once.
 func (obj *SocketSet) Shutdown() error {
+	if obj == nil {
+		return fmt.Errorf("nil object") // caller used this incorrectly
+	}
+
 	// close the event socket so no more events are produced
 	if err := unix.Close(obj.fdEvents); err != nil {
 		return err
@@ -193,6 +241,10 @@ func (obj *SocketSet) Shutdown() error {
 // Close closes the pipe file descriptor. It must only be called after Shutdown
 // has closed fdEvents, and unblocked receive. It should only be called once.
 func (obj *SocketSet) Close() error {
+	if obj == nil {
+		return fmt.Errorf("nil object") // caller used this incorrectly
+	}
+
 	if err := unix.Unlink(obj.pipeFile); err != nil {
 		return errwrap.Wrapf(err, "could not unbind %s", obj.pipeFile)
 	}

@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,19 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 // Package lang is the mcl language frontend that implements the reactive DSL
 // that lets users model their desired state over time.
@@ -21,24 +33,49 @@ package lang
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/purpleidea/mgmt/engine"
+	"github.com/purpleidea/mgmt/engine/local"
 	"github.com/purpleidea/mgmt/lang/ast"
-	"github.com/purpleidea/mgmt/lang/funcs"
-	_ "github.com/purpleidea/mgmt/lang/funcs/core" // import so the funcs register
+	_ "github.com/purpleidea/mgmt/lang/core" // import so the funcs register
+	"github.com/purpleidea/mgmt/lang/funcs/dage"
 	"github.com/purpleidea/mgmt/lang/funcs/vars"
 	"github.com/purpleidea/mgmt/lang/inputs"
 	"github.com/purpleidea/mgmt/lang/interfaces"
 	"github.com/purpleidea/mgmt/lang/interpolate"
 	"github.com/purpleidea/mgmt/lang/interpret"
 	"github.com/purpleidea/mgmt/lang/parser"
+	"github.com/purpleidea/mgmt/lang/types"
 	"github.com/purpleidea/mgmt/lang/unification"
+	_ "github.com/purpleidea/mgmt/lang/unification/solvers" // import so the solvers register
 	"github.com/purpleidea/mgmt/pgraph"
 	"github.com/purpleidea/mgmt/util"
 	"github.com/purpleidea/mgmt/util/errwrap"
 )
+
+const (
+	// EngineStartupStatsTimeout is the amount of time in seconds to wait
+	// between engine startup, and loaded event before printing some
+	// debugging stats. This is useful for finding bugs in the function
+	// engine. Set to zero to disable.
+	EngineStartupStatsTimeout = 60
+)
+
+// Data is some data that is passed into the Lang struct. It is presented here
+// as a single struct with room for multiple fields so that it can be changed or
+// extended in the future without having to re-plumb through all the fields it
+// contains
+type Data struct {
+	// UnificationStrategy is a hack to tune unification performance until
+	// we have an overall cleaner unification algorithm in place.
+	UnificationStrategy map[string]string
+
+	// TODO: Add other fields here if necessary.
+}
 
 // Lang is the main language lexer/parser object.
 type Lang struct {
@@ -55,37 +92,41 @@ type Lang struct {
 	// run the raw string as mcl code.
 	Input string
 
+	// Data is some additional data for the lang struct.
+	Data *Data
+
 	Hostname string
+	Local    *local.API
 	World    engine.World
 	Prefix   string
 	Debug    bool
 	Logf     func(format string, v ...interface{})
 
 	ast   interfaces.Stmt // store main prog AST here
-	funcs *funcs.Engine   // function event engine
+	funcs *dage.Engine    // function event engine
+	graph *pgraph.Graph   // function graph
 
-	loadedChan chan struct{} // loaded signal
-
-	streamChan chan error // signals a new graph can be created or problem
+	streamChan chan *pgraph.Graph // stream of new graphs
 	//streamBurst bool // should we try and be bursty with the stream events?
 
-	closeChan chan struct{} // close signal
-	wg        *sync.WaitGroup
+	interpreter *interpret.Interpreter
+
+	wg       *sync.WaitGroup
+	err      error
+	errMutex *sync.Mutex // guards err
 }
 
-// Init initializes the lang struct, and starts up the initial data sources.
+// Init initializes the lang struct, and starts up the initial input parsing.
 // NOTE: The trick is that we need to get the list of funcs to watch AND start
 // watching them, *before* we pull their values, that way we'll know if they
 // changed from the values we wanted.
-func (obj *Lang) Init() error {
-	obj.loadedChan = make(chan struct{})
-	obj.streamChan = make(chan error)
-	obj.closeChan = make(chan struct{})
-	obj.wg = &sync.WaitGroup{}
-
-	once := &sync.Once{}
-	loadedSignal := func() { close(obj.loadedChan) } // only run once!
-
+func (obj *Lang) Init(ctx context.Context) error {
+	if obj.Data == nil {
+		return fmt.Errorf("lang struct was not built properly")
+	}
+	if obj.Data.UnificationStrategy == nil {
+		return fmt.Errorf("lang struct was not built properly")
+	}
 	if obj.Debug {
 		obj.Logf("input: %s", obj.Input)
 		tree, err := util.FsTree(obj.Fs, "/") // should look like gapi
@@ -94,6 +135,7 @@ func (obj *Lang) Init() error {
 		}
 		obj.Logf("run tree:\n%s", tree)
 	}
+	var timing time.Time
 
 	// we used to support stdin passthrough, but we we got rid of it for now
 	// the fs input here is the local fs we're reading to get the files from
@@ -114,18 +156,23 @@ func (obj *Lang) Init() error {
 
 	// run the lexer/parser and build an AST
 	obj.Logf("lexing/parsing...")
+	timing = time.Now()
 	// this reads an io.Reader, which might be a stream of multiple files...
 	xast, err := parser.LexParse(reader)
 	if err != nil {
+		// annotate parse errors with a source position byline + caret
+		file := &interfaces.SourceFile{FS: output.FS, Path: output.Base + output.Metadata.Main}
+		err = interfaces.HighlightParseError(err, file, obj.Logf)
 		return errwrap.Wrapf(err, "could not generate AST")
 	}
+	obj.Logf("lexing/parsing took: %s", time.Since(timing))
 	if obj.Debug {
 		obj.Logf("behold, the AST: %+v", xast)
 	}
 
 	importGraph, err := pgraph.NewGraph("importGraph")
 	if err != nil {
-		return errwrap.Wrapf(err, "could not create graph")
+		return err
 	}
 	importVertex := &pgraph.SelfVertex{
 		Name:  "",          // first node is the empty string
@@ -133,13 +180,14 @@ func (obj *Lang) Init() error {
 	}
 	importGraph.AddVertex(importVertex)
 
-	obj.Logf("init...")
+	//obj.Logf("init...")
+	obj.Logf("import: %s", output.Base)
 	// init and validate the structure of the AST
 	data := &interfaces.Data{
 		// TODO: add missing fields here if/when needed
-		Fs:       obj.Fs,
-		FsURI:    obj.FsURI,
-		Base:     output.Base, // base dir (absolute path) the metadata file is in
+		Fs:       output.FS,       // formerly: obj.Fs
+		FsURI:    output.FS.URI(), // formerly: obj.FsURI
+		Base:     output.Base,     // base dir (absolute path) the metadata file is in
 		Files:    output.Files,
 		Imports:  importVertex,
 		Metadata: output.Metadata,
@@ -147,7 +195,8 @@ func (obj *Lang) Init() error {
 
 		LexParser:       parser.LexParse,
 		Downloader:      nil, // XXX: is this used here?
-		StrInterpolater: interpolate.InterpolateStr,
+		StrInterpolater: interpolate.StrInterpolate,
+		//Local: obj.Local, // TODO: do we need this?
 		//World: obj.World, // TODO: do we need this?
 
 		Prefix: obj.Prefix,
@@ -162,19 +211,24 @@ func (obj *Lang) Init() error {
 		return errwrap.Wrapf(err, "could not init and validate AST")
 	}
 
-	obj.Logf("interpolating...")
+	if obj.Debug {
+		obj.Logf("interpolating...")
+	}
+	timing = time.Now()
 	// interpolate strings and other expansionable nodes in AST
-	interpolated, err := xast.Interpolate()
+	iast, err := xast.Interpolate()
 	if err != nil {
 		return errwrap.Wrapf(err, "could not interpolate AST")
 	}
-	obj.ast = interpolated
+	obj.Logf("interpolating took: %s", time.Since(timing))
+	obj.ast = iast
 
 	variables := map[string]interfaces.Expr{
 		"purpleidea": &ast.ExprStr{V: "hello world!"}, // james says hi
 		// TODO: change to a func when we can change hostname dynamically!
 		"hostname": &ast.ExprStr{V: obj.Hostname},
 	}
+	// TODO: pass `data` into ast.VarPrefixToVariablesScope ?
 	consts := ast.VarPrefixToVariablesScope(vars.ConstNamespace) // strips prefix!
 	addback := vars.ConstNamespace + interfaces.ModuleSep        // add it back...
 	variables, err = ast.MergeExprMaps(variables, consts, addback)
@@ -189,171 +243,249 @@ func (obj *Lang) Init() error {
 		Functions: ast.FuncPrefixToFunctionsScope(""), // runs funcs.LookupPrefix
 	}
 
-	obj.Logf("building scope...")
+	if obj.Debug {
+		obj.Logf("scope building...")
+	}
+	timing = time.Now()
 	// propagate the scope down through the AST...
 	if err := obj.ast.SetScope(scope); err != nil {
 		return errwrap.Wrapf(err, "could not set scope")
 	}
+	obj.Logf("scope building took: %s", time.Since(timing))
 
 	// apply type unification
 	logf := func(format string, v ...interface{}) {
-		if obj.Debug { // unification only has debug messages...
-			obj.Logf("unification: "+format, v...)
-		}
+		obj.Logf("unification: "+format, v...)
 	}
 	obj.Logf("running type unification...")
-	unifier := &unification.Unifier{
-		AST:    obj.ast,
-		Solver: unification.SimpleInvariantSolverLogger(logf),
-		Debug:  obj.Debug,
-		Logf:   logf,
+
+	var solver unification.Solver
+	if name, exists := obj.Data.UnificationStrategy["solver"]; exists && name != "" {
+		if solver, err = unification.Lookup(name); err != nil {
+			return errwrap.Wrapf(err, "could not get solver: %s", name)
+		}
+	} else if solver, err = unification.LookupDefault(); err != nil {
+		return errwrap.Wrapf(err, "could not get default solver")
 	}
-	if err := unifier.Unify(); err != nil {
-		return errwrap.Wrapf(err, "could not unify types")
+	unifier := &unification.Unifier{
+		AST:          obj.ast,
+		Solver:       solver,
+		Strategy:     obj.Data.UnificationStrategy,
+		UnifiedState: types.NewUnifiedState(),
+		Debug:        obj.Debug,
+		Logf:         logf,
+	}
+	timing = time.Now()
+	// NOTE: This is the "real" Unify that runs. (This is not for deploy.)
+	unifyErr := unifier.Unify(ctx)
+	obj.Logf("type unification took: %s", time.Since(timing))
+	if unifyErr != nil {
+		return errwrap.Wrapf(unifyErr, "could not unify types")
 	}
 
+	// XXX: Should we do a kind of SetType on resources here to tell the
+	// ones with variant fields what their concrete field types are? They
+	// should only be dynamic in implementation and before unification, and
+	// static once we've unified the specific resource.
+
 	obj.Logf("building function graph...")
+	timing = time.Now()
 	// we assume that for some given code, the list of funcs doesn't change
 	// iow, we don't support variable, variables or absurd things like that
-	graph, err := obj.ast.Graph() // build the graph of functions
+	obj.graph = &pgraph.Graph{Name: "functionGraph"}
+	env := interfaces.EmptyEnv()
+	// XXX: Do we need to do something like this?
+	//for k, v := range scope.Variables {
+	//	g, builtinFunc, err := v.Graph(nil)
+	//	if err != nil {
+	//		return errwrap.Wrapf(err, "calling Graph on builtins")
+	//	}
+	//	obj.graph.AddGraph(g)
+	//	env.Variables[k] = builtinFunc // XXX: Ask Sam (.Functions ???)
+	//}
+	//for k, v := range scope.Functions {
+	//	env.Functions[k] = &interfaces.Closure{
+	//		Env: interfaces.EmptyEnv(),
+	//		Expr: v,
+	//	}
+	//}
+	g, err := obj.ast.Graph(env) // build the graph of functions
 	if err != nil {
 		return errwrap.Wrapf(err, "could not generate function graph")
 	}
+	obj.graph.AddGraph(g)
 
+	obj.Logf("building function graph took: %s", time.Since(timing))
+	obj.Logf("function graph: %+v", obj.graph)
 	if obj.Debug {
-		obj.Logf("function graph: %+v", graph)
-		graph.Logf(obj.Logf) // log graph output with this logger...
+		obj.graph.Logf(obj.Logf) // log graph output with this logger...
+		//if err := obj.graph.ExecGraphviz("/tmp/graphviz.dot"); err != nil {
+		//	return errwrap.Wrapf(err, "writing graph failed")
+		//}
 	}
 
-	if graph.NumVertices() == 0 { // no funcs to load!
-		// send only one signal since we won't ever send after this!
-		obj.Logf("static graph found")
-		obj.wg.Add(1)
-		go func() {
-			defer obj.wg.Done()
-			defer close(obj.streamChan) // no more events are coming!
-			close(obj.loadedChan)       // signal
-			select {
-			case obj.streamChan <- nil: // send one signal
-				// pass
-			case <-obj.closeChan:
-				return
-			}
-		}()
-		return nil // exit early, no funcs to load!
-	}
-
-	obj.funcs = &funcs.Engine{
-		Graph:    graph, // not the same as the output graph!
+	obj.funcs = &dage.Engine{
+		Name:     "lang", // TODO: arbitrary name for now
 		Hostname: obj.Hostname,
+		Local:    obj.Local,
 		World:    obj.World,
-		Debug:    obj.Debug,
+		//Prefix:   fmt.Sprintf("%s/", path.Join(obj.Prefix, "funcs")),
+		Debug: obj.Debug,
 		Logf: func(format string, v ...interface{}) {
 			obj.Logf("funcs: "+format, v...)
 		},
-		Glitch: false, // FIXME: verify this functionality is perfect!
 	}
 
 	obj.Logf("function engine initializing...")
-	if err := obj.funcs.Init(); err != nil {
+	if err := obj.funcs.Setup(); err != nil {
 		return errwrap.Wrapf(err, "init error with func engine")
 	}
 
-	obj.Logf("function engine validating...")
-	if err := obj.funcs.Validate(); err != nil {
-		return errwrap.Wrapf(err, "validate error with func engine")
+	//obj.Logf("function engine validating...")
+	//if err := obj.funcs.Validate(); err != nil {
+	//	return errwrap.Wrapf(err, "validate error with func engine")
+	//}
+
+	obj.streamChan = make(chan *pgraph.Graph)
+
+	obj.interpreter = &interpret.Interpreter{
+		Debug: obj.Debug,
+		Logf: func(format string, v ...interface{}) {
+			// TODO: is this a sane prefix to use here?
+			obj.Logf("interpret: "+format, v...)
+		},
 	}
 
-	obj.Logf("function engine starting...")
-	// On failure, we expect the caller to run Close() to shutdown all of
-	// the currently initialized (and running) funcs... This is needed if
-	// we successfully ran `Run` but isn't needed only for Init/Validate.
-	if err := obj.funcs.Run(); err != nil {
-		return errwrap.Wrapf(err, "run error with func engine")
-	}
+	obj.wg = &sync.WaitGroup{}
+	obj.errMutex = &sync.Mutex{}
 
+	return nil
+}
+
+// Run kicks off the function engine. Use the context to shut it down.
+func (obj *Lang) Run(ctx context.Context) (reterr error) {
+	defer obj.wg.Wait()
+
+	ctx, cancel := context.WithCancel(ctx) // wrap parent
+	defer cancel()
+
+	//<-obj.funcs.Started() // wait for startup (will not block forever)
+
+	// Sanity checks for graph size.
+	//if count := obj.funcs.NumVertices(); count != 0 {
+	//	return fmt.Errorf("expected empty graph on start, got %d vertices", count)
+	//}
+	//defer func() {
+	//	if count := obj.funcs.NumVertices(); count != 0 {
+	//		err := fmt.Errorf("expected empty graph on exit, got %d vertices", count)
+	//		reterr = errwrap.Append(reterr, err)
+	//	}
+	//}()
+
+	txn := obj.funcs.Txn()
+	defer txn.Free() // remember to call Free()
+	txn.AddGraph(obj.graph)
+	if err := txn.Commit(); err != nil {
+		return errwrap.Wrapf(err, "error adding to function graph engine")
+	}
+	defer func() {
+		if err := txn.Reverse(); err != nil { // should remove everything we added
+			reterr = errwrap.Append(reterr, err)
+		}
+	}()
+
+	//obj.Logf("function engine starting took: %s", time.Since(timing))
 	// wait for some activity
 	obj.Logf("stream...")
-	stream := obj.funcs.Stream()
+
+	tableChan := obj.funcs.Stream() // after obj.funcs.Setup runs
+
 	obj.wg.Add(1)
 	go func() {
-		obj.Logf("loop...")
 		defer obj.wg.Done()
-		defer close(obj.streamChan) // no more events are coming!
+		defer close(obj.streamChan)
+		defer cancel() // if this loop errors, it should cancel and err
+
+		var table interfaces.Table
+		var ok bool
 		for {
-			var err error
-			var ok bool
 			select {
-			case err, ok = <-stream:
+			case table, ok = <-tableChan:
 				if !ok {
-					obj.Logf("stream closed")
 					return
 				}
-				if err == nil {
-					// only do this once, on the first event
-					once.Do(loadedSignal) // signal
-				}
 
-			case <-obj.closeChan:
+			case <-ctx.Done():
+				obj.errAppend(ctx.Err())
+				return
+			}
+
+			// this call returns the graph
+			// XXX: add a ctx?
+			graph, err := obj.interpreter.Interpret(obj.ast, table)
+			if err != nil {
+				e := errwrap.Wrapf(err, "could not interpret")
+				obj.errAppend(e)
 				return
 			}
 
 			select {
-			case obj.streamChan <- err: // send
-				if err != nil {
-					obj.Logf("Stream error: %+v", err)
-					return
-				}
+			case obj.streamChan <- graph:
 
-			case <-obj.closeChan:
+			case <-ctx.Done():
+				obj.errAppend(ctx.Err())
 				return
 			}
 		}
 	}()
-	return nil
+
+	// print some stats if the engine takes too long to startup
+	//if EngineStartupStatsTimeout > 0 {
+	//	wg.Add(1)
+	//	go func() {
+	//		defer wg.Done()
+	//		select {
+	//		case <-obj.funcs.Loaded(): // funcs are now loaded!
+	//		case <-time.After(time.Duration(EngineStartupStatsTimeout) * time.Second):
+	//			obj.Logf("stats...")
+	//			obj.Logf("%s", obj.funcs.Stats())
+	//		case <-ctx.Done():
+	//		}
+	//	}()
+	//}
+
+	obj.Logf("function engine starting...")
+
+	err := obj.funcs.Run(ctx)
+	// When run terminates, inspect the "official" error first.
+	if err := obj.funcs.Err(); err != nil {
+		return errwrap.WithoutContext(err)
+	}
+	return err // If we got this far, return whatever Run did.
 }
 
-// Stream returns a channel of graph change requests or errors. These are
-// usually sent when a func output changes.
-func (obj *Lang) Stream() chan error {
+// Stream returns a channel of resource graphs. This changes when a func output
+// changes.
+func (obj *Lang) Stream(ctx context.Context) <-chan *pgraph.Graph {
 	return obj.streamChan
 }
 
-// Interpret runs the interpreter and returns a graph and corresponding error.
-func (obj *Lang) Interpret() (*pgraph.Graph, error) {
-	select {
-	case <-obj.loadedChan: // funcs are now loaded!
-		// pass
-	default:
-		// if this is hit, someone probably called this too early!
-		// it should only be called in response to a stream event!
-		return nil, fmt.Errorf("funcs aren't loaded yet")
-	}
-
-	obj.Logf("running interpret...")
-	if obj.funcs != nil { // no need to rlock if we have a static graph
-		obj.funcs.RLock()
-	}
-	// this call returns the graph
-	graph, err := interpret.Interpret(obj.ast)
-	if obj.funcs != nil {
-		obj.funcs.RUnlock()
-	}
-	if err != nil {
-		return nil, errwrap.Wrapf(err, "could not interpret")
-	}
-
-	return graph, nil // return a graph
+// Err will contain the last error when Stream shuts down. It waits for all the
+// running processes to exit before it returns.
+func (obj *Lang) Err() error {
+	obj.wg.Wait()
+	return obj.err
 }
 
-// Close shuts down the lang struct and causes all the funcs to shutdown. It
-// must be called when finished after any successful Init ran.
-func (obj *Lang) Close() error {
-	var err error
-	if obj.funcs != nil {
-		err = obj.funcs.Close()
-	}
-	close(obj.closeChan)
-	obj.wg.Wait()
-	return err
+// Cleanup cleans up and frees memory and resources after everything is done.
+func (obj *Lang) Cleanup() error {
+	//return obj.funcs.Cleanup() // not implemented atm
+	return nil
+}
+
+// errAppend is a simple helper function.
+func (obj *Lang) errAppend(err error) {
+	obj.errMutex.Lock()
+	obj.err = errwrap.Append(obj.err, err)
+	obj.errMutex.Unlock()
 }

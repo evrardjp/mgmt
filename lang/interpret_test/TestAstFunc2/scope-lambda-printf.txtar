@@ -1,0 +1,17 @@
+-- main.mcl --
+import "fmt"
+$format = "%d" # should get ignored
+$fn = func($format) {
+	fmt.printf($format, 42)
+}
+$name = $fn("%s")
+test "${name}" {}
+# should error at unification if possible, otherwise at runtime
+# TODO: I would expect that if the "%s" and "%d" swapped, that speculatively we
+# would be able to run this at compile time and know the result statically.
+-- OUTPUT --
+# err: errStream: func `printf@0x0000000000` stopped before it was loaded: base kind does not match (str != int)
+unexpected type: base kind does not match (str != int): /main.mcl @ 6:9-6:18
+
+$name = $fn("%s")
+        ^^^^^^^^^

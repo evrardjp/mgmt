@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,19 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package strmap
 
@@ -27,7 +39,7 @@ import (
 	"github.com/purpleidea/mgmt/util/errwrap"
 
 	etcd "go.etcd.io/etcd/client/v3"
-	etcdutil "go.etcd.io/etcd/client/v3/clientv3util"
+	etcdUtil "go.etcd.io/etcd/client/v3/clientv3util"
 )
 
 const (
@@ -39,7 +51,7 @@ const (
 // something goes wrong.
 func WatchStrMap(ctx context.Context, client interfaces.Client, key string) (chan error, error) {
 	// new key structure is $NS/strings/$key/$hostname = $data
-	path := fmt.Sprintf("%s/strings/%s", ns, key)
+	path := fmt.Sprintf("%s/strings/%s/", ns, key)
 	return client.Watcher(ctx, path, etcd.WithPrefix())
 }
 
@@ -50,7 +62,7 @@ func GetStrMap(ctx context.Context, client interfaces.Client, hostnameFilter []s
 	// FIXME: if we have the $key as the last token (old key structure), we
 	// can allow the key to contain the slash char, otherwise we need to
 	// verify that one isn't present in the input string.
-	path := fmt.Sprintf("%s/strings/%s", ns, key)
+	path := fmt.Sprintf("%s/strings/%s/", ns, key)
 	keyMap, err := client.Get(ctx, path, etcd.WithPrefix(), etcd.WithSort(etcd.SortByKey, etcd.SortAscend))
 	if err != nil {
 		return nil, errwrap.Wrapf(err, "could not get strings in: %s", key)
@@ -61,21 +73,18 @@ func GetStrMap(ctx context.Context, client interfaces.Client, hostnameFilter []s
 			continue
 		}
 
-		str := strings.Split(key[len(path):], "/")
-		if len(str) != 2 {
-			return nil, fmt.Errorf("unexpected chunk count of %d", len(str))
-		}
-		_, hostname := str[0], str[1]
-
+		hostname := key[len(path):]
 		if hostname == "" {
-			return nil, fmt.Errorf("unexpected chunk length of %d", len(hostname))
+			return nil, fmt.Errorf("unexpected empty hostname")
+		}
+		if strings.Contains(hostname, "/") {
+			return nil, fmt.Errorf("hostname unexpectedly contains slash")
 		}
 
 		// FIXME: ideally this would be a server side filter instead!
 		if len(hostnameFilter) > 0 && !util.StrInList(hostname, hostnameFilter) {
 			continue
 		}
-		//log.Printf("Etcd: GetStr(%s): (Hostname, Data): (%s, %s)", key, hostname, val)
 		result[hostname] = val
 	}
 	return result, nil
@@ -91,7 +100,7 @@ func SetStrMap(ctx context.Context, client interfaces.Client, hostname, key stri
 	ops := []etcd.Op{}  // list of ops in this transaction (then)
 	els := []etcd.Op{}  // list of ops in this transaction (else)
 	if data == nil {    // perform a delete
-		ifs = append(ifs, etcdutil.KeyExists(path))
+		ifs = append(ifs, etcdUtil.KeyExists(path))
 		//ifs = append(ifs, etcd.Compare(etcd.Version(path), ">", 0))
 		ops = append(ops, etcd.OpDelete(path))
 	} else {

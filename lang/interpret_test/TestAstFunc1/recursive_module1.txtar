@@ -1,0 +1,106 @@
+-- metadata.yaml --
+main: "main/hello.mcl" # this is not the default, the default is "main.mcl"
+files: "files/" # these are some extra files we can use (is the default)
+path: "path/" # where to look for modules, defaults to using a global
+-- main/h2g2.mcl --
+import "third.mcl"
+
+$answer = 42 + $third.three
+-- main/hello.mcl --
+import "fmt"
+import "h2g2.mcl"
+import "mod1/"
+
+# imports as example1
+import "git://github.com/purpleidea/mgmt-example1/"
+import "git://github.com/purpleidea/mgmt-example2/"
+
+$answer = $h2g2.answer
+
+test "hello" {
+	anotherstr => fmt.printf("the answer is: %d", $answer),
+}
+test "hello2" {
+	anotherstr => fmt.printf("i imported local: %s", $mod1.name),
+}
+test "hello3" {
+	anotherstr => fmt.printf("i imported remote: %s and %s", $example1.name, $example2.ex1),
+}
+-- main/third.mcl --
+$three = 3
+-- main/mod1/metadata.yaml --
+# empty metadata file (use defaults)
+-- main/mod1/main.mcl --
+import "mod1/" # the nested version, not us
+
+$name = "this is module mod1 which contains: " + $mod1.name
+-- main/mod1/mod1/metadata.yaml --
+# empty metadata file (use defaults)
+-- main/mod1/mod1/main.mcl --
+$name = "this is the nested local module mod1"
+-- path/github.com/purpleidea/mgmt-example1/metadata.yaml --
+main: "main.mcl"
+files: "files/" # these are some extra files we can use (is the default)
+-- path/github.com/purpleidea/mgmt-example1/main.mcl --
+# this is a pretty lame module!
+import "mod1/" # yet another similarly named "mod1" import
+
+$name = "i am github.com/purpleidea/mgmt-example1/ and i contain: " + $mod1.name
+-- path/github.com/purpleidea/mgmt-example1/mod1/metadata.yaml --
+# empty metadata file (use defaults)
+-- path/github.com/purpleidea/mgmt-example1/mod1/main.mcl --
+$name = "this is the nested git module mod1"
+-- path/github.com/purpleidea/mgmt-example2/metadata.yaml --
+main: "main.mcl"
+files: "files/" # these are some extra files we can use (is the default)
+-- path/github.com/purpleidea/mgmt-example2/main.mcl --
+# this is a pretty lame module!
+import "git://github.com/purpleidea/mgmt-example1/" # import another module
+$ex1 = $example1.name
+
+$name = "i am github.com/purpleidea/mgmt-example2/ and i contain: " + $ex1
+-- OUTPUT --
+Edge: _operator -> printf: func(format str, a int) str # a
+Edge: _operator -> printf: func(format str, a str) str # a
+Edge: _operator -> printf: func(format str, a str, b str) str # a
+Edge: _operator -> printf: func(format str, a str, b str) str # b
+Edge: const: int(3) -> _operator # b
+Edge: const: int(42) -> _operator # a
+Edge: const: str("+") -> _operator # op
+Edge: const: str("+") -> _operator # op
+Edge: const: str("+") -> _operator # op
+Edge: const: str("+") -> _operator # op
+Edge: const: str("i am github.com/purpleidea/mgmt-example1/ and i contain: ") -> _operator # a
+Edge: const: str("i am github.com/purpleidea/mgmt-example1/ and i contain: ") -> _operator # a
+Edge: const: str("i imported local: %s") -> printf: func(format str, a str) str # format
+Edge: const: str("i imported remote: %s and %s") -> printf: func(format str, a str, b str) str # format
+Edge: const: str("the answer is: %d") -> printf: func(format str, a int) str # format
+Edge: const: str("this is module mod1 which contains: ") -> _operator # a
+Edge: const: str("this is the nested git module mod1") -> _operator # b
+Edge: const: str("this is the nested git module mod1") -> _operator # b
+Edge: const: str("this is the nested local module mod1") -> _operator # b
+Vertex: _operator
+Vertex: _operator
+Vertex: _operator
+Vertex: _operator
+Vertex: const: int(3)
+Vertex: const: int(42)
+Vertex: const: str("+")
+Vertex: const: str("+")
+Vertex: const: str("+")
+Vertex: const: str("+")
+Vertex: const: str("hello")
+Vertex: const: str("hello2")
+Vertex: const: str("hello3")
+Vertex: const: str("i am github.com/purpleidea/mgmt-example1/ and i contain: ")
+Vertex: const: str("i am github.com/purpleidea/mgmt-example1/ and i contain: ")
+Vertex: const: str("i imported local: %s")
+Vertex: const: str("i imported remote: %s and %s")
+Vertex: const: str("the answer is: %d")
+Vertex: const: str("this is module mod1 which contains: ")
+Vertex: const: str("this is the nested git module mod1")
+Vertex: const: str("this is the nested git module mod1")
+Vertex: const: str("this is the nested local module mod1")
+Vertex: printf: func(format str, a int) str
+Vertex: printf: func(format str, a str) str
+Vertex: printf: func(format str, a str, b str) str

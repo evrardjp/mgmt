@@ -1,0 +1,41 @@
+-- main.mcl --
+# this can return changing functions, and could be optimized, too
+func funcgen($b) {
+	if $b {
+		func() {
+			"hello"
+		}
+	} else {
+		func() {
+			"world"
+		}
+	}
+}
+
+$fn1 = funcgen(true)
+$fn2 = funcgen(false)
+
+$out1 = $fn1()
+$out2 = $fn2()
+
+test "${out1}" {}
+test "${out2}" {}
+-- OUTPUT --
+Edge: call -> callSubgraphOutput # dummy
+Edge: call -> callSubgraphOutput # dummy
+Edge: const: bool(false) -> exprif # condition
+Edge: const: bool(true) -> exprif # condition
+Edge: exprIfSubgraphOutput -> call # fn
+Edge: exprIfSubgraphOutput -> call # fn
+Edge: exprif -> exprIfSubgraphOutput # dummy
+Edge: exprif -> exprIfSubgraphOutput # dummy
+Vertex: call
+Vertex: call
+Vertex: callSubgraphOutput
+Vertex: callSubgraphOutput
+Vertex: const: bool(false)
+Vertex: const: bool(true)
+Vertex: exprIfSubgraphOutput
+Vertex: exprIfSubgraphOutput
+Vertex: exprif
+Vertex: exprif

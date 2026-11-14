@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # check that go lint passes or doesn't get worse by some threshold
 
 echo running "$0"
@@ -26,8 +26,9 @@ if [ "$COMMITS" != "" ] && [ "$COMMITS" -gt "1" ]; then
 	HACK="yes"
 fi
 
-# find all go files, exluding temporary directories and generated files
-LINT=$(find * -maxdepth 9 -iname '*.go' -not -path 'old/*' -not -path 'tmp/*' -not -path 'bindata/*' -not -path 'lang/parser/y.go' -not -path 'lang/parser/lexer.nn.go' -not -path 'lang/interpolate/parse.generated.go' -not -path 'lang/types/kind_stringer.go' -not -path 'vendor/*' -exec golint {} \;)	# current golint output
+# find all go files, excluding temporary directories and generated files
+# NOTE: we skip the "dot imports" because we want that for this gettext stuff!
+LINT=$(find * -maxdepth 9 -iname '*.go' -not -path 'old/*' -not -path 'tmp/*' -not -path 'lang/parser/y.go' -not -path 'lang/parser/lexer.nn.go' -not -path 'lang/interpolate/parse.generated.go' -not -path 'vendor/*' -exec golint {} \; | grep -v 'should not use dot imports')	# current golint output
 
 COUNT=`echo -e "$LINT" | wc -l`	# number of golint problems in current branch
 [ "$LINT" = "" ] && echo PASS && exit	# everything is "perfect"
@@ -55,7 +56,7 @@ while read -r line; do
 done <<< "$NUMSTAT1"	# three < is the secret to putting a variable into read
 
 git checkout "$PREVIOUS" &>/dev/null	# previous commit
-LINT1=$(find * -maxdepth 9 -iname '*.go' -not -path 'old/*' -not -path 'tmp/*' -not -path 'bindata/*' -not -path 'lang/parser/y.go' -not -path 'lang/parser/lexer.nn.go' -not -path 'vendor/*' -exec golint {} \;)
+LINT1=$(find * -maxdepth 9 -iname '*.go' -not -path 'old/*' -not -path 'tmp/*' -not -path 'lang/parser/y.go' -not -path 'lang/parser/lexer.nn.go' -not -path 'vendor/*' -exec golint {} \; | grep -v 'should not use dot imports')
 COUNT1=`echo -e "$LINT1" | wc -l`	# number of golint problems in older branch
 
 # clean up

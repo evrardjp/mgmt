@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,19 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 // Package parser contains the lexer and parser for the mcl language.
 package parser
@@ -34,21 +46,21 @@ import (
 
 // These constants represent the different possible lexer/parser errors.
 const (
-	ErrLexerUnrecognized      = interfaces.Error("unrecognized")
-	ErrLexerUnrecognizedCR    = interfaces.Error("unrecognized carriage return")
-	ErrLexerStringBadEscaping = interfaces.Error("string: bad escaping")
-	ErrLexerIntegerOverflow   = interfaces.Error("integer: overflow")
-	ErrLexerFloatOverflow     = interfaces.Error("float: overflow")
-	ErrParseError             = interfaces.Error("parser")
-	ErrParseSetType           = interfaces.Error("can't set return type in parser")
-	ErrParseResFieldInvalid   = interfaces.Error("can't use unknown resource field")
-	ErrParseAdditionalEquals  = interfaces.Error(errstrParseAdditionalEquals)
-	ErrParseExpectingComma    = interfaces.Error(errstrParseExpectingComma)
+	ErrLexerUnrecognized      = util.Error("unrecognized")
+	ErrLexerUnrecognizedCR    = util.Error("unrecognized carriage return")
+	ErrLexerStringBadEscaping = util.Error("string: bad escaping")
+	ErrLexerIntegerOverflow   = util.Error("integer: overflow")
+	ErrLexerFloatOverflow     = util.Error("float: overflow")
+	ErrParseError             = util.Error("parser")
+	ErrParseSetType           = util.Error("can't set return type in parser")
+	ErrParseResFieldInvalid   = util.Error("can't use unknown resource field")
+	ErrParseAdditionalEquals  = util.Error(errstrParseAdditionalEquals)
+	ErrParseExpectingComma    = util.Error(errstrParseExpectingComma)
 )
 
 // LexParseErr is a permanent failure error to notify about borkage.
 type LexParseErr struct {
-	Err interfaces.Error
+	Err util.Error
 	Str string
 	Row int // this is zero-indexed (the first line is 0)
 	Col int // this is zero-indexed (the first char is 0)
@@ -59,9 +71,18 @@ type LexParseErr struct {
 	Filename string
 }
 
-// Error displays this error with all the relevant state information.
-func (e *LexParseErr) Error() string {
-	return fmt.Sprintf("%s: `%s` @%d:%d", e.Err, e.Str, e.Row+1, e.Col+1)
+// Error displays this error with all the relevant state information. The source
+// position is not included here; use interfaces.HighlightParseError to add a
+// byline (and caret) from the source file that the code was parsed from.
+func (obj *LexParseErr) Error() string {
+	return fmt.Sprintf("%s: `%s`", obj.Err, obj.Str)
+}
+
+// ErrorPos returns the zero-based row and column where this error occurred. It
+// implements the interfaces.PositionedError interface so that the error can be
+// annotated with a source position byline and caret highlight.
+func (obj *LexParseErr) ErrorPos() (row, col int) {
+	return obj.Row, obj.Col
 }
 
 // lexParseAST is a struct which we pass into the lexer/parser so that we have a
@@ -72,12 +93,26 @@ type lexParseAST struct {
 	row int
 	col int
 
+	// comments are collected by the lexer in order of appearance.
+	comments []*interfaces.Comment
+
 	lexerErr error // from lexer
 	parseErr error // from Error(e string)
 }
 
-// LexParse runs the lexer/parser machinery and returns the AST.
+// LexParse runs the lexer/parser machinery and returns the AST. Make sure that
+// the final character is a newline, or the parser may error.
 func LexParse(input io.Reader) (interfaces.Stmt, error) {
+	stmt, _, err := LexParseWithComments(input)
+	return stmt, err
+}
+
+// LexParseWithComments runs the lexer/parser machinery and returns the AST and
+// the list of comments found in the input, in order of appearance. The parser
+// skips over the comments entirely, so they are returned separately with their
+// position information. This is what a code formatting tool would want to use.
+// Make sure that the final character is a newline, or the parser may error.
+func LexParseWithComments(input io.Reader) (interfaces.Stmt, []*interfaces.Comment, error) {
 	lp := &lexParseAST{}
 	// parseResult is a seemingly unused field in the Lexer struct for us...
 	lexer := NewLexerWithInit(input, func(y *Lexer) { y.parseResult = lp })
@@ -90,9 +125,9 @@ func LexParse(input io.Reader) (interfaces.Stmt, error) {
 		err = e
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return lp.ast, nil
+	return lp.ast, lp.comments, nil
 }
 
 // LexParseWithOffsets takes an io.Reader input and a list of corresponding
@@ -132,6 +167,7 @@ func LexParseWithOffsets(input io.Reader, offsets map[uint64]string) (interfaces
 
 	// TODO: switch this to an offset in bytes instead of lines
 	// TODO: we'll also need a way to convert that into the new row number!
+	//nolint:gosec // G115: a parser row number is non-negative
 	row := uint64(e.Row)
 	var i uint64           // initial condition
 	filename := offsets[0] // (assumption)

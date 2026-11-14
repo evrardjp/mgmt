@@ -1,4 +1,4 @@
-#!/bin/bash -e
+#!/usr/bin/env -S bash -e
 # tests if commit message conforms to convention
 
 # library of utility functions
@@ -10,11 +10,12 @@ echo running "$0"
 ROOT=$(dirname "${BASH_SOURCE}")/..
 cd "${ROOT}" || exit 1
 
-commit_title_regex='^\([a-z0-9]\(\(, \)\|[a-z0-9]\)\+[a-z0-9]: \)\+[A-Z0-9][^:]\+[^:.]$'
+commit_title_regex='^\([a-z0-9]\(\(, \)\|[a-z0-9]\)*[a-z0-9]: \)\+[A-Z0-9][^:]\+[^:.]$'
 
 # Testing the regex itself.
 
 # Correct patterns.
+[[ $(echo "ci: Bar" | grep -c "$commit_title_regex") -eq 1 ]]
 [[ $(echo "foo, bar: Bar" | grep -c "$commit_title_regex") -eq 1 ]]
 [[ $(echo "foo: Bar" | grep -c "$commit_title_regex") -eq 1 ]]
 [[ $(echo "f1oo, b2ar: Bar" | grep -c "$commit_title_regex") -eq 1 ]]
@@ -48,7 +49,7 @@ commit_title_regex='^\([a-z0-9]\(\(, \)\|[a-z0-9]\)\+[a-z0-9]: \)\+[A-Z0-9][^:]\
 # More than one char is required before :
 [[ $(echo "a: bar" | grep -c "$commit_title_regex") -eq 0 ]]
 
-# Run checks agains multiple :.
+# Run checks against multiple :.
 [[ $(echo "a: bar:" | grep -c "$commit_title_regex") -eq 0 ]]
 [[ $(echo "a: bar, fooX: Barfoo" | grep -c "$commit_title_regex") -eq 0 ]]
 [[ $(echo "a: bar, foo: barfoo foo: Nope" | grep -c "$commit_title_regex") -eq 0 ]]
@@ -109,6 +110,51 @@ test_commit_message_common_bugs() {
 		echo 'FAIL: Commit message starts with `lang: func:`, did you mean `lang: funcs:` ?'
 		exit 1
 	fi
+	if git log --format=%s $1 | head -n 1 | grep -q "^module:"
+	then
+		echo 'FAIL: Commit message starts with `module:`, did you mean `modules:` ?'
+		exit 1
+	fi
+}
+
+test_commit_message_body() {
+	echo "Testing commit message body $1"
+	if git show --no-patch --format=%B $1 | grep -q "^Co-Authored-By:"
+	then
+		echo 'FAIL: Commit message includes `Co-Authored-By:`, did you mean `Co-authored-by:` ?'
+		exit 1
+	fi
+	if git show --no-patch --format=%B $1 | grep -q "^Co-Authored-by:"
+	then
+		echo 'FAIL: Commit message includes `Co-Authored-by:`, did you mean `Co-authored-by:` ?'
+		exit 1
+	fi
+	if git show --no-patch --format=%B $1 | grep -q "^co-authored-by:"
+	then
+		echo 'FAIL: Commit message includes `co-authored-by:`, did you mean `Co-authored-by:` ?'
+		exit 1
+	fi
+	if git show --no-patch --format=%B $1 | grep -q "^Authored-By:"	# wat?
+	then
+		echo 'FAIL: Commit message includes `Authored-By:`, did you mean `Co-authored-by:` ?'
+		exit 1
+	fi
+
+	if git show --no-patch --format=%B $1 | grep -q "^Signed-Off-By:"
+	then
+		echo 'FAIL: Commit message includes `Signed-Off-By:`, did you mean `Signed-off-by:` ?'
+		exit 1
+	fi
+	if git show --no-patch --format=%B $1 | grep -q "^Signed-Off-by:"
+	then
+		echo 'FAIL: Commit message includes `Signed-Off-by:`, did you mean `Signed-off-by:` ?'
+		exit 1
+	fi
+	if git show --no-patch --format=%B $1 | grep -q "^signed-off-by:"
+	then
+		echo 'FAIL: Commit message includes `signed-off-by:`, did you mean `Signed-off-by:` ?'
+		exit 1
+	fi
 }
 
 if [[ -n "$TRAVIS_PULL_REQUEST_SHA" ]]
@@ -119,10 +165,19 @@ then
 	for commit in $commits
 	do
 		test_commit_message $commit
+		test_commit_message_body $commit
 		test_commit_message_common_bugs $commit
 	done
 elif [[ -n "$GITHUB_SHA" ]]
 then
+
+	# XXX: no idea if this will work, but CI fails when I push a tag...
+	if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+		echo "skipping because tag"
+		echo 'SKIP'
+		exit
+	fi
+
 	# GITHUB_SHA is the HEAD of the branch
 	# GITHUB_REF: The branch or tag ref that triggered the workflow. For example, refs/heads/feature-branch-1. If neither a branch or tag is available for the event type, the variable will not exist.
 	# GITHUB_BASE_REF: Only set for pull request events. The name of the base branch.
@@ -138,8 +193,17 @@ then
 		for commit in $commits
 		do
 			test_commit_message $commit
+			test_commit_message_body $commit
 			test_commit_message_common_bugs $commit
 		done
 	fi
+else # assume local branch
+	commits=$(git log --no-merges --format=%H origin/master..HEAD)
+	for commit in $commits
+	do
+		test_commit_message $commit
+		test_commit_message_body $commit
+		test_commit_message_common_bugs $commit
+	done
 fi
 echo 'PASS'

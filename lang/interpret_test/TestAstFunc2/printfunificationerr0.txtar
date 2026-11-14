@@ -1,0 +1,9 @@
+-- main.mcl --
+import "fmt"
+test fmt.printf("%d%d", 42) {} # should not pass, missing second int
+-- OUTPUT --
+# err: errUnify: func `printf` infer error: number of args (1) doesn't match format string verb count (2): /main.mcl @ 2:6-2:28
+func `printf` infer error: number of args (1) doesn't match format string verb count (2): /main.mcl @ 2:6-2:28
+
+test fmt.printf("%d%d", 42) {} # should not pass, missing second int
+     ^^^^^^^^^^^^^^^^^^^^^^

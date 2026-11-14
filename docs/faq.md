@@ -53,16 +53,13 @@ find a number of tutorials online.
 3. Spend between four to six hours with the [golang tour](https://tour.golang.org/).
 Skip over the longer problems, but try and get a solid overview of everything.
 If you forget something, you can always go back and repeat those parts.
-4. Connect to our [#mgmtconfig](https://web.libera.chat/?channels=#mgmtconfig)
-IRC channel on the [Libera.Chat](https://libera.chat/) network. You can use any
-IRC client that you'd like, but the [hosted web portal](https://web.libera.chat/?channels=#mgmtconfig)
-will suffice if you don't know what else to use. [Here are a few suggestions for
-alternative clients.](https://libera.chat/guides/clients)
+4. Connect to our [#mgmtconfig](https://matrix.to/#/#mgmtconfig:matrix.org)
+Matrix channel and hang out with us there out there.
 5. Now it's time to try and starting writing a patch! We have tagged a bunch of
 [open issues as #mgmtlove](https://github.com/purpleidea/mgmt/issues?q=is%3Aissue+is%3Aopen+label%3Amgmtlove)
 for new users to have somewhere to get involved. Look through them to see if
 something interests you. If you find one, let us know you're working on it by
-leaving a comment in the ticket. We'll be around to answer questions in the IRC
+leaving a comment in the ticket. We'll be around to answer questions in the
 channel, and to create new issues if there wasn't something that fit your
 interests. When you submit a patch, we'll review it and give you some feedback.
 Over time, we hope you'll learn a lot while supporting the project! Now get
@@ -70,16 +67,20 @@ hacking!
 
 ### Is this project ready for production?
 
-It's getting pretty close. I'm able to write modules for it now!
+Yes it is! It's been used in production for some time now. We think the level of
+polish is excellent. We have enterprise support available too through:
+[https://m9rx.com/](https://m9rx.com/).
 
-Compared to some existing automation tools out there, mgmt is a relatively new
-project. It is probably not as feature complete as some other software, but it
-also offers a number of features which are not currently available elsewhere.
+Compared to some legacy existing automation tools out there, mgmt is a
+relatively newer project. This shouldn't be seen as a detractor, we offer a
+number of valuable, modern features which are not currently available elsewhere!
 
-Because we have not released a `1.0` release yet, we are not guaranteeing
-stability of the internal or external API's. We only change them if it's really
-necessary, and we don't expect anything particularly drastic to occur. We would
-expect it to be relatively easy to adapt your code if such changes happened.
+We're past our `1.0.0` release now. If major dangerous/scary/incompatible
+changes happen, we'll bump that number. We'll bump the second number for bigger
+changes that you might want to take note of. Nothing should break in a dangerous
+way. Anything incompatible should be caught by the compiler safely or would be
+prominently mentioned in the release notes. If we bump the last number it's for
+smaller bug fixes, or other inconsequential features.
 
 As with all software, bugs can occur, and while we make no guarantees of being
 bug-free, there are a number of things we've done to reduce the chances of one
@@ -96,28 +97,7 @@ Having said all this, as with all software, there are still missing features
 which some users might want in their production environments. We're working hard
 to get all of those implemented, but we hope that you'll get involved and help
 us finish off the ones that are most important to you. We are happy to mentor
-new contributors, and have even [tagged](https://github.com/purpleidea/mgmt/issues?q=is%3Aissue+is%3Aopen+label%3Amgmtlove)
-a number of issues if you need help getting started.
-
-Some of the current limitations include:
-
-* Auth hasn't been implemented yet, so you should only use it in trusted
-environments (not on publicly accessible networks) for now.
-* The number of built-in core functions is still small. You may encounter
-scenarios where you're missing a function. The good news is that it's relatively
-easy to add this missing functionality yourself. In time, with your help, the
-list will grow!
-* Large file distribution is not yet implemented. You might want a scenario
-where mgmt is used to distribute large files (such as `.iso` images) throughout
-your cluster. While this isn't a common use-case, it won't be possible until
-someone wants to write the patch. (Mentoring available!) You can workaround this
-easily by storing those files on a separate fileserver for the interim.
-* There isn't an ecosystem of community `modules` yet. We've got this on our
-roadmap, so please stay tuned!
-
-We hope you'll participate as an early adopter. Every additional pair of helping
-hands gets us all there faster! It's quite possible to use this to build useful
-automation today, and we hope you'll start getting familiar with the software.
+new contributors too!
 
 ### Why did you use etcd? What about consul?
 
@@ -201,9 +181,9 @@ time.)
 Some users might prefer to only run `mgmt` on-demand manually, or at a set
 interval via a tool like `cron`. In order to do so, `mgmt` must have a way to
 shut itself down after a single "run". This feature is possible with the
-`--converged-timeout` flag. You may specify this flag, along with a number of
-seconds as the argument, and when there has been no activity for that many
-seconds, the program will shutdown.
+`--converger-timeout <N>` and `converged-exit` flags. You may specify these
+flags, along with a number of seconds as the argument, and when there has been
+no activity for that many seconds, the program will shutdown.
 
 Alternatively, while it is not recommended, if you'd like to ensure the program
 never runs for longer that a specific number of seconds, you can ask it to
@@ -213,7 +193,43 @@ requires a number of seconds as an argument.
 #### Example:
 
 ```
-./mgmt run lang examples/lang/hello0.mcl --converged-timeout=5
+./mgmt run lang examples/lang/hello0.mcl --converger-timeout=5 --converged-exit
+```
+
+### Can I run `mgmt` for type-checking only?
+
+Yes, you can use the `check` command with the mcl format check disabled, and it
+will exit after type unification.
+
+#### Example:
+
+```
+./mgmt check --tmp-prefix lang --skip-fmt examples/lang/hello0.mcl
+```
+
+It will also print how long it took on either success or failure. Keep in mind
+that even if you pass type unification, an `mgmt` run can still fail later on
+for other reasons, although these are mostly runtime considerations.
+
+### Why is type unification happening twice with `mgmt run`?
+
+When you use the `run` action, it runs all of the compile time checks (including
+type unification) that are possible, and then packages everything up into a
+deployable object and runs the same mechanism that `mgmt deploy` uses, sending
+the deploy to itself. At this point, mgmt starts up as a server, and receives
+the deploy. It will then need to run type unification again before running the
+code.
+
+You can skip the first type unification check by adding the `--skip-unify`
+option to the lang frontend when using the `run` command.
+
+You can also skip this check when running the `deploy` action, but if your code
+doesn't pass, you might be deploying broken code. This is not recommended.
+
+#### Example:
+
+```
+./mgmt run --tmp-prefix lang --skip-unify examples/lang/hello0.mcl
 ```
 
 ### Why does my file resource error with `no such file or directory`?
@@ -242,11 +258,84 @@ Similar logic applies for situations when you only specify the `mode` parameter.
 This all turns out to be more safe and "correct", in that it would error and
 prevent masking an error for a situation when you expected a file to already be
 at that location. It also turns out to simplify the internals significantly, and
-remove an ambiguous scenario with the reversable file resource.
+remove an ambiguous scenario with the reversible file resource.
+
+### Package resources error with: "The name is not activatable", what's wrong?
+
+You may see an error like:
+
+`main: error running auto edges: The name is not activatable`
+
+This can happen because the mgmt `pkg` resource uses a library and daemon called
+`PackageKit` to install packages. If it is not installed, then it cannot do its
+work. On Fedora system you may wish to run `dnf install /usr/bin/pkcon` or on a
+Debian system you may wish to run `apt install packagekit-tools`.
+
+PackageKit is excellent because it provides both an API and an event system to
+watch the package database for changes, and it abstracts away the differences
+between the various package managers. If you'd prefer to not need to install
+this tool, then you can contribute a native `pkg:rpm` and `pkg:deb` resource to
+mgmt!
+
+### When running mgmt, it says: "module path error: can't find a module path".
+
+You might get an error along the lines of:
+
+```
+could not set scope: import scope `git://github.com/purpleidea/mgmt/modules/some_module_name/` failed: module path error: can't find a module path
+```
+
+This usually means that you haven't specified the directory that mgmt should use
+when looking for modules. This could happen when using mgmt interactively or
+when it's being run as a service. In such cases you may want the main invocation
+to look something like:
+
+```
+mgmt run lang --module-path '/etc/mgmt/modules/' /etc/mgmt/main.mcl
+```
+
+### I get an error: "cannot open shared object file: No such file or directory".
+
+Mgmt currently uses two libraries that depend on `.so` files being installed on
+the host. Those are for `augeas` and `libvirt`. If those dependencies are not
+present, then mgmt will not run. The complete error might look like:
+
+```
+mgmt: error while loading shared libraries: libvirt-lxc.so.0: cannot open shared object file: No such file or directory
+```
+
+or:
+
+```
+mgmt: error while loading shared libraries: libaugeas.so.0: cannot open shared object file: No such file or directory
+```
+
+or something similar. There are two solutions to this:
+
+1. Use a build that doesn't include one or both of those features. You can build
+that like: `GOTAGS="noaugeas novirt nodocker" make build`.
+
+2. Install those dependencies. On a Fedora machine you might want to run:
+
+```
+dnf install libvirt-devel augeas-devel
+```
+
+On a Debian machine you might want to run:
+
+```
+apt install libvirt-dev libaugeas-dev
+```
+
+On an Arch machine you might want to run:
+
+```
+pacman -S libvirt augeas
+```
 
 ### Why do function names inside of templates include underscores?
 
-The golang template library which we use to implement the template() function
+The golang template library which we use to implement the golang.template() func
 doesn't support the dot notation, so we import all our normal functions, and
 just replace dots with underscores. As an example, the standard `datetime.print`
 function is shown within mcl scripts as datetime_print after being imported.
@@ -284,12 +373,91 @@ an instance of mgmt running, or if a related file locking issue occurred. To
 solve this, shutdown and running mgmt process, run `rm mgmt` to remove the file,
 and then get a new one by running `make` again.
 
+### Type unification error with string interpolation.
+
+Look carefully at the following code:
+
+```
+$num = 42
+print "hello" {
+	msg => "My favourite number is ${num}",
+}
+```
+
+What's actually happening is that we can't unify `str + int`, because our
+addition operator only supports `str + str`, `int + int`, and `float + float`.
+The string interpolation feature can only combine strings. One solution is to
+instead write:
+
+```
+$num = "42" # now this is a string
+print "hello" {
+	msg => "My favourite number is ${num}",
+}
+```
+
+The first example will usually error with something along the lines of:
+
+`unify error with: topLevel(func() { <built-in:concat> }): type error: int != str`
+
+Now you know why this specific case doesn't work! We may reconsider allowing
+other types to be pulled into interpolation in the future. If you have a good
+case for this, then let us know.
+
+### The run and deploy commands don't parse correctly when used with `--seeds`.
+
+If you're running a command with `--seeds`, `--server-urls`, or `--client-urls`,
+then make sure you are using an equals sign between the flag name and the value.
+For example, if you were to run:
+
+```
+# wrong invocation!
+mgmt deploy --no-git --seeds http://127.0.0.1:2379 lang code/test.mcl
+```
+
+Then the `--seeds` flag would interpret `lang` and `code/test.mcl` as additional
+seeds. This flag as well as the other aforementioned ones all accept multiple
+values. Use an equals sign to guarantee you enter the correct data, eg:
+
+```
+# better invocation! (note the equals sign)
+mgmt deploy --no-git --seeds=http://127.0.0.1:2379 lang code/test.mcl
+```
+
+This is caused by a parsing peculiarity of the CLI library that we are using.
+This is tracked upstream at: [https://github.com/alexflint/go-arg/issues/239](https://github.com/alexflint/go-arg/issues/239).
+We have a workaround in place to mitigate it and attempt to show you a helpful
+error message, but it's also documented here in the meantime. The error you will
+see is: `cli parse error: missing equals sign for list element`.
+
+### Can `mgmt` deploy a new version of mcl whenever that source changes?
+
+The short answer is yes, but you probably don't want that. The reason is that
+you can't reliably tell when a file update has *finished* changing. So if you
+watch file system events, and react automatically to run a deploy, then you
+might read a partial (truncated) version of the `mcl` code and deploy something
+incorrect or dangerous.
+
+If you do really want to "yolo" deploy, then you could first run `mgmt` locally:
+
+```bash
+mgmt run --tmp-prefix empty
+```
+
+and then run this dangerous inotify+deploy command to deploy to it:
+
+```bash
+while inotifywait -e close_write main.mcl; do mgmt deploy --no-git --seeds=http://127.0.0.1:2379 lang main.mcl; done
+```
+
+This could also deploy to a cluster of agents anywhere by changing the `--seeds`
+endpoint, or as shown above, if you're just running a single node, this would
+deploy to the standalone binary you've previously run.
+
 ### The docs speaks of `--remote` but the CLI errors out?
 
 The `--remote` flag existed in an earlier version of mgmt. It was removed and
-will be replaced with a more powerful version, which is a "remote" resource. The
-code is mostly ready but it's not finished. If you'd like to help finish it or
-sponsor the work, please let me know.
+was replaced with a more powerful version, which is the "remote" resource.
 
 ### Does this support Windows? OSX? GNU Hurd?
 
@@ -374,9 +542,6 @@ which definitely existed before the band did.
 
 ### You didn't answer my question, or I have a question!
 
-It's best to ask on [IRC](https://web.libera.chat/?channels=#mgmtconfig)
-to see if someone can help you. If you don't get a response from IRC, you can
-contact me through my [technical blog](https://purpleidea.com/contact/) and I'll
-do my best to help. If you have a good question, please add it as a patch to
+It's best to ask on [Matrix](https://matrix.to/#/#mgmtconfig:matrix.org) to see
+if someone can help. If you don't get a response there, you can send a patch to
 this documentation. I'll merge your question, and add a patch with the answer!
-For news and updates, subscribe to the [mailing list](https://www.redhat.com/mailman/listinfo/mgmtconfig-list).

@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,19 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package util
 
@@ -57,7 +69,7 @@ func modeIsValidWhat(what string) bool {
 	return len(what) == 0
 }
 
-// modeAssigned executes an assigment symbolic mode string (u=r). It clears out
+// modeAssigned executes an assignment symbolic mode string (u=r). It clears out
 // any bits for every subject in who and then assigns the specified modes in
 // what.
 func modeAssigned(who, what string, from os.FileMode) (os.FileMode, error) {
@@ -196,17 +208,17 @@ func modeSubtracted(who, what string, from os.FileMode) (os.FileMode, error) {
 }
 
 // modeValueFrom will return the bits requested for the mode in the correct
-// possitions for the specified subjects in who.
+// positions for the specified subjects in who.
 func modeValueFrom(who string, modeType uint32) os.FileMode {
 	i := uint32(0)
 	for _, w := range who {
 		switch w {
 		case 'u':
-			i += ModeUser * uint32(modeType)
+			i += ModeUser * modeType
 		case 'g':
-			i += ModeGroup * uint32(modeType)
+			i += ModeGroup * modeType
 		case 'o':
-			i += ModeOther * uint32(modeType)
+			i += ModeOther * modeType
 		}
 	}
 

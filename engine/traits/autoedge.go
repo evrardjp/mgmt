@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,19 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package traits
 
@@ -25,9 +37,12 @@ import (
 // methods needed to support autoedges on resources. It may be used as a start
 // point to avoid re-implementing the straightforward methods.
 type Edgeable struct {
-	// Xmeta is the stored meta. It should be called `meta` but it must be
-	// public so that the `encoding/gob` package can encode it properly.
-	Xmeta *engine.AutoEdgeMeta
+	// Xautoedge is the stored meta. It should be called `autoedge` but it
+	// must be public so that encoders such as `encoding/json` and
+	// `encoding/gob` can encode it. It is not called Xmeta so that it
+	// doesn't collide with the other traits when an encoder like
+	// `encoding/json` flattens a resource.
+	Xautoedge *engine.AutoEdgeMeta
 
 	// Bug5819 works around issue https://github.com/golang/go/issues/5819
 	Bug5819 interface{} // XXX: workaround
@@ -35,16 +50,16 @@ type Edgeable struct {
 
 // AutoEdgeMeta lets you get or set meta params for the automatic edges trait.
 func (obj *Edgeable) AutoEdgeMeta() *engine.AutoEdgeMeta {
-	if obj.Xmeta == nil { // set the defaults if previously empty
-		obj.Xmeta = &engine.AutoEdgeMeta{
+	if obj.Xautoedge == nil { // set the defaults if previously empty
+		obj.Xautoedge = &engine.AutoEdgeMeta{
 			Disabled: false,
 		}
 	}
-	return obj.Xmeta
+	return obj.Xautoedge
 }
 
 // SetAutoEdgeMeta lets you set all of the meta params for the automatic edges
 // trait in a single call.
 func (obj *Edgeable) SetAutoEdgeMeta(meta *engine.AutoEdgeMeta) {
-	obj.Xmeta = meta
+	obj.Xautoedge = meta
 }

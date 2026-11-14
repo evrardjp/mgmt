@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,14 +13,25 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package integration
 
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path"
@@ -28,8 +39,8 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/purpleidea/mgmt/recwatch"
 	"github.com/purpleidea/mgmt/util/errwrap"
+	"github.com/purpleidea/mgmt/util/recwatch"
 )
 
 const (
@@ -41,9 +52,9 @@ const (
 	// directory which is used for the mgmt prefix.
 	PrefixDirectory = "prefix"
 
-	// ConvergedStatusFile is the name of the file which is used for the
-	// converged status tracking.
-	ConvergedStatusFile = "csf.txt"
+	// ConvergerStatusFile is the name of the file which is used for the
+	// converger status tracking.
+	ConvergerStatusFile = "csf.txt"
 
 	// StdoutStderrFile is the name of the file which is used for the
 	// command output.
@@ -53,9 +64,9 @@ const (
 	// If we exceed this timeout, then it's likely we are blocked somewhere.
 	longTimeout = 60 // seconds
 
-	// convergedTimeout is the number of seconds we wait for our instance to
+	// convergerTimeout is the number of seconds we wait for our instance to
 	// remain unchanged to be considered as converged.
-	convergedTimeout = 15 // seconds
+	convergerTimeout = 15 // seconds
 
 	// dirMode is the the mode used when making directories.
 	dirMode = 0755
@@ -66,7 +77,16 @@ const (
 
 // Instance represents a single running mgmt instance. It is a building block
 // that can be used to run standalone tests, or combined to run clustered tests.
+// It can also be used to run a standalone etcd server instance.
 type Instance struct {
+	// Etcd specifies that this is a pure etcd instance instead of an mgmt
+	// one.
+	Etcd bool
+
+	// EtcdServer specifies we're connecting to an etcd instance instead of
+	// a normal mgmt peer.
+	EtcdServer bool
+
 	// Hostname is a unique identifier for this instance.
 	Hostname string
 
@@ -85,8 +105,8 @@ type Instance struct {
 
 	tmpPrefixDirectory   string
 	testRootDirectory    string
-	convergedStatusFile  string
-	convergedStatusIndex int
+	convergerStatusFile  string
+	convergerStatusIndex int
 
 	cmd *exec.Cmd
 
@@ -97,6 +117,10 @@ type Instance struct {
 // Init runs some initialization for this instance. It errors if the struct was
 // populated in an invalid way, or if it can't initialize correctly.
 func (obj *Instance) Init() error {
+	if obj.Etcd && obj.EtcdServer {
+		return fmt.Errorf("if we're etcd, we're not connecting to one")
+	}
+
 	if obj.Hostname == "" {
 		return fmt.Errorf("must specify a hostname")
 	}
@@ -104,7 +128,7 @@ func (obj *Instance) Init() error {
 	// create temporary directory to use during testing
 	if obj.dir == "" {
 		var err error
-		obj.dir, err = ioutil.TempDir("", fmt.Sprintf("mgmt-integration-%s-", obj.Hostname))
+		obj.dir, err = os.MkdirTemp("", fmt.Sprintf("mgmt-integration-%s-", obj.Hostname))
 		if err != nil {
 			return errwrap.Wrapf(err, "can't create temporary directory")
 		}
@@ -122,7 +146,7 @@ func (obj *Instance) Init() error {
 	}
 	obj.testRootDirectory = testRootDirectory
 
-	obj.convergedStatusFile = path.Join(obj.dir, ConvergedStatusFile)
+	obj.convergerStatusFile = path.Join(obj.dir, ConvergerStatusFile)
 
 	return nil
 }
@@ -137,7 +161,7 @@ func (obj *Instance) Close() error {
 			return errwrap.Wrapf(err, "can't remove instance dir")
 		}
 	}
-	obj.Kill() // safety
+	_ = obj.Kill() // safety
 	return nil
 }
 
@@ -184,15 +208,50 @@ func (obj *Instance) Run(seeds []*Instance) error {
 	if err != nil {
 		return err
 	}
+
+	// run `mgmt etcd`
+	if obj.Etcd {
+		cmdArgs := []string{
+			"etcd", // mode
+			//fmt.Sprintf("--name=%s", obj.Hostname),
+			fmt.Sprintf("--listen-client-urls=%s", obj.clientURL),
+			fmt.Sprintf("--listen-peer-urls=%s", obj.serverURL),
+			fmt.Sprintf("--advertise-client-urls=%s", obj.clientURL),
+			//fmt.Sprintf("--advertise-peer-urls=%s", obj.serverURL),
+			fmt.Sprintf("--data-dir=%s", obj.tmpPrefixDirectory),
+		}
+
+		obj.Logf("run: %s %s", cmdName, strings.Join(cmdArgs, " "))
+		obj.cmd = exec.Command(cmdName, cmdArgs...)
+		//obj.cmd.Env = []string{
+		//	fmt.Sprintf("MGMT_TEST_ROOT=%s", obj.testRootDirectory),
+		//}
+		obj.cmd.Dir = obj.tmpPrefixDirectory // run program in pwd if ""
+
+		// output file for storing logs
+		file, err := os.Create(path.Join(obj.dir, StdoutStderrFile))
+		if err != nil {
+			return errwrap.Wrapf(err, "error creating log file")
+		}
+		defer file.Close()
+		obj.cmd.Stdout = file
+		obj.cmd.Stderr = file
+
+		if err := obj.cmd.Start(); err != nil {
+			return errwrap.Wrapf(err, "error starting etcd")
+		}
+
+		return nil
+	}
+
 	cmdArgs := []string{
 		"run", // mode
 		fmt.Sprintf("--hostname=%s", obj.Hostname),
 		fmt.Sprintf("--client-urls=%s", obj.clientURL),
 		fmt.Sprintf("--server-urls=%s", obj.serverURL),
 		fmt.Sprintf("--prefix=%s", obj.tmpPrefixDirectory),
-		fmt.Sprintf("--converged-timeout=%d", convergedTimeout),
-		"--converged-timeout-no-exit",
-		fmt.Sprintf("--converged-status-file=%s", obj.convergedStatusFile),
+		fmt.Sprintf("--converger-timeout=%d", convergerTimeout), // no exit!
+		fmt.Sprintf("--converger-status-file=%s", obj.convergerStatusFile),
 	}
 	if len(seeds) > 0 {
 		urls := []string{}
@@ -201,11 +260,10 @@ func (obj *Instance) Run(seeds []*Instance) error {
 				return fmt.Errorf("instance `%s` has not started yet", instance.Hostname)
 			}
 			urls = append(urls, instance.clientURL)
+
+			s := fmt.Sprintf("--seeds=%s", instance.clientURL)
+			cmdArgs = append(cmdArgs, s)
 		}
-		s := fmt.Sprintf("--seeds=%s", urls[0])
-		// TODO: we could just add all the seeds instead...
-		//s := fmt.Sprintf("--seeds=%s", strings.Join(urls, ","))
-		cmdArgs = append(cmdArgs, s)
 	}
 	gapi := "empty" // empty GAPI (for now)
 	cmdArgs = append(cmdArgs, gapi)
@@ -272,7 +330,7 @@ func (obj *Instance) Quit(ctx context.Context) error {
 		select {
 		case err = <-done:
 		case <-ctx.Done():
-			obj.Kill() // should cause the Wait() to exit
+			_ = obj.Kill() // should cause the Wait() to exit
 			err = ctx.Err()
 		}
 	}()
@@ -282,23 +340,39 @@ func (obj *Instance) Quit(ctx context.Context) error {
 	return err
 }
 
-// Wait until the first converged state we hit. It is not necessary to use the
-// `--converged-timeout` option with mgmt for this to work. It tracks this via
-// the `--converged-status-file` option which can be used to track the varying
+// Wait until the first converger state we hit. It is not necessary to use the
+// `--converger-timeout` option with mgmt for this to work. It tracks this via
+// the `--converger-status-file` option which can be used to track the varying
 // convergence status.
 func (obj *Instance) Wait(ctx context.Context) error {
+	return obj.wait(ctx, false)
+}
+
+// WaitForConvergedAfterActivity waits until the first converged state we hit
+// after seeing activity. This is useful after deploys where an older true line
+// from the startup graph must not satisfy the wait.
+func (obj *Instance) WaitForConvergedAfterActivity(ctx context.Context) error {
+	return obj.wait(ctx, true)
+}
+
+func (obj *Instance) wait(ctx context.Context, requireActivity bool) error {
 	//if obj.cmd == nil { // TODO: should we include this?
 	//	return fmt.Errorf("no process is running")
 	//}
 
+	if obj.Etcd {
+		return fmt.Errorf("etcd Wait not implemented")
+	}
+
 	recurse := false
-	recWatcher, err := recwatch.NewRecWatcher(obj.convergedStatusFile, recurse)
+	recWatcher, err := recwatch.NewRecWatcher(ctx, obj.convergerStatusFile, recurse)
 	if err != nil {
 		return errwrap.Wrapf(err, "could not watch file")
 	}
-	defer recWatcher.Close()
+	defer recWatcher.Cleanup()
 	startup := make(chan struct{})
 	close(startup)
+	activity := !requireActivity
 	for {
 		select {
 		// FIXME: instead of sending one event here, the recwatch
@@ -308,11 +382,18 @@ func (obj *Instance) Wait(ctx context.Context) error {
 			// send an initial event
 
 		case event, ok := <-recWatcher.Events():
+			if ctx.Err() != nil {
+				return ctx.Err() // engine is shutting us down
+			}
 			if !ok {
 				return fmt.Errorf("file watcher shut down")
 			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
+			}
 			if err := event.Error; err != nil {
-				return errwrap.Wrapf(err, "error event received")
+				return err
 			}
 			startup = nil
 			// send event...
@@ -322,7 +403,7 @@ func (obj *Instance) Wait(ctx context.Context) error {
 			return ctx.Err()
 		}
 
-		contents, err := ioutil.ReadFile(obj.convergedStatusFile)
+		contents, err := os.ReadFile(obj.convergerStatusFile)
 		if err != nil {
 			continue // file might not exist yet, wait for an event
 		}
@@ -335,17 +416,24 @@ func (obj *Instance) Wait(ctx context.Context) error {
 			lines = append(lines, x)
 		}
 
-		if c := len(lines); c < obj.convergedStatusIndex {
+		if c := len(lines); c < obj.convergerStatusIndex {
 			return fmt.Errorf("file is missing lines or was truncated, got: %d", c)
 		}
 
 		var converged bool
-		for i := obj.convergedStatusIndex; i < len(lines); i++ {
-			obj.convergedStatusIndex = i + 1 // new max
+		for i := obj.convergerStatusIndex; i < len(lines); i++ {
 			line := lines[i]
-			if line == "true" { // converged!
-				converged = true
+			if line == "false" { // activity!
+				obj.convergerStatusIndex = i + 1 // new max
+				activity = true
+				continue
 			}
+			if line == "true" { // converged!
+				obj.convergerStatusIndex = i + 1 // new max
+				converged = activity
+				continue
+			}
+			break // possibly a partial write; do not consume it yet
 		}
 		if converged {
 			return nil
@@ -361,7 +449,7 @@ func (obj *Instance) DeployLang(code string) error {
 
 	filename := path.Join(obj.dir, "deploy.mcl")
 	data := []byte(code)
-	if err := ioutil.WriteFile(filename, data, fileMode); err != nil {
+	if err := os.WriteFile(filename, data, fileMode); err != nil {
 		return err
 	}
 
@@ -372,7 +460,7 @@ func (obj *Instance) DeployLang(code string) error {
 	cmdArgs := []string{
 		"deploy", // mode
 		"--no-git",
-		"--seeds", obj.clientURL,
+		fmt.Sprintf("--seeds=%s", obj.clientURL),
 		"lang", filename,
 	}
 	obj.Logf("run: %s %s", cmdName, strings.Join(cmdArgs, " "))
@@ -394,7 +482,7 @@ func (obj *Instance) Dir() string {
 
 // CombinedOutput returns the logged output from the instance.
 func (obj *Instance) CombinedOutput() (string, error) {
-	contents, err := ioutil.ReadFile(path.Join(obj.dir, StdoutStderrFile))
+	contents, err := os.ReadFile(path.Join(obj.dir, StdoutStderrFile))
 	if err != nil {
 		return "", err
 	}

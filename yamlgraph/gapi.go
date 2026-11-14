@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,19 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package yamlgraph
 
@@ -22,16 +34,17 @@ import (
 	"fmt"
 	"sync"
 
+	cliUtil "github.com/purpleidea/mgmt/cli/util"
+	"github.com/purpleidea/mgmt/engine"
 	"github.com/purpleidea/mgmt/gapi"
 	"github.com/purpleidea/mgmt/pgraph"
 	"github.com/purpleidea/mgmt/util/errwrap"
-
-	"github.com/urfave/cli/v2"
 )
 
 const (
 	// Name is the name of this frontend.
 	Name = "yaml"
+
 	// Start is the entry point filename that we use. It is arbitrary.
 	Start = "/start.yaml"
 )
@@ -47,54 +60,42 @@ type GAPI struct {
 	data        *gapi.Data
 	initialized bool
 	closeChan   chan struct{}
+	cancel      func()         // shuts down the Next goroutine
 	wg          sync.WaitGroup // sync group for tunnel go routines
+	err         error
+	errMutex    *sync.Mutex // guards err
 }
 
-// CliFlags returns a list of flags used by the specified subcommand.
-func (obj *GAPI) CliFlags(command string) []cli.Flag {
-	switch command {
-	case gapi.CommandRun:
-		fallthrough
-	case gapi.CommandDeploy:
-		return []cli.Flag{}
-	//case gapi.CommandGet:
-	default:
-		return []cli.Flag{}
+// Cli takes an *Info struct, and returns our deploy if activated, and if there
+// are any validation problems, you should return an error. If there is no
+// deploy, then you should return a nil deploy and a nil error.
+func (obj *GAPI) Cli(info *gapi.Info) (*gapi.Deploy, error) {
+	args, ok := info.Args.(*cliUtil.YamlArgs)
+	if !ok {
+		// programming error
+		return nil, fmt.Errorf("could not convert to our struct")
 	}
-}
 
-// Cli takes a cli.Context, and returns our GAPI if activated. All arguments
-// should take the prefix of the registered name. On activation, if there are
-// any validation problems, you should return an error. If this was not
-// activated, then you should return a nil GAPI and a nil error.
-func (obj *GAPI) Cli(cliInfo *gapi.CliInfo) (*gapi.Deploy, error) {
-	c := cliInfo.CliContext
-	fs := cliInfo.Fs
-	//debug := cliInfo.Debug
+	fs := info.Fs
+	//debug := info.Debug
 	//logf := func(format string, v ...interface{}) {
-	//	 cliInfo.Logf(Name + ": "+format, v...)
+	//	 info.Logf(Name + ": "+format, v...)
 	//}
 
-	if l := c.NArg(); l != 1 {
-		if l > 1 {
-			return nil, fmt.Errorf("input program must be a single arg")
-		}
-		return nil, fmt.Errorf("must specify input program")
-	}
-	s := c.Args().Get(0)
-	if s == "" {
-		return nil, fmt.Errorf("input yaml is empty")
+	writeableFS, ok := fs.(engine.WriteableFS)
+	if !ok {
+		return nil, fmt.Errorf("the FS was not writeable")
 	}
 
 	// single file input only
-	if err := gapi.CopyFileToFs(fs, s, Start); err != nil {
-		return nil, errwrap.Wrapf(err, "can't copy yaml from `%s` to `%s`", s, Start)
+	if err := gapi.CopyFileToFs(writeableFS, args.Input, Start); err != nil {
+		return nil, errwrap.Wrapf(err, "can't copy yaml from `%s` to `%s`", args.Input, Start)
 	}
 
 	return &gapi.Deploy{
 		Name: Name,
-		Noop: c.Bool("noop"),
-		Sema: c.Int("sema"),
+		Noop: info.Flags.Noop,
+		Sema: info.Flags.Sema,
 		GAPI: &GAPI{
 			InputURI: fs.URI(),
 			// TODO: add properties here...
@@ -112,17 +113,25 @@ func (obj *GAPI) Init(data *gapi.Data) error {
 	}
 	obj.data = data // store for later
 	obj.closeChan = make(chan struct{})
+	obj.errMutex = &sync.Mutex{}
 	obj.initialized = true
 	return nil
 }
 
-// Graph returns a current Graph.
-func (obj *GAPI) Graph() (*pgraph.Graph, error) {
+// Info returns some data about the GAPI implementation.
+func (obj *GAPI) Info() *gapi.InfoResult {
+	return &gapi.InfoResult{
+		URI: obj.InputURI,
+	}
+}
+
+// graph returns a current Graph.
+func (obj *GAPI) graph() (*pgraph.Graph, error) {
 	if !obj.initialized {
 		return nil, fmt.Errorf("%s: GAPI is not initialized", Name)
 	}
 
-	fs, err := obj.data.World.Fs(obj.InputURI) // open the remote file system
+	fs, err := obj.data.World.Fs(context.TODO(), obj.InputURI) // open the remote file system
 	if err != nil {
 		return nil, errwrap.Wrapf(err, "can't load yaml from file system `%s`", obj.InputURI)
 	}
@@ -150,23 +159,30 @@ func (obj *GAPI) Graph() (*pgraph.Graph, error) {
 }
 
 // Next returns nil errors every time there could be a new graph.
-func (obj *GAPI) Next() chan gapi.Next {
+func (obj *GAPI) Next(ctx context.Context) chan gapi.Next {
 	ch := make(chan gapi.Next)
+	// Wrap the incoming context so that Cleanup can shut us down on our own
+	// (eg: when a new deploy replaces us) without cancelling our parent.
+	ctx, obj.cancel = context.WithCancel(ctx)
 	obj.wg.Add(1)
 	go func() {
 		defer obj.wg.Done()
 		defer close(ch) // this will run before the obj.wg.Done()
 		if !obj.initialized {
+			err := fmt.Errorf("%s: GAPI is not initialized", Name)
 			next := gapi.Next{
-				Err:  fmt.Errorf("%s: GAPI is not initialized", Name),
+				Err:  err,
 				Exit: true, // exit, b/c programming error?
 			}
-			ch <- next
+			select {
+			case ch <- next:
+			case <-ctx.Done():
+				obj.errAppend(ctx.Err())
+				return
+			}
+			obj.errAppend(err)
 			return
 		}
-		// FIXME: add timeout to context
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
 
 		startChan := make(chan struct{}) // start signal
 		close(startChan)                 // kick it off!
@@ -175,16 +191,17 @@ func (obj *GAPI) Next() chan gapi.Next {
 		if obj.data.NoStreamWatch {
 			watchChan = nil
 		} else {
-			var err error
-			watchChan, err = obj.data.World.ResWatch(ctx)
-			if err != nil {
-				next := gapi.Next{
-					Err:  errwrap.Wrapf(err, "%s: could not start watch", Name),
-					Exit: true, // exit, b/c programming error?
-				}
-				ch <- next
-				return
-			}
+			// XXX: disabled for now until someone ports to new API.
+			//var err error
+			//watchChan, err = obj.data.World.ResWatch(ctx)
+			//if err != nil {
+			//	next := gapi.Next{
+			//		Err:  errwrap.Wrapf(err, "%s: could not start watch", Name),
+			//		Exit: true, // exit, b/c programming error?
+			//	}
+			//	ch <- next
+			//	return
+			//}
 		}
 
 		for {
@@ -198,12 +215,19 @@ func (obj *GAPI) Next() chan gapi.Next {
 				if !ok {
 					return
 				}
-			case <-obj.closeChan:
+			case <-ctx.Done():
 				return
 			}
 
 			obj.data.Logf("generating new graph...")
+			g, err := obj.graph()
+			if err != nil {
+				obj.errAppend(err)
+				return
+			}
+
 			next := gapi.Next{
+				Graph: g,
 				//Exit: true, // TODO: for permanent shutdown!
 				Err: err,
 			}
@@ -214,7 +238,7 @@ func (obj *GAPI) Next() chan gapi.Next {
 				//	return
 				//}
 			// unblock if we exit while waiting to send!
-			case <-obj.closeChan:
+			case <-ctx.Done():
 				return
 			}
 		}
@@ -222,13 +246,28 @@ func (obj *GAPI) Next() chan gapi.Next {
 	return ch
 }
 
-// Close shuts down the yamlgraph GAPI.
-func (obj *GAPI) Close() error {
-	if !obj.initialized {
-		return fmt.Errorf("%s: GAPI is not initialized", Name)
+// Cleanup shuts the GAPI down and waits for it to finish before it returns. It
+// cancels the context we wrapped in Next and blocks until the Next goroutine
+// has exited. The context.Canceled that results from our own cancellation is
+// filtered out, so this returns nil on a clean shutdown.
+func (obj *GAPI) Cleanup() error {
+	if obj.cancel == nil {
+		return nil // Next was never called; nothing to shut down
 	}
-	close(obj.closeChan)
+	obj.cancel()
+	return errwrap.NoContextCanceled(errwrap.WithoutContext(obj.Err()))
+}
+
+// Err will contain the last error when Next shuts down. It waits for all the
+// running processes to exit before it returns.
+func (obj *GAPI) Err() error {
 	obj.wg.Wait()
-	obj.initialized = false // closed = true
-	return nil
+	return obj.err
+}
+
+// errAppend is a simple helper function.
+func (obj *GAPI) errAppend(err error) {
+	obj.errMutex.Lock()
+	obj.err = errwrap.Append(obj.err, err)
+	obj.errMutex.Unlock()
 }

@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,19 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package util
 
@@ -22,15 +34,36 @@ import (
 	"io"
 	"os"
 	"path"
+	"path/filepath"
 
 	"github.com/spf13/afero"
 )
 
+// FsWalk walks the file tree rooted at the named root, calling walkFn for each
+// file or directory in the tree, including the root. It is a thin wrapper, and
+// it exists so that a caller which already has one of our filesystems doesn't
+// have to name the underlying implementation to walk it. The standard library
+// io/fs.WalkDir is only usable on a read-only filesystem, so we can't use that
+// here.
+func FsWalk(fs afero.Fs, root string, walkFn filepath.WalkFunc) error {
+	return afero.Walk(fs, root, walkFn)
+}
+
 // FsTree returns a string representation of the file system tree similar to the
 // well-known `tree` command.
 func FsTree(fs afero.Fs, name string) (string, error) {
-	str := ".\n" // top level dir
-	s, err := stringify(fs, path.Clean(name), []bool{})
+	if fs == nil {
+		return "", fmt.Errorf("nil fs")
+	}
+	clean := path.Clean(name)
+	str := clean + "/\n" // named dir
+	if name == "" {
+		str = ".\n" // relative dir
+	}
+	if name == "/" {
+		str = "/\n" // root dir
+	}
+	s, err := stringify(fs, clean, []bool{})
 	if err != nil {
 		return "", err
 	}

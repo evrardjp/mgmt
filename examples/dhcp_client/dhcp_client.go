@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,7 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 package main
 
@@ -92,16 +92,16 @@ func main() {
 	// TODO: add modifiers
 
 	log.Printf("Requesting...")
-	ctx := context.Background()                     // TODO: add to ^C handler
-	offer, ack, err := c.Request(ctx, modifiers...) // (offer, ack *dhcpv4.DHCPv4, err error)
+	ctx := context.Background()                // TODO: add to ^C handler
+	lease, err := c.Request(ctx, modifiers...) // (lease *Lease, err error)
 	if err != nil {
 		log.Printf("Error requesting from server: %v", err)
 		return
 	}
 
 	// Show the results of the D-O-R-A exchange.
-	log.Printf("Offer: %+v", offer)
-	log.Printf("Ack: %+v", ack)
+	log.Printf("Offer: %+v", lease.Offer)
+	log.Printf("Ack: %+v", lease.ACK)
 
 	log.Printf("Done!")
 }

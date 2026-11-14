@@ -1,0 +1,332 @@
+// Mgmt
+// Copyright (C) James Shubin and the project contributors
+// Written by James Shubin <james@shubin.ca> and the project contributors
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
+
+//go:build !novirt
+
+package resources
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"math/rand"
+	"net"
+	"sync"
+	"time"
+
+	"github.com/purpleidea/mgmt/engine"
+	"github.com/purpleidea/mgmt/util/errwrap"
+
+	libvirt "libvirt.org/go/libvirt"       // gitlab.com/libvirt/libvirt-go-module
+	libvirtxml "libvirt.org/go/libvirtxml" // gitlab.com/libvirt/libvirt-go-xml-module
+)
+
+var (
+	// shared by all virt resources
+	libvirtMutex          *sync.Mutex
+	libvirtInitialized                           = false
+	libvirtBackgroundPool *engine.BackgroundPool = nil
+)
+
+func init() {
+	libvirtMutex = &sync.Mutex{}
+}
+
+type virtURISchemeType int
+
+const (
+	defaultURI virtURISchemeType = iota
+	lxcURI
+)
+
+// libvirtAvailable returns an error if we can't use the libvirt library. It is
+// normally loaded at runtime instead of being linked, so this is called in the
+// Init method of the virt resources, so they can fail early with a useful error
+// instead of later on, when something first tries to use libvirt. The mutex is
+// held since the first call is what loads the library, which isn't thread-safe.
+func libvirtAvailable() error {
+	libvirtMutex.Lock()
+	defer libvirtMutex.Unlock()
+
+	if _, err := libvirt.GetVersion(); err != nil {
+		return errwrap.Wrapf(err, "can't use libvirt, is it installed?")
+	}
+	return nil
+}
+
+// libvirtInit is called in the Init method of any virt resource or instead in
+// the Background method if that exists. It must be run before any connection to
+// the hypervisor is made! It only has to be done once for all virt resources.
+func libvirtInit() error {
+	libvirtMutex.Lock()
+	defer libvirtMutex.Unlock()
+
+	if libvirtInitialized {
+		return nil // done early
+	}
+
+	if err := libvirt.EventRegisterDefaultImpl(); err != nil {
+		return errwrap.Wrapf(err, "method EventRegisterDefaultImpl failed")
+	}
+	libvirtInitialized = true
+
+	return nil
+}
+
+// generateLibvirtBackground generates the correct background function for virt.
+func generateLibvirtBackground(handle *engine.BackgroundHandle) engine.BackgroundFunc {
+	// This is the function used by the virt resource Background funcs.
+	return func(ctx context.Context, ready chan<- struct{}) error {
+		if err := libvirtInit(); err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		// Register a disabled timeout. It fires when we cancel the ctx so that
+		// EventRunDefaultImpl unblocks immediately instead of waiting for its
+		// internal ~5s poll interval.
+		timerID, err := libvirt.EventAddTimeout(-1, func(int) {})
+		if err != nil {
+			return errwrap.Wrapf(err, "EventAddTimeout failed")
+		}
+		defer libvirt.EventRemoveTimeout(timerID)
+
+		wg := sync.WaitGroup{}
+		defer wg.Wait()
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case <-ctx.Done(): // wait until ctx exits
+			}
+			// Setting freq to 0 schedules immediate firing, which causes
+			// EventRunDefaultImpl to return so that the loop below notices
+			// the done ctx when it next iterates.
+			libvirt.EventUpdateTimeout(timerID, 0)
+		}()
+
+		close(ready)   // ready to go!
+		defer cancel() // XXX: would an error below cause a block above?
+		if handle.Debug || true {
+			// NOTE: the logf prefix might be misleading since this
+			// is a shared background between all libvirt resources
+			handle.Logf("running...")
+			defer handle.Logf("stopped!")
+		}
+		for {
+			// loop forever...
+			if err := libvirt.EventRunDefaultImpl(); err != nil {
+				// XXX: should we actually exit on error here?
+				return errwrap.Wrapf(err, "EventRunDefaultImpl failed")
+			}
+
+			select {
+			case <-ctx.Done():
+				return ctx.Err() // safe to return the ctx err!
+			default:
+			}
+		}
+	}
+}
+
+// libvirtNewBackgroundBool returns the pooled background function that is used
+// for wrapping all the background functions used by different virt resources.
+func libvirtNewBackgroundBool(handle *engine.BackgroundHandle) engine.BackgroundFunc {
+	libvirtMutex.Lock()
+	defer libvirtMutex.Unlock()
+
+	if libvirtBackgroundPool != nil {
+		return libvirtBackgroundPool.Background // done early
+	}
+
+	fn := generateLibvirtBackground(handle)
+	libvirtBackgroundPool = engine.NewBackgroundPool(fn)
+	return libvirtBackgroundPool.Background
+}
+
+// randMAC returns a random mac address in the libvirt range.
+func randMAC() string {
+	rand.Seed(time.Now().UnixNano())
+	// non-crypto pseudo-random is sufficient for a MAC address
+	//nolint:gosec // G404: not used for anything security-sensitive
+	a, b, c := rand.Intn(255), rand.Intn(255), rand.Intn(255)
+	return fmt.Sprintf("52:54:00:%x:%x:%x", a, b, c)
+}
+
+// isNotFound tells us if this is a domain or network not found error.
+// TODO: expand this with other ERR_NO_? values eventually.
+func isNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	virErr, ok := err.(libvirt.Error)
+	if !ok {
+		return false
+	}
+
+	if virErr.Code == libvirt.ERR_NO_DOMAIN {
+		// domain not found
+		return true
+	}
+	if virErr.Code == libvirt.ERR_NO_NETWORK {
+		// network not found
+		return true
+	}
+
+	return false // some other error
+}
+
+// VirtAuth is used to pass credentials to libvirt.
+type VirtAuth struct {
+	Username string `lang:"username" yaml:"username"`
+	Password string `lang:"password" yaml:"password"`
+}
+
+// Cmp compares two VirtAuth structs. It errors if they are not identical.
+func (obj *VirtAuth) Cmp(auth *VirtAuth) error {
+	if (obj == nil) != (auth == nil) { // xor
+		return fmt.Errorf("the VirtAuth differs")
+	}
+	if obj == nil && auth == nil {
+		return nil
+	}
+
+	if obj.Username != auth.Username {
+		return fmt.Errorf("the Username differs")
+	}
+	if obj.Password != auth.Password {
+		return fmt.Errorf("the Password differs")
+	}
+	return nil
+}
+
+// Connect is the connect helper for the libvirt connection. It can handle auth.
+func (obj *VirtAuth) Connect(uri string) (conn *libvirt.Connect, version uint32, err error) {
+	if obj != nil {
+		callback := func(creds []*libvirt.ConnectCredential) {
+			// Populate credential structs with the
+			// prepared username/password values
+			for _, cred := range creds {
+				if cred.Type == libvirt.CRED_AUTHNAME {
+					cred.Result = obj.Username
+					cred.ResultLen = len(cred.Result)
+				} else if cred.Type == libvirt.CRED_PASSPHRASE {
+					cred.Result = obj.Password
+					cred.ResultLen = len(cred.Result)
+				}
+			}
+		}
+		auth := &libvirt.ConnectAuth{
+			CredType: []libvirt.ConnectCredentialType{
+				libvirt.CRED_AUTHNAME, libvirt.CRED_PASSPHRASE,
+			},
+			Callback: callback,
+		}
+		conn, err = libvirt.NewConnectWithAuth(uri, auth, 0)
+		if err == nil {
+			if v, err := conn.GetLibVersion(); err == nil {
+				version = v
+			}
+		}
+	}
+	if obj == nil || err != nil {
+		conn, err = libvirt.NewConnect(uri)
+		if err == nil {
+			if v, err := conn.GetLibVersion(); err == nil {
+				version = v
+			}
+		}
+	}
+	return
+}
+
+// networkIPIsIPv4 reports whether a libvirt network IP entry looks like IPv4.
+func networkIPIsIPv4(ip libvirtxml.NetworkIP) bool {
+	switch ip.Family {
+	case "ipv6":
+		return false
+	case "ipv4":
+		return true
+	}
+	parsed := net.ParseIP(ip.Address)
+	return parsed != nil && parsed.To4() != nil
+}
+
+// validateUsableIPv4 checks that addr belongs to ipNet and is not the network
+// or broadcast address for ordinary IPv4 subnets.
+func validateUsableIPv4(label string, addr net.IP, ipNet *net.IPNet) error {
+	if !ipNet.Contains(addr) {
+		return fmt.Errorf("%s %s is not within network %s", label, addr, ipNet)
+	}
+	network, broadcast, ok := ipv4NetworkBounds(ipNet)
+	if !ok {
+		return nil
+	}
+	if addr.Equal(network) || addr.Equal(broadcast) {
+		return fmt.Errorf("%s %s cannot be the network or broadcast address of %s", label, addr, ipNet)
+	}
+	return nil
+}
+
+// ipv4NetworkBounds returns the network and broadcast addresses for IPv4
+// subnets that have distinct host addresses.
+func ipv4NetworkBounds(ipNet *net.IPNet) (net.IP, net.IP, bool) {
+	ones, bits := ipNet.Mask.Size()
+	if bits != 32 || ones > 30 {
+		return nil, nil, false
+	}
+	network := ipNet.IP.To4()
+	if network == nil {
+		return nil, nil, false
+	}
+	broadcast := make(net.IP, net.IPv4len)
+	for i := range broadcast {
+		broadcast[i] = network[i] | ^ipNet.Mask[i]
+	}
+	return network, broadcast, true
+}
+
+// ipv4Between reports whether ip is within the inclusive start/end range.
+func ipv4Between(ip, start, end net.IP) bool {
+	return bytes.Compare(start, ip) <= 0 && bytes.Compare(ip, end) <= 0
+}
+
+// ipv4RangesOverlap reports whether two inclusive IPv4 ranges overlap.
+func ipv4RangesOverlap(aStart, aEnd, bStart, bEnd net.IP) bool {
+	return ipv4Between(aStart, bStart, bEnd) || ipv4Between(bStart, aStart, aEnd)
+}
+
+// hostsEqual compares two DHCP host entries on the fields we actually set.
+func hostsEqual(a, b libvirtxml.NetworkDHCPHost) bool {
+	return a.MAC == b.MAC && a.Name == b.Name && a.IP == b.IP
+}

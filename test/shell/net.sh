@@ -1,14 +1,14 @@
-#!/bin/bash -e
+#!/usr/bin/env -S bash -e
 
 . "$(dirname "$0")/../util.sh"
 
-if in_ci travis; then
+if in_env travis; then
 	# this often fails in travis with: `address already in use`
 	echo "Travis gives wonky results here, skipping test!"
 	exit
 fi
 
-if in_ci github; then
+if in_env github; then
 	# TODO: consider debugging this
 	echo "This is failing in github, skipping test!"
 	exit
@@ -58,7 +58,7 @@ sudo mkdir -p /etc/systemd/network
 sudo ip link add $IFACE type dummy || true
 
 # run mgmt net res with $IFACE and $ADDR set as above
-sudo -A $TIMEOUT "$MGMT" run --converged-timeout=5 --tmp-prefix lang ./net0.mcl &
+sudo -A $TIMEOUT "$MGMT" run --converger-timeout=5 --converged-exit --tmp-prefix lang ./net0.mcl &
 pid1=$!
 
 # give the engine time to start up
@@ -99,7 +99,7 @@ wait $pid1
 e1=$?
 
 # run mgmt net res with $IFACE state => "down"
-sudo -A $TIMEOUT "$MGMT" run --converged-timeout=5 --tmp-prefix lang ./net1.mcl &
+sudo -A $TIMEOUT "$MGMT" run --converger-timeout=5 --converged-exit --tmp-prefix lang ./net1.mcl &
 
 # give the engine time to start up
 sleep 5

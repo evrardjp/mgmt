@@ -1,8 +1,8 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 . "$(dirname "$0")/../util.sh"
 
-if in_ci github; then
+if in_env github; then
 	# TODO: consider debugging this
 	echo "This is failing in github, skipping test!"
 	exit
@@ -46,7 +46,7 @@ function run_usergroup_test() {
 	setup
 
 	# run till completion
-	sudo -A $TIMEOUT "$MGMT" run --converged-timeout=15 --no-watch --tmp-prefix yaml ./exec-usergroup/${graph} &
+	sudo -A $TIMEOUT "$MGMT" run --converger-timeout=15 --converged-exit --no-watch --tmp-prefix yaml ./exec-usergroup/${graph} &
 	pid=$!
 	wait $pid	# get exit status
 	e=$?

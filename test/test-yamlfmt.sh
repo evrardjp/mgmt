@@ -1,11 +1,11 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # check for any yaml files that aren't properly formatted
 
 exit 0	# i give up, we're skipping this entirely, help wanted to fix this
 
 echo running "$0"
 set -o errexit
-set -o nounset
+#set -o nounset
 set -o pipefail
 
 #ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && cd .. && pwd )"	# dir!
@@ -13,7 +13,7 @@ ROOT=$(dirname "${BASH_SOURCE}")/..
 cd "${ROOT}"
 . test/util.sh
 
-#if in_ci travis jenkins; then
+#if in_env travis jenkins; then
 #	echo "Travis and Jenkins give wonky results here, skipping test!"
 #	exit 0
 #fi
@@ -48,7 +48,7 @@ if [ "$major" -eq 2 ] && [ "$minor" -lt 1 ] ; then
 fi
 
 find_files() {
-	git ls-files | grep '\.yaml$'
+	repo_files | grep '\.yaml$'
 }
 
 bad_files=$(

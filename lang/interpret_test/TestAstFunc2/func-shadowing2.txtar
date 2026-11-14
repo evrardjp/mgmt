@@ -1,0 +1,9 @@
+-- main.mcl --
+$foo = "bad1"
+$bar = func($foo) {
+	"hello " + $foo # shadows parent var
+}
+$name = $bar("world")
+test "${name}" {}
+-- OUTPUT --
+Vertex: test[hello world]

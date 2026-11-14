@@ -1,0 +1,45 @@
+-- main.mcl --
+$l1 = ["a", "b", "c"]
+
+$l2 = [$l1, ["hello", "world"]]
+
+test [$l1[0] <|> "fail"] {}
+test [$l1[2] <|> "fail"] {}
+test [$l1[3] <|> "pass"] {}
+test $l2[1] <|> ["fail"] {}
+
+$map1 map{int: str} = {42 => "hello1"}
+$name1 = $map1[42] <|> "not found"
+test "${name1}" {}
+
+$map2 map{int: str} = {42 => "hello2"}
+$name2 = $map2[13] <|> "world2"
+test "${name2}" {}
+
+$map3 = {42 => "hello3"}
+$name3 = $map3[42] <|> "not found"
+test "${name3}" {}
+
+$map4 = {42 => "hello4"}
+$name4 = $map4[13] <|> "world4"
+test "${name4}" {}
+
+$map5 = {"wow" => "pass1"}
+$name5 = $map5["wow"] <|> "fail"
+test "${name5}" {}
+
+$map6 = {"wow" => "fail"}
+$name6 = $map6["mom"] <|> "pass2"
+test "${name6}" {}
+-- OUTPUT --
+Vertex: test[a]
+Vertex: test[c]
+Vertex: test[hello1]
+Vertex: test[hello3]
+Vertex: test[hello]
+Vertex: test[pass1]
+Vertex: test[pass2]
+Vertex: test[pass]
+Vertex: test[world2]
+Vertex: test[world4]
+Vertex: test[world]

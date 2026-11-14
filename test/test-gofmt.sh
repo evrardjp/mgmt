@@ -1,9 +1,9 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # original version of this script from kubernetes project, under ALv2 license
 
 echo running "$0"
 set -o errexit
-set -o nounset
+#set -o nounset
 set -o pipefail
 
 #ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && cd .. && pwd )"	# dir!
@@ -12,7 +12,7 @@ cd "${ROOT}"
 . test/util.sh
 
 find_files() {
-	git ls-files | grep '\.go$'
+	repo_files | grep '\.go$'
 }
 
 # gofmt -s -l

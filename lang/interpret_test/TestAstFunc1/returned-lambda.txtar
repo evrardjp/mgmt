@@ -1,0 +1,17 @@
+-- main.mcl --
+$funcgen = func() {
+	func() {
+		"hello"
+	}
+}
+
+$fn = $funcgen()
+$out = $fn()
+
+test "${out}" {}
+-- OUTPUT --
+Edge: FuncValue -> call # fn
+Edge: call -> callSubgraphOutput # dummy
+Vertex: FuncValue
+Vertex: call
+Vertex: callSubgraphOutput

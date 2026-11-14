@@ -1,8 +1,8 @@
-#!/bin/bash -e
+#!/usr/bin/env -S bash -e
 
 . "$(dirname "$0")/../util.sh"
 
-if in_ci github; then
+if in_env github; then
 	# TODO: consider debugging this
 	echo "This is failing in github, skipping test!"
 	exit
@@ -13,11 +13,11 @@ $TIMEOUT "$MGMT" run --hostname h1 --tmp-prefix empty &
 pid1=$!
 sleep 45s	# let it startup
 
-$TIMEOUT "$MGMT" run --hostname h2 --seeds http://127.0.0.1:2379 --client-urls http://127.0.0.1:2381 --server-urls http://127.0.0.1:2382 --tmp-prefix empty &
+$TIMEOUT "$MGMT" run --hostname h2 --seeds=http://127.0.0.1:2379 --client-urls=http://127.0.0.1:2381 --server-urls=http://127.0.0.1:2382 --tmp-prefix empty &
 pid2=$!
 sleep 45s
 
-$TIMEOUT "$MGMT" run --hostname h3 --seeds http://127.0.0.1:2379 --client-urls http://127.0.0.1:2383 --server-urls http://127.0.0.1:2384 --tmp-prefix empty &
+$TIMEOUT "$MGMT" run --hostname h3 --seeds=http://127.0.0.1:2379 --client-urls=http://127.0.0.1:2383 --server-urls=http://127.0.0.1:2384 --tmp-prefix empty &
 pid3=$!
 sleep 45s
 

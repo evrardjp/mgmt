@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,16 +13,32 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package resources
 
 import (
+	"context"
 	"fmt"
 	"reflect"
+	"strings"
+	"time"
 
 	"github.com/purpleidea/mgmt/engine"
 	"github.com/purpleidea/mgmt/engine/traits"
+	"github.com/purpleidea/mgmt/util"
 )
 
 func init() {
@@ -54,7 +70,8 @@ type TestRes struct {
 	Uint32 uint32 `lang:"uint32" yaml:"uint32"`
 	Uint64 uint64 `lang:"uint64" yaml:"uint64"`
 
-	//Uintptr uintptr `yaml:"uintptr"`
+	//Uintptr uintptr `lang:"uintptr" yaml:"uintptr"`
+
 	Byte byte `lang:"byte" yaml:"byte"` // alias for uint8
 	Rune rune `lang:"rune" yaml:"rune"` // alias for int32, represents a Unicode code point
 
@@ -69,26 +86,42 @@ type TestRes struct {
 	Int8Ptr   *int8   `lang:"int8ptr" yaml:"int8ptr"`
 	Uint8Ptr  *uint8  `lang:"uint8ptr" yaml:"uint8ptr"`
 
-	// probably makes no sense, but is legal
+	// Int8PtrPtrPtr probably makes no sense, but is legal.
 	Int8PtrPtrPtr ***int8 `lang:"int8ptrptrptr" yaml:"int8ptrptrptr"`
 
 	SliceString []string          `lang:"slicestring" yaml:"slicestring"`
 	MapIntFloat map[int64]float64 `lang:"mapintfloat" yaml:"mapintfloat"`
+	MapBoolStr  map[bool]string   `lang:"mapboolstr" yaml:"mapboolstr"`
 	MixedStruct struct {
-		somebool  bool
-		somestr   string
-		someint   int64
-		somefloat float64
+		SomeBool         bool    `lang:"somebool" yaml:"somebool"`
+		SomeStr          string  `lang:"somestr" yaml:"somestr"`
+		SomeInt          int64   `lang:"someint" yaml:"someint"`
+		SomeFloat        float64 `lang:"somefloat" yaml:"somefloat"`
+		somePrivatefield string
 	} `lang:"mixedstruct" yaml:"mixedstruct"`
 	Interface interface{} `lang:"interface" yaml:"interface"`
 
 	AnotherStr string `lang:"anotherstr" yaml:"anotherstr"`
 
-	ValidateBool  bool   `lang:"validatebool" yaml:"validate_bool"`   // set to true to cause a validate error
-	ValidateError string `lang:"validateerror" yaml:"validate_error"` // set to cause a validate error
-	AlwaysGroup   bool   `lang:"alwaysgroup" yaml:"always_group"`     // set to true to cause auto grouping
-	CompareFail   bool   `lang:"comparefail" yaml:"compare_fail"`     // will compare fail?
-	SendValue     string `lang:"sendvalue" yaml:"send_value"`         // what value should we send?
+	// Func1 passes the value 42 to the input and returns a string.
+	//
+	// XXX: Lang can't set func fields yet (see the *FuncValue case in
+	// types.Into) and a bare func can't be encoded, so omitzero makes
+	// encoding a nil func skip it, and a set one error. To support this,
+	// wrap the func in a type that also stores a description of what func
+	// it was (eg: a builtin name and type) and encode that instead, so it
+	// can be rebuilt after decoding. A pointer to the func can't serve as
+	// its identity, since all reflect.MakeFunc funcs share one pointer.
+	Func1 func(int) string `lang:"func1" yaml:"func1" json:",omitzero"`
+
+	ValidateBool  bool      `lang:"validatebool" yaml:"validate_bool"`   // set to true to cause a validate error
+	ValidateError string    `lang:"validateerror" yaml:"validate_error"` // set to cause a validate error
+	AlwaysGroup   bool      `lang:"alwaysgroup" yaml:"always_group"`     // set to true to cause auto grouping
+	CompareFail   bool      `lang:"comparefail" yaml:"compare_fail"`     // will compare fail?
+	SendValue     string    `lang:"sendvalue" yaml:"send_value"`         // what value should we send?
+	ExpectRecv    *[]string `lang:"expectrecv" yaml:"expect_recv"`       // what keys should we expect from send/recv?
+	OnlyShow      []string  `lang:"onlyshow" yaml:"only_show"`           // what values do we show?
+	WaitForError  int64     `lang:"waitforerror" yaml:"waitforerror"`    // block in check apply for this many ms then error
 
 	// TODO: add more fun properties!
 
@@ -118,72 +151,100 @@ func (obj *TestRes) Init(init *engine.Init) error {
 	return nil
 }
 
-// Close is run by the engine to clean up after the resource is done.
-func (obj *TestRes) Close() error {
+// Cleanup is run by the engine to clean up after the resource is done.
+func (obj *TestRes) Cleanup() error {
 	return nil
 }
 
 // Watch is the primary listener for this resource and it outputs events.
-func (obj *TestRes) Watch() error {
-	obj.init.Running() // when started, notify engine that we're running
-
-	select {
-	case <-obj.init.Done: // closed by the engine to signal shutdown
+func (obj *TestRes) Watch(ctx context.Context) error {
+	if err := obj.init.Event(ctx); err != nil {
+		return err
 	}
 
-	//obj.init.Event() // notify engine of an event (this can block)
+	select {
+	case <-ctx.Done(): // closed by the engine to signal shutdown
+	}
 
-	return nil
+	return ctx.Err()
 }
 
 // CheckApply method for Test resource. Does nothing, returns happy!
-func (obj *TestRes) CheckApply(apply bool) (bool, error) {
+func (obj *TestRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
+	expectRecv := []string{}
 	for key, val := range obj.init.Recv() {
-		obj.init.Logf("CheckApply: Received `%s`, changed: %t", key, val.Changed)
+		obj.init.Logf("received `%s`, changed: %t", key, val.Changed)
+		expectRecv = append(expectRecv, key)
 	}
 
 	if obj.init.Refresh() {
 		obj.init.Logf("Received a notification!")
 	}
 
-	obj.init.Logf("%s: Bool:          %v", obj, obj.Bool)
-	obj.init.Logf("%s: Str:           %v", obj, obj.Str)
+	if obj.ExpectRecv != nil && len(*obj.ExpectRecv) != len(expectRecv) {
+		return false, fmt.Errorf("the received keys differ from expected, got: %+v", expectRecv)
+	}
 
-	obj.init.Logf("%s: Int:           %v", obj, obj.Int)
-	obj.init.Logf("%s: Int8:          %v", obj, obj.Int8)
-	obj.init.Logf("%s: Int16:         %v", obj, obj.Int16)
-	obj.init.Logf("%s: Int32:         %v", obj, obj.Int32)
-	obj.init.Logf("%s: Int64:         %v", obj, obj.Int64)
+	fakeLogf := func(format string, v ...interface{}) {
+		key := format[0:strings.LastIndex(format, ":")]
+		if len(obj.OnlyShow) == 0 || util.StrInList(key, obj.OnlyShow) {
+			obj.init.Logf(format, v...)
+		}
+	}
 
-	obj.init.Logf("%s: Uint:          %v", obj, obj.Uint)
-	obj.init.Logf("%s: Uint8:         %v", obj, obj.Uint)
-	obj.init.Logf("%s: Uint16:        %v", obj, obj.Uint)
-	obj.init.Logf("%s: Uint32:        %v", obj, obj.Uint)
-	obj.init.Logf("%s: Uint64:        %v", obj, obj.Uint)
+	if duration := time.Duration(obj.WaitForError) * time.Millisecond; duration > 0 {
+		select {
+		case <-time.After(duration):
+			return false, fmt.Errorf("waitforerror %.4f seconds", duration.Seconds())
 
-	//obj.init.Logf("%s: Uintptr:       %v", obj, obj.Uintptr)
-	obj.init.Logf("%s: Byte:          %v", obj, obj.Byte)
-	obj.init.Logf("%s: Rune:          %v", obj, obj.Rune)
+		case <-ctx.Done(): // comment out this case to simulate a bad res
+			return false, ctx.Err()
+		}
+	}
 
-	obj.init.Logf("%s: Float32:       %v", obj, obj.Float32)
-	obj.init.Logf("%s: Float64:       %v", obj, obj.Float64)
-	obj.init.Logf("%s: Complex64:     %v", obj, obj.Complex64)
-	obj.init.Logf("%s: Complex128:    %v", obj, obj.Complex128)
+	fakeLogf("Bool:          %v", obj.Bool)
+	fakeLogf("Str:           %v", obj.Str)
 
-	obj.init.Logf("%s: BoolPtr:       %v", obj, obj.BoolPtr)
-	obj.init.Logf("%s: StringPtr:     %v", obj, obj.StringPtr)
-	obj.init.Logf("%s: Int64Ptr:      %v", obj, obj.Int64Ptr)
-	obj.init.Logf("%s: Int8Ptr:       %v", obj, obj.Int8Ptr)
-	obj.init.Logf("%s: Uint8Ptr:      %v", obj, obj.Uint8Ptr)
+	fakeLogf("Int:           %v", obj.Int)
+	fakeLogf("Int8:          %v", obj.Int8)
+	fakeLogf("Int16:         %v", obj.Int16)
+	fakeLogf("Int32:         %v", obj.Int32)
+	fakeLogf("Int64:         %v", obj.Int64)
 
-	obj.init.Logf("%s: Int8PtrPtrPtr: %v", obj, obj.Int8PtrPtrPtr)
+	fakeLogf("Uint:          %v", obj.Uint)
+	fakeLogf("Uint8:         %v", obj.Uint)
+	fakeLogf("Uint16:        %v", obj.Uint)
+	fakeLogf("Uint32:        %v", obj.Uint)
+	fakeLogf("Uint64:        %v", obj.Uint)
 
-	obj.init.Logf("%s: SliceString:   %v", obj, obj.SliceString)
-	obj.init.Logf("%s: MapIntFloat:   %v", obj, obj.MapIntFloat)
-	obj.init.Logf("%s: MixedStruct:   %v", obj, obj.MixedStruct)
-	obj.init.Logf("%s: Interface:     %v", obj, obj.Interface)
+	//fakeLogf("Uintptr:       %v", obj.Uintptr)
+	fakeLogf("Byte:          %v", obj.Byte)
+	fakeLogf("Rune:          %v", obj.Rune)
 
-	obj.init.Logf("%s: AnotherStr:    %v", obj, obj.AnotherStr)
+	fakeLogf("Float32:       %v", obj.Float32)
+	fakeLogf("Float64:       %v", obj.Float64)
+	fakeLogf("Complex64:     %v", obj.Complex64)
+	fakeLogf("Complex128:    %v", obj.Complex128)
+
+	fakeLogf("BoolPtr:       %v", obj.BoolPtr)
+	fakeLogf("StringPtr:     %v", obj.StringPtr)
+	fakeLogf("Int64Ptr:      %v", obj.Int64Ptr)
+	fakeLogf("Int8Ptr:       %v", obj.Int8Ptr)
+	fakeLogf("Uint8Ptr:      %v", obj.Uint8Ptr)
+
+	fakeLogf("Int8PtrPtrPtr: %v", obj.Int8PtrPtrPtr)
+
+	fakeLogf("SliceString:   %v", obj.SliceString)
+	fakeLogf("MapIntFloat:   %v", obj.MapIntFloat)
+	fakeLogf("MapBoolStr:    %v", obj.MapBoolStr)
+	fakeLogf("MixedStruct:   %v", obj.MixedStruct)
+	fakeLogf("Interface:     %v", obj.Interface)
+
+	fakeLogf("AnotherStr:    %v", obj.AnotherStr)
+
+	if obj.Func1 != nil {
+		fakeLogf("Func1:         %v", obj.Func1(42))
+	}
 
 	// send
 	hello := obj.SendValue
@@ -330,6 +391,9 @@ func (obj *TestRes) Cmp(r engine.Res) error {
 	if !reflect.DeepEqual(obj.MapIntFloat, res.MapIntFloat) {
 		return fmt.Errorf("the MapIntFloat differs")
 	}
+	if !reflect.DeepEqual(obj.MapBoolStr, res.MapBoolStr) {
+		return fmt.Errorf("the MapBoolStr differs")
+	}
 	if !reflect.DeepEqual(obj.MixedStruct, res.MixedStruct) {
 		return fmt.Errorf("the MixedStruct differs")
 	}
@@ -352,6 +416,30 @@ func (obj *TestRes) Cmp(r engine.Res) error {
 	}
 	if obj.SendValue != res.SendValue {
 		return fmt.Errorf("the SendValue differs")
+	}
+	if (obj.ExpectRecv == nil) != (res.ExpectRecv == nil) { // xor
+		return fmt.Errorf("the ExpectRecv differs")
+	}
+	if obj.ExpectRecv != nil && res.ExpectRecv != nil {
+		if len(*obj.ExpectRecv) != len(*res.ExpectRecv) {
+			return fmt.Errorf("the length of ExpectRecv differs")
+		}
+		for i, x := range *obj.ExpectRecv {
+			if x != (*res.ExpectRecv)[i] {
+				return fmt.Errorf("the item at ExpectRecv index %d differs", i)
+			}
+		}
+	}
+	if len(obj.OnlyShow) != len(res.OnlyShow) {
+		return fmt.Errorf("the length of OnlyShow differs")
+	}
+	for i, x := range obj.OnlyShow {
+		if x != res.OnlyShow[i] {
+			return fmt.Errorf("the item at OnlyShow index %d differs", i)
+		}
+	}
+	if obj.WaitForError != res.WaitForError {
+		return fmt.Errorf("the WaitForError differs")
 	}
 
 	if obj.Comment != res.Comment {
@@ -393,8 +481,8 @@ func (obj *TestRes) GroupCmp(r engine.GroupableRes) error {
 // TestSends is the struct of data which is sent after a successful Apply.
 type TestSends struct {
 	// Hello is some value being sent.
-	Hello  *string `lang:"hello"`
-	Answer int     `lang:"answer"` // some other value being sent
+	Hello  *string `lang:"hello" yaml:"hello"`
+	Answer int     `lang:"answer" yaml:"answer"` // some other value being sent
 }
 
 // Sends represents the default struct of values we can send using Send/Recv.
@@ -402,6 +490,31 @@ func (obj *TestRes) Sends() interface{} {
 	return &TestSends{
 		Hello:  nil,
 		Answer: -1,
+	}
+}
+
+// Background is a worker function which is run once per resource kind as long
+// as there is at least one of that kind running in the active resource graph.
+// The worker function is the generated (returned) function that is used here.
+func (obj *TestRes) Background(handle *engine.BackgroundHandle) engine.BackgroundFunc {
+	return func(ctx context.Context, ready chan<- struct{}) error {
+		defer handle.Logf("stopped!")
+
+		close(ready) // i've started successfully
+
+		// XXX: What if we error 60 sec into running? How should this error be
+		// handled in the resource engine? I suppose everything should shutdown.
+
+		for {
+			handle.Logf("running...")
+			select {
+			case <-time.After(1 * time.Second):
+				continue
+
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 	}
 }
 

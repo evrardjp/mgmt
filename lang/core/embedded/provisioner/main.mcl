@@ -1,0 +1,1890 @@
+# Mgmt
+# Copyright (C) James Shubin and the project contributors
+# Written by James Shubin <james@shubin.ca> and the project contributors
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# Additional permission under GNU GPL version 3 section 7
+#
+# If you modify this program, or any covered work, by linking or combining it
+# with embedded mcl code and modules (and that the embedded mcl code and
+# modules which link with this program, contain a copy of their source code in
+# the authoritative form) containing parts covered by the terms of any other
+# license, the licensors of this program grant you additional permission to
+# convey the resulting work. Furthermore, the licensors of this program grant
+# the original author, James Shubin, additional permission to update this
+# additional permission if he deems it necessary to achieve the goals of this
+# additional permission.
+
+# Run `sudo setcap CAP_NET_BIND_SERVICE=+eip mgmt` first to avoid running as root.
+# based on: https://docs.fedoraproject.org/en-US/fedora/f36/install-guide/advanced/Network_based_Installations/
+
+import "convert"
+import "deploy"
+import "encoding"
+import "fmt"
+import "golang"
+import "golang/path/filepath" as golang_path_filepath
+import "golang/strings" as golang_strings
+import "iter"
+import "list"
+import "local"
+import "map"
+import "net"
+import "os"
+import "regexp"
+import "res/remote"
+import "sys"
+import "world"
+
+$http_suffix = "http/"
+$tftp_suffix = "tftp/"
+$uefi_suffix = "uefi/"
+$kickstart_suffix = "kickstart/"
+$preseed_suffix = "preseed/"
+$ipxe_iso_filename = "ipxe.iso"
+$ipxe_iso_default = "https://boot.ipxe.org/${ipxe_iso_filename}" # default download source
+$ipxe_efi_x86_64_default = "https://boot.ipxe.org/x86_64-efi/ipxe.efi"
+$ipxe_efi_aarch64_default = "https://boot.ipxe.org/arm64-efi/ipxe.efi"
+$ipxe_autoexec_filename = "autoexec.ipxe"
+
+# ipxe_efi_filename returns the name of the iPXE UEFI executable that we serve
+# for an architecture. The .efi must be last for it to work!
+func ipxe_efi_filename($arch) {
+	"ipxe.${arch}.efi" # eg: ipxe.x86_64.efi
+}
+
+# source_host_name returns the name of a host which was installed from a shared
+# config, such as a range, since it has no name of its own. The source is the
+# name of that config, and this is unique, since it comes from its mac address.
+func source_host_name($source, $mac) {
+	"${source}-" + golang_strings.replace_all($mac, ":", "") # eg: mgmt-001122334455
+}
+
+# Debian uses codenames in its mirror paths, and has its own names for each of
+# the architectures. Our distro uid's always use the version and our arch name.
+$debian_codenames = {
+	"12" => "bookworm",
+	"13" => "trixie",
+	"14" => "forky",
+	"15" => "duke",
+}
+$debian_arches = {
+	"x86_64" => "amd64",
+	"aarch64" => "arm64",
+}
+
+# The base class is the core provisioner which can also spawn child classes.
+class base($config) {
+	#
+	#	variables
+	#
+	$interface_env = sys.getenv("MGMT_PROVISIONER_INTERFACE")
+	$interface_def = if $interface_env == "" {
+		net.wired_interface() # XXX: add <|> "" when it exists!
+	} else {
+		$interface_env
+	}
+	$interface_config = $config->interface <|> ""
+	$interface = if $interface_config == "" {
+		$interface_def # if no interface exists, we error
+	} else {
+		$interface_config
+	}
+
+	$http_port = $config->http_port <|> 4280 # using :4280 avoids needing root and isn't in /etc/services
+	$http_port_str = convert.int_to_str($http_port)
+
+	# This is the master switch which allows hosts and ranges to each turn
+	# on proxy dhcp. It's for an existing network where another dhcp server
+	# is giving out the leases, and we only send the network boot program.
+	$proxy = $config->proxy <|> false
+
+	# if $network is the empty string, then we don't do any dhcp ourselves!
+	# if $network is the empty string, then we don't bring up the interface!
+	# an unspecified network uses the private default, while an explicitly
+	# empty network uses the address already assigned to the interface. The
+	# proxy mode is only for an existing network, so it's empty by default.
+	$network_def = if $proxy {
+		""
+	} else {
+		if sys.hasenv("MGMT_PROVISIONER_NETWORK") {
+			sys.getenv("MGMT_PROVISIONER_NETWORK")
+		} else {
+			"192.168.42.0/24"
+		}
+	}
+	$network = $config->network <|> "${network_def}"
+	panic($proxy and $network != "", "provisioner:base $network must be empty with $proxy")
+
+	$router_config = $config->router <|> ""
+	$router = if $router_config == "" {
+		if $network == "" {
+			net.interface_cidr($interface)
+		} else {
+			if sys.hasenv("MGMT_PROVISIONER_ROUTER") {
+				sys.getenv("MGMT_PROVISIONER_ROUTER")
+			} else {
+				"192.168.42.1/24"
+			}
+		}
+	} else {
+		$router_config
+	}
+	$router_ip = net.cidr_to_ip($router) # removes cidr suffix
+
+	# The hosts only talk to us while provisioning, so they don't need any dns,
+	# and we shouldn't send them a public one that can't work offline.
+	$dns = $config->dns <|> [] # eg: ["8.8.8.8", "1.1.1.1"] # maybe google/cloudflare will sponsor!
+
+	$prefix = $config->prefix <|> ""
+	panic($prefix == "", "provisioner:base $prefix is empty") # panic if prefix is empty
+	panic(not golang_strings.has_suffix($prefix, "/"), "provisioner:base $prefix is not absolute")
+
+	file "${prefix}" { # dir
+		state => $const.res.file.state.exists,
+	}
+	$tftp_prefix = "${prefix}${tftp_suffix}"
+	$http_prefix = "${prefix}${http_suffix}"
+	$uefi_prefix = "${prefix}${uefi_suffix}"
+
+	$firewalld = $config->firewalld <|> true
+
+	# eg: equivalent of: https://download.fedoraproject.org/pub/fedora/linux/
+	$inst_repo_base = "http://${router_ip}:${http_port_str}/fedora/" # private lan online, no https!
+	$server_base = "http://${router_ip}:${http_port_str}/" # private lan online, no https!
+
+	$syslinux_root = "/usr/share/syslinux/"
+
+	# Fetch an iPXE ISO once and serve the cached copy from the provisioner.
+	# An explicit empty source disables it. The exported $ipxe_iso is then
+	# empty too.
+	$ipxe_iso_source = $config->ipxe_iso <|> $ipxe_iso_default
+	$ipxe_iso_file = "${http_prefix}${ipxe_iso_filename}"
+	$ipxe_iso = if $ipxe_iso_source == "" {
+		""
+	} else {
+		"${server_base}${ipxe_iso_filename}"
+	}
+
+	# Fetch architecture-specific iPXE UEFI executables once and serve them
+	# forever. Each architecture has an explicit source and a stable root
+	# URL, while every executable shares the root autoexec.ipxe below. Add
+	# an architecture here to support it. An empty source disables it.
+	$ipxe_efi_sources = {
+		"x86_64" => $config->ipxe_efi_x86_64 <|> $ipxe_efi_x86_64_default,
+		"aarch64" => $config->ipxe_efi_aarch64 <|> $ipxe_efi_aarch64_default,
+	}
+	$ipxe_efi_x86_64_source = $ipxe_efi_sources["x86_64"] <|> ""
+	$ipxe_efi_x86_64 = if $ipxe_efi_x86_64_source == "" {
+		""
+	} else {
+		$server_base + ipxe_efi_filename("x86_64")
+	}
+	$ipxe_autoexec_template = struct{
+		server_base => $server_base,
+	}
+
+	#
+	#	network
+	#
+	if $network != "" {
+		net "${interface}" {
+			state => $const.res.net.state.up,
+			addrs => [$router], # has cidr suffix
+			#gateway => "192.168.42.1", # TODO: get upstream public gateway with new function
+
+			ip_forward => true, # XXX: does this work?
+
+			Meta:reverse => true, # XXX: ^C doesn't reverse atm. Fix that!
+
+			Before => Dhcp:Server[":67"], # TODO: add autoedges
+		}
+	}
+
+	#
+	#	packages
+	#
+	# TODO: do we need "syslinux-nonlinux" ?
+	$pkgs_bios = ["syslinux"]
+	$pkgs_uefi = ["shim-x64", "grub2-efi-x64"]
+	pkg $pkgs_bios {
+		state => "installed",
+	}
+	#pkg $pkgs_uefi {
+	#	state => "installed",
+	#}
+
+	# TODO: not in F39+ it seems
+	#$pkgs_kickstart = ["fedora-kickstarts", "spin-kickstarts"]
+	#pkg $pkgs_kickstart {
+	#	state => "installed",
+	#}
+
+	#
+	#	firewalld
+	#
+	$proxy_services = if $proxy {
+		["proxy-dhcp"] # the pxe boot server port of 4011
+	} else {
+		[]
+	}
+	if $firewalld {
+		firewalld "provisioner" { # name is irrelevant
+			services => list.concat([
+				"tftp",
+				"dhcp",
+			], $proxy_services),
+			ports => ["${http_port_str}/tcp"],
+
+			state => $const.res.firewalld.state.exists,
+		}
+	}
+
+	file "${tftp_prefix}" { # dir
+		state => $const.res.file.state.exists,
+	}
+	file "${uefi_prefix}" { # dir
+		state => $const.res.file.state.exists,
+	}
+
+	#
+	#	tftp
+	#
+	tftp:server ":69" {
+		timeout => 60, # increase the timeout
+		#root => $root, # we're running in memory without needing a root!
+		#debug => true, # XXX: print out a `tree` representation in tmp prefix for the user
+
+		Depend => Pkg[$pkgs_bios], # hosted by tftp
+		#Depend => Pkg[$pkgs_uefi],
+	}
+
+	#
+	#	bios bootloader images
+	#
+
+	# XXX: should this also be part of repo too?
+	class tftp_root_file($f) {
+		#tftp:file "${f}" {	# without root slash
+		tftp:file "/${f}" { # with root slash
+			path => $syslinux_root + $f, # TODO: add autoedges
+
+			Depend => Pkg[$pkgs_bios],
+		}
+	}
+	include tftp_root_file("pxelinux.0")
+	include tftp_root_file("vesamenu.c32")
+	include tftp_root_file("ldlinux.c32")
+	include tftp_root_file("libcom32.c32")
+	include tftp_root_file("libutil.c32")
+
+	#
+	#	dhcp
+	#
+	if $network != "" or $proxy {
+		dhcp:server ":67" { # in proxy mode, it also listens on :4011
+			interface => $interface, # required for now
+			leasetime => "10m", # seems some clients refresh half way at 5m
+			dns => $dns, # pick your own better ones!
+			routers => [$router_ip],
+			serverid => $router_ip, # XXX: test automatic mode
+
+			#Depend => Net[$interface], # TODO: add autoedges
+		}
+	}
+
+	#
+	#	http
+	#
+	file "${http_prefix}" { # dir
+		state => $const.res.file.state.exists,
+	}
+
+	http:server ":${http_port_str}" {
+		#address => ":${http_port_str}", # you can override the name like this
+		#timeout => 60, # add a timeout (seconds)
+	}
+
+	# Each host tells us that it's installed with one request, which we
+	# store as a record in this etcd key, under its mac address. It has what
+	# the host sent us: its ip, the public key of its root user, its ssh
+	# host key, and its source. That's the name of the shared config, such
+	# as a range, which installed it, or empty if it had a config of its own
+	# from its mac. The classes which need to know about the hosts such as
+	# the remote handoff, read the records from here, so they're kept if
+	# this provisioner goes away. The runner class can add a name and a
+	# handoff to a record, which a host can't send us. The key must not be
+	# in the provisioner/ namespace, since that's where the runner finds the
+	# hosts that it's been asked to install.
+	$store_key = $config->store_key <|> "provisioner_hosts"
+	panic($store_key == "", "provisioner:base $store_key is empty")
+	panic(golang_strings.has_prefix($store_key, "provisioner/"), "provisioner:base $store_key can't be in the provisioner/ namespace")
+
+	http:server:record "/action/done" {
+		store => "etcd:///${store_key}",
+		state => "exists",
+		key => "mac",
+		fields => ["ip", "sshkey", "hostkey", "source"],
+	}
+
+	$hosts_st = world.getval($store_key)
+	$hosts_json = if $hosts_st->exists {
+		$hosts_st->value
+	} else {
+		"{}"
+	}
+	$hosts = encoding.decode_json_flexible($hosts_json, "map{str: struct{ip str; sshkey str; hostkey str; source str; name str; handoff str}}") # export this value to parent scope
+
+	if $ipxe_iso_source != "" { # download it once so we have a copy
+		exec "provisioner-ipxe-iso" {
+			cmd => "/usr/bin/wget",
+			args => [
+				"--no-verbose",
+				$ipxe_iso_source,
+				"-O",
+				$ipxe_iso_file,
+			],
+			creates => $ipxe_iso_file,
+
+			Depend => File["${http_prefix}"],
+		}
+
+		http:server:file "/${ipxe_iso_filename}" {
+			path => $ipxe_iso_file,
+
+			Depend => Exec["provisioner-ipxe-iso"],
+			Before => Print["ready"],
+		}
+	}
+
+	class ipxe_efi($arch, $source) {
+		$ipxe_efi_filename = ipxe_efi_filename($arch)
+		$ipxe_efi_file = "${http_prefix}${ipxe_efi_filename}"
+
+		exec "provisioner-ipxe-efi-${arch}" {
+			cmd => "/usr/bin/wget",
+			args => [
+				"--no-verbose",
+				$source,
+				"-O",
+				$ipxe_efi_file,
+			],
+			creates => $ipxe_efi_file,
+
+			Depend => File["${http_prefix}"],
+		}
+
+		http:server:file "/${ipxe_efi_filename}" {
+			path => $ipxe_efi_file,
+
+			Depend => Exec["provisioner-ipxe-efi-${arch}"],
+			Before => Print["ready"],
+		}
+
+		tftp:file "/${ipxe_efi_filename}" { # when a host uses ipxe
+			path => $ipxe_efi_file,
+
+			Depend => Exec["provisioner-ipxe-efi-${arch}"],
+		}
+	}
+	forkv $arch, $source in $ipxe_efi_sources {
+		if $source != "" {
+			include ipxe_efi($arch, $source)
+		}
+	}
+
+	# UEFI HTTP Boot gives iPXE the executable's full URL, so every
+	# architecture-specific executable above discovers this shared script.
+	http:server:file "/${ipxe_autoexec_filename}" {
+		data => golang.template(deploy.readfile("/files/ipxe-autoexec.tmpl"), $ipxe_autoexec_template),
+
+		Before => Print["ready"],
+	}
+
+	# When a host uses ipxe, it's loaded over tftp, and then it runs this
+	# script from the same dir first. It gets its script from dhcp, which
+	# can be slow with proxy dhcp, so it keeps on trying until it has one.
+	# The ipxe executables are at the root, and ipxe asks for this without
+	# a leading slash, so it must be named that way.
+	tftp:file "${ipxe_autoexec_filename}" {
+		data => deploy.readfile("/files/ipxe-autoexec-tftp.ipxe"),
+	}
+
+	$kickstart_http_prefix = "${http_prefix}${kickstart_suffix}"
+	file "${kickstart_http_prefix}" {
+		state => $const.res.file.state.exists,
+		#source => "", # this default means empty directory
+		recurse => true,
+		purge => true, # remove unmanaged files in here
+
+		Depend => File["${http_prefix}"],
+	}
+
+	$preseed_http_prefix = "${http_prefix}${preseed_suffix}"
+	file "${preseed_http_prefix}" {
+		state => $const.res.file.state.exists,
+		recurse => true,
+		purge => true, # remove unmanaged files in here
+
+		Depend => File["${http_prefix}"],
+	}
+
+	$vardir = local.vardir("provisioner/")
+	$binary_path = deploy.binary_path()
+
+	http:server:file "/mgmt/binary" { # TODO: support different architectures
+		path => $binary_path, # TODO: As long as binary doesn't contain private data!
+
+		Before => Print["ready"],
+	}
+
+	# XXX: don't put anything private in your code this isn't authenticated!
+	$abs_tar = "${vardir}deploys/deploy.tar"
+	$abs_gz = "${abs_tar}.gz"
+
+	file "${vardir}deploys/" {
+		state => $const.res.file.state.exists,
+		recurse => true,
+		purge => true,
+		owner => "root",
+		group => "root",
+		mode => "u=rwx,g=rx,o=", # dir
+	}
+	# Tag this so that the folder purge doesn't remove it. (XXX: bug!)
+	file "${abs_tar}" {
+		owner => "root",
+		group => "root",
+		mode => "u=rw,g=rw,o=", # file
+
+		Meta:retry => -1, # changing the mode on this file can be racy
+	}
+	file "${abs_gz}" {
+		owner => "root",
+		group => "root",
+		mode => "u=rw,g=rw,o=", # file
+
+		Meta:retry => -1, # changing the mode on this file can be racy
+	}
+	deploy:tar "${abs_tar}" {
+		Before => Gzip["${abs_gz}"],
+		Depend => File["${vardir}deploys/"], # make the dir first!
+	}
+	gzip "${abs_gz}" {
+		input => "${abs_tar}",
+	}
+	http:server:file "/mgmt/deploy.tar.gz" {
+		path => "${abs_gz}",
+	}
+
+	print "ready" {
+		msg => "ready to provision!",
+
+		Meta:autogroup => false,
+
+		Depend => Tftp:Server[":69"],
+		Depend => $network != "" ?: Dhcp:Server[":67"],
+		Depend => Http:Server[":${http_port_str}"],
+	}
+
+	# we're effectively returning a new class definition...
+}
+
+# The repo class which is a child of base, defines the distro repo to use.
+class base:repo($config) {
+
+	$distro = $config->distro <|> "fedora"
+	$version = $config->version <|> "39" # not an int!
+	$arch = $config->arch <|> "x86_64"
+	#$flavour = $config->flavour <|> "" # is flavour needed for repo sync?
+
+	# export this value to parent scope for base:host to consume
+	$uid = "${distro}${version}-${arch}" # eg: fedora39-x86_64 or debian13-x86_64
+
+	# TODO: We need a way to pick a good default because if a lot of people
+	# use this, then most won't change it to one in their country...
+	$mirror = $config->mirror <|> "" # TODO: how do we pick a default?
+	$rsync = $config->rsync <|> ""
+
+	$is_fedora = $distro == "fedora"
+	$is_debian = $distro == "debian"
+	panic(not $is_fedora and not $is_debian, "provisioner:repo ${distro} is not supported")
+
+	$distroarch_tftp_prefix = "${tftp_prefix}${uid}/"
+
+	file "${distroarch_tftp_prefix}" { # dir
+		state => $const.res.file.state.exists,
+
+		#Meta:quiet => true,	# TODO
+
+		Depend => File["${tftp_prefix}"],
+	}
+
+	# Each distro downloads these two files in its own way.
+	$vmlinuz_file = "${distroarch_tftp_prefix}vmlinuz"
+	$initrd_file = "${distroarch_tftp_prefix}initrd.img"
+
+	tftp:file "/${uid}/vmlinuz" {
+		path => $vmlinuz_file, # TODO: add autoedges
+
+		#Depend => Pkg[$pkgs],
+	}
+	http:server:file "/${uid}/vmlinuz" { # when using ipxe
+		path => $vmlinuz_file, # TODO: add autoedges
+
+		#Depend => Pkg[$pkgs],
+	}
+
+	tftp:file "/${uid}/initrd.img" {
+		path => $initrd_file, # TODO: add autoedges
+
+		#Depend => Pkg[$pkgs],
+	}
+	http:server:file "/${uid}/initrd.img" { # when using ipxe
+		path => $initrd_file, # TODO: add autoedges
+
+		#Depend => Pkg[$pkgs],
+	}
+
+	if $is_fedora {
+		$distroarch_uefi_prefix = "${uefi_prefix}${uid}/"
+		$distroarch_http_prefix = "${http_prefix}${uid}/"
+		$distroarch_release_http_prefix = "${distroarch_http_prefix}release/"
+		$distroarch_updates_http_prefix = "${distroarch_http_prefix}updates/"
+
+		file "${distroarch_uefi_prefix}" { # dir
+			state => $const.res.file.state.exists,
+
+			Depend => File["${uefi_prefix}"],
+		}
+		file "${distroarch_http_prefix}" { # root http dir
+			state => $const.res.file.state.exists,
+
+			Depend => File["${http_prefix}"],
+		}
+		file "${distroarch_release_http_prefix}" {
+			state => $const.res.file.state.exists,
+
+			Depend => File["${distroarch_http_prefix}"],
+		}
+		file "${distroarch_updates_http_prefix}" {
+			state => $const.res.file.state.exists,
+
+			Depend => File["${distroarch_http_prefix}"],
+		}
+
+		#
+		#	uefi bootloader images
+		#
+		$uefi_download_dir = "${distroarch_uefi_prefix}download/"
+		$uefi_extract_dir = "${distroarch_uefi_prefix}extract/"
+
+		file "${uefi_extract_dir}" { # mkdir
+			state => $const.res.file.state.exists,
+
+			Depend => Exec["uefi-download-${uid}"],
+			Before => Exec["uefi-extract-${uid}"],
+		}
+
+		# Download the shim and grub2-efi packages. If your server is a BIOS
+		# system, you must download the packages to a temporary install root.
+		# Installing them directly on a BIOS machine will attempt to configure
+		# the system for UEFI booting and cause problems.
+		$pkgs_uefi_string = golang_strings.join($pkgs_uefi, " ")
+		$repoidname = "local"
+		# eg: https://mirror.csclub.uwaterloo.ca/fedora/linux/releases/39/Everything/x86_64/os/
+		$repo_url = "http://${router_ip}:${http_port_str}/fedora/releases/${version}/Everything/${arch}/os/"
+
+		exec "uefi-download-${uid}" {
+			# no inner quotes because it's not bash handling this!
+			# the dnf download command makes the download destination dir
+			# With DNF5 (provisioning OS Fedora 41+) it's --destdir.
+			# Previously it's --downloaddir and no idea why the API break.
+			cmd => "/usr/bin/dnf download ${pkgs_uefi_string} --assumeyes --disablerepo=* --repofrompath ${repoidname},${repo_url} --destdir=${uefi_download_dir} --releasever ${version}",
+
+			# TODO: add an optional expiry mtime check that deletes these old files with an || rm * && false
+			ifcmd => "! test -s '${uefi_download_dir}shim-x64'*",
+			ifshell => "/usr/bin/bash",
+
+			Depend => Http:Server[":${http_port_str}"],
+		}
+
+		exec "uefi-extract-${uid}" {
+			# we use rpm2archive instead of cpio since the latter is deprecated for big files
+			# we do this in a loop for all the rpm files
+			# fedora44 stores the raw RPM payload in versioned /usr/lib/efi/
+			# directories. Older releases have the files in $uefi_root.
+			cmd => golang_strings.join([
+				"for i in ${uefi_download_dir}*.rpm",
+				"do /usr/bin/rpm2archive \$i | /usr/bin/tar -xvz --directory ${uefi_extract_dir} --exclude ./etc",
+				"done",
+				"if ! /usr/bin/test -s '${uefi_shim}'",
+				"then /usr/bin/mkdir -p '${uefi_root}' && /usr/bin/cp '${uefi_extract_dir}usr/lib/efi/shim/'*/EFI/fedora/shim.efi '${uefi_shim}'",
+				"fi",
+				"if ! /usr/bin/test -s '${uefi_shimx64}'",
+				"then /usr/bin/cp '${uefi_extract_dir}usr/lib/efi/shim/'*/EFI/fedora/shimx64.efi '${uefi_shimx64}'",
+				"fi",
+				"if ! /usr/bin/test -s '${uefi_grubx64}'",
+				"then /usr/bin/cp '${uefi_extract_dir}usr/lib/efi/grub2/'*/EFI/fedora/grubx64.efi '${uefi_grubx64}'",
+				"fi",
+				"/usr/bin/test -s '${uefi_shim}' && /usr/bin/test -s '${uefi_shimx64}' && /usr/bin/test -s '${uefi_grubx64}'",
+			], "; "),
+			shell => "/usr/bin/bash",
+
+			# TODO: add an optional expiry mtime check that deletes these old files with an || rm * && false
+			ifcmd => "! /usr/bin/test -s '${uefi_shim}' || ! /usr/bin/test -s '${uefi_shimx64}' || ! /usr/bin/test -s '${uefi_grubx64}'",
+			ifshell => "/usr/bin/bash",
+			watchfiles => [
+				$uefi_shim,
+				$uefi_shimx64,
+				$uefi_grubx64,
+			],
+
+			Depend => Exec["uefi-download-${uid}"],
+			Before => Tftp:Server[":69"],
+		}
+
+		$uefi_root = "${uefi_extract_dir}/boot/efi/EFI/fedora/"
+		$uefi_shim = "${uefi_root}shim.efi"
+		$uefi_shimx64 = "${uefi_root}shimx64.efi"
+		$uefi_grubx64 = "${uefi_root}grubx64.efi"
+		tftp:file "/uefi/shim.efi" { # needs leading slash
+			path => $uefi_shim, # TODO: add autoedges
+
+			Depend => Exec["uefi-extract-${uid}"],
+		}
+		tftp:file "/uefi/shimx64.efi" { # needs leading slash
+			path => $uefi_shimx64, # TODO: add autoedges
+
+			Depend => Exec["uefi-extract-${uid}"],
+		}
+		tftp:file "/uefi/grubx64.efi" {
+			path => $uefi_grubx64, # TODO: add autoedges
+
+			Depend => Exec["uefi-extract-${uid}"],
+		}
+
+		# XXX: replace with a download resource
+		# XXX: allow send->recv to pass this file to tftp:file->data to keep it in mem!
+		exec "vmlinuz-${uid}" {
+			cmd => "/usr/bin/wget",
+			args => [
+				"--no-verbose",
+				"${repo_url}images/pxeboot/vmlinuz",
+				"-O",
+				$vmlinuz_file,
+			],
+			creates => $vmlinuz_file,
+
+			Depend => File[$distroarch_tftp_prefix],
+			Depend => Http:Server[":${http_port_str}"],
+			Before => Print["ready"],
+		}
+
+		exec "initrd-${uid}" {
+			cmd => "/usr/bin/wget",
+			args => [
+				"--no-verbose",
+				"${repo_url}images/pxeboot/initrd.img",
+				"-O",
+				$initrd_file,
+			],
+			creates => $initrd_file,
+
+			Depend => File[$distroarch_tftp_prefix],
+			Depend => Http:Server[":${http_port_str}"],
+			Before => Print["ready"],
+		}
+
+		# this file resource serves the entire rsync directory over http
+		if $mirror == "" { # and $rsync != ""
+			http:server:file "/fedora/releases/${version}/Everything/${arch}/os/" {
+				path => $distroarch_release_http_prefix,
+			}
+			http:server:file "/fedora/updates/${version}/Everything/${arch}/" {
+				path => $distroarch_updates_http_prefix,
+			}
+		} else {
+			# same as the above http:server:file path would have been
+			http:server:proxy "/fedora/releases/${version}/Everything/${arch}/os/" {
+				sub => "/fedora/", # we remove this from the name!
+				head => $mirror,
+
+				cache => $distroarch_release_http_prefix, # $prefix/http/fedora39-x86_64/release/
+			}
+
+			# XXX: if we had both of these in the same http_prefix, we could overlap them with an rsync :/ hmm...
+			http:server:proxy "/fedora/updates/${version}/Everything/${arch}/" { # no os/ dir at the end
+				sub => "/fedora/", # we remove this from the name!
+				head => $mirror,
+
+				cache => $distroarch_updates_http_prefix, # $prefix/http/fedora39-x86_64/updates/
+			}
+		}
+
+		# .repo files
+		#$fedora_repo_template = struct{
+		#	name => "fedora",
+		#	distro => $distro,
+		#	version => $version, # 39 for fedora 39
+		#	arch => $arch, # could also be aarch64
+		#	#flavour => "Everything", # The install repo uses "Everything" even for "Workstation" or "Server"
+		#	extra => "releases",
+		#
+		#	baseurl => "http://${router_ip}:${http_port_str}/fedora/releases/${version}/Everything/${arch}/os/",
+		#}
+		#$updates_repo_template = struct{
+		#	name => "updates",
+		#	distro => $distro,
+		#	version => $version, # 39 for fedora 39
+		#	arch => $arch, # could also be aarch64
+		#	#flavour => "Everything", # The install repo uses "Everything" even for "Workstation" or "Server"
+		#	extra => "updates",
+		#
+		#	baseurl => "http://${router_ip}:${http_port_str}/fedora/updates/${version}/Everything/${arch}/",
+		#}
+		#http:server:file "/fedora/${uid}/fedora.repo" {
+		#	data => golang.template(deploy.readfile("/files/repo.tmpl"), $fedora_repo_template),
+		#}
+		#http:server:file "/fedora/${uid}/updates.repo" {
+		#	data => golang.template(deploy.readfile("/files/repo.tmpl"), $updates_repo_template),
+		#}
+
+		#
+		#	rsync
+		#
+		#$source_pattern = if $is_fedora {
+		#	"${rsync}releases/${version}/Everything/${arch}/os/" # source
+		#} else {
+		#	"" # XXX: not implemented
+		#}
+		#panic($source_pattern == "") # distro is not specified
+		# TODO: combine release and updates?
+		#$is_safe = $distroarch_release_http_prefix != "" and $distroarch_release_http_prefix != "/"
+		#if $rsync != "" and $source_pattern != "" and $is_safe {
+		#
+		#	$mtime_file = "${http_prefix}rsync-${uid}.mtime"
+		#	$delta = convert.int_to_str(60 * 60 * 24 * 7) # ~1 week in seconds: 604800
+		#	exec "rsync-${uid}" {
+		#		cmd => "/usr/bin/rsync",
+		#		args => [
+		#			"-avSH",
+		#			"--progress",
+		#			# This flavour must always be Everything to work.
+		#			# The Workstation flavour doesn't have an os/ dir.
+		#			$source_pattern, # source
+		#			$distroarch_release_http_prefix, # dest
+		#		],
+		#
+		#		# run this when cmd completes successfully
+		#		donecmd => "/usr/bin/date --utc > ${mtime_file}",
+		#		doneshell => "/usr/bin/bash",
+		#
+		#		# Run if the difference between the current date and the
+		#		# saved date (both converted to sec) is greater than the
+		#		# delta! (Or if the mtime file does not even exist yet.)
+		#		ifcmd => "! /usr/bin/test -e ${mtime_file} || /usr/bin/test \$((`/usr/bin/date +%s` - `/usr/bin/stat -c %Y '${mtime_file}'`)) -gt ${delta}",
+		#
+		#		ifshell => "/usr/bin/bash",
+		#
+		#		Before => Http:Server[":${http_port_str}"],
+		#		Before => File[$distroarch_release_http_prefix],
+		#	}
+		#}
+	}
+
+	if $is_debian {
+		# Debian uses codenames in its paths and its own arch names.
+		$codename = $debian_codenames[$version] <|> ""
+		$debarch = $debian_arches[$arch] <|> ""
+		panic($codename == "", "provisioner:repo debian ${version} is unknown")
+		panic($debarch == "", "provisioner:repo debian ${arch} is unknown")
+
+		# The security repository is usually not on the regular mirrors.
+		$mirror_security = $config->mirror_security <|> "https://deb.debian.org/debian-security/"
+
+		# The debian mirror layout is shared by every version and arch,
+		# so we serve the same paths that deb.debian.org does. This is
+		# required since the installer uses the /debian-security/ path
+		# for security updates on our host, no matter what else we say.
+		# Everything is cached forever, so that once we've done a first
+		# install, we can do the next ones without the internet. These
+		# identical resources from different versions get merged. With
+		# no mirror, this only serves what is already in the cache.
+		# NOTE: The security metadata (and updates since trixie) expires
+		# a week after it was first cached, so our apt hook tells apt to
+		# ignore those dates during the install, which lets it get the
+		# updates that we have. The installed machine checks as usual.
+		http:server:proxy "/debian/" {
+			sub => "/debian/", # we remove this from the name!
+			head => $mirror,
+
+			cache => "${http_prefix}debian/", # $prefix/http/debian/
+		}
+		http:server:proxy "/debian-security/" {
+			sub => "/debian-security/", # we remove this from the name!
+			head => $mirror_security,
+
+			cache => "${http_prefix}debian-security/", # $prefix/http/debian-security/
+		}
+
+		# The automatic partitioner can only encrypt with lvm, so our
+		# recipe marks the root partition for encryption, and then the
+		# installer downloads this hook which sets that up without lvm.
+		http:server:file "/${preseed_suffix}debian-partman-crypto.sh" {
+			data => deploy.readfile("/files/debian-partman-crypto.sh"),
+		}
+		http:server:file "/${preseed_suffix}debian-apt-hook.sh" {
+			data => deploy.readfile("/files/debian-apt-hook.sh"),
+		}
+
+		# The netboot installer gives us the kernel and the initrd, and
+		# also the signed shim and grub for uefi. This grub always reads
+		# its config from a hard-coded path so a shared file there picks
+		# the host specific menu by mac address. These come through our
+		# cache so they match the kernel modules that the installer gets
+		# from it. If you clear the cache, then clear these files too.
+		# eg: https://deb.debian.org/debian/dists/trixie/main/installer-amd64/current/images/
+		$netboot_url = "http://${router_ip}:${http_port_str}/debian/dists/${codename}/main/installer-${debarch}/current/images/"
+		$netboot_template = struct{
+			dir => $distroarch_tftp_prefix,
+			url => $netboot_url,
+			debarch => $debarch,
+		}
+		$uefi_shim = "${distroarch_tftp_prefix}shimx64.efi"
+		$uefi_grub = "${distroarch_tftp_prefix}grubx64.efi"
+
+		exec "netboot-${uid}" {
+			cmd => golang.template(deploy.readfile("/files/debian-netboot.sh.tmpl"), $netboot_template),
+			shell => "/usr/bin/bash",
+
+			# Run if any of the files are missing.
+			ifcmd => golang_strings.join([
+				"for f in vmlinuz initrd.img shimx64.efi grubx64.efi SHA256SUMS",
+				"do /usr/bin/test -s '${distroarch_tftp_prefix}'\$f || exit 0",
+				"done",
+				"exit 1",
+			], "; "),
+			ifshell => "/usr/bin/bash",
+
+			Depend => File[$distroarch_tftp_prefix],
+			Depend => Http:Server[":${http_port_str}"],
+			Before => Tftp:Server[":69"],
+			Before => Print["ready"],
+		}
+
+		tftp:file "/uefi/${uid}/shimx64.efi" { # needs leading slash
+			path => $uefi_shim, # TODO: add autoedges
+
+			Depend => Exec["netboot-${uid}"],
+		}
+		tftp:file "/uefi/${uid}/grubx64.efi" { # the shim loads this from its dir
+			path => $uefi_grub, # TODO: add autoedges
+
+			Depend => Exec["netboot-${uid}"],
+		}
+		tftp:file "/debian-installer/${debarch}/grub/grub.cfg" { # shared
+			data => deploy.readfile("/files/debian-uefi-grub.cfg"),
+		}
+	}
+}
+
+# The host class is used for each physical host we want to provision.
+class base:host($name, $config) {
+	#print $name {
+	#	msg => "host: ${name}",
+	#
+	#	Meta:autogroup => false,
+	#}
+	$repouid = $config->repo <|> ""
+	$uidst = os.parse_distro_uid($repouid)
+	$distro str = $uidst->distro
+	$version str = $uidst->version # not an int!
+	$arch str = $uidst->arch
+	panic($distro == "", "provisioner:host $distro is empty")
+	panic($version == "", "provisioner:host $version is empty")
+	panic($arch == "", "provisioner:host $arch is empty")
+	$flavour = $config->flavour <|> ""
+
+	$is_fedora = $distro == "fedora"
+	$is_debian = $distro == "debian"
+	panic(not $is_fedora and not $is_debian, "provisioner:host ${distro} is not supported")
+
+	# Debian uses codenames in its paths and its own arch names.
+	$codename = $debian_codenames[$version] <|> ""
+	$debarch = $debian_arches[$arch] <|> ""
+	panic($is_debian and $codename == "", "provisioner:host debian ${version} is unknown")
+	panic($is_debian and $debarch == "", "provisioner:host debian ${arch} is unknown")
+
+	$mac = $config->mac <|> ""
+	#panic($mac == "") # provision anyone by default
+	$ip = $config->ip <|> "" # XXX: auto-generate it inside of the above network somehow (see below)
+
+	# This needs the master switch in the base class to be on as well. With
+	# proxy dhcp, the ip is optional, and if it's set, then the host is only
+	# provisioned if the other dhcp server gave it this ip.
+	$host_proxy = $config->proxy <|> false
+	panic($host_proxy and not $proxy, "provisioner:host $proxy is not enabled in the base")
+
+	if $network != "" and $mac != "" {
+		panic($ip == "", "provisioner:host $ip is empty")
+	}
+	#$ns = if $config->ip == "" {
+	#	""
+	#} else {
+	#	"" + get_value("network") # XXX: implement some sort of lookup function
+	#}
+	#$ip = $config->ip <|> magic.pool($ns, [1,2,3,4], $name) # XXX: if $ns is "", then don't allocate. Otherwise get from list. Reuse based on $name hash.
+	$bios = $config->bios <|> false
+	# A bios client never asks us for its nbp once it has its lease, so we
+	# could never check its ip, and it would never get provisioned.
+	panic($host_proxy and $bios and $ip != "", "provisioner:host $ip must be empty for a bios host with $proxy")
+
+	# With ipxe, the firmware loads ipxe, which then loads its script from
+	# our http server, which loads everything else over http. We only have
+	# uefi ipxe executables, and only for the architectures that we have a
+	# source for. Stock ipxe isn't signed, so secure boot must be disabled.
+	$host_ipxe = $config->ipxe <|> false
+	panic($host_ipxe and $bios, "provisioner:host $ipxe can't be used with $bios")
+	panic($host_ipxe and ($ipxe_efi_sources[$arch] <|> "") == "", "provisioner:host $ipxe isn't available for ${arch}")
+	$ipxe_script = "${server_base}${ipxe_menu}" # the menu from our http server
+
+	# The debian 12 grub doesn't look at our proxy dhcp offer, so it can't
+	# find its config, but it works with ipxe or with debian 13 and newer.
+	panic($host_proxy and $codename == "bookworm" and not $host_ipxe, "provisioner:host debian 12 needs $ipxe with $proxy")
+
+	$password = $config->password <|> "" # empty means disabled
+	panic(len($password) != 0 and len($password) != 106, "provisioner:host $password (salted) is wrong length") # length of salted password
+	$sshkey = golang_strings.trim_space($config->sshkey <|> "") # root ssh pub key to add
+
+	$part = $config->part <|> "" # partitioning scheme
+	$luks = $config->luks <|> true # enable luks encryption
+
+	$empty_list_str []str = [] # need an explicit type on empty list definition
+	$packages = $config->packages <|> $empty_list_str
+
+	# should we provision this host by default?
+	$provision_default = $config->provision <|> false # false is safest!
+
+	$handoff_type = $config->handoff <|> ""
+	$handoff_exec = $config->handoff_exec <|> ""
+	$handoff_code = $config->handoff_code <|> ""
+	$handoff_module_path = $config->handoff_module_path <|> ""
+	$handoff_svc_sshurl = $config->handoff_svc_sshurl <|> ""
+	$handoff_svc_hostkey = $config->handoff_svc_hostkey <|> ""
+	$handoff_svc_sshid = $config->handoff_svc_sshid <|> ""
+	panic(($handoff_svc_sshurl != "") != ($handoff_svc_hostkey != ""), "provisioner:host $handoff_svc needs sshurl (${handoff_svc_sshurl}) and hostkey (${handoff_svc_hostkey})")
+
+	panic($handoff_code != "" and not golang_strings.has_prefix($handoff_code, "/"), "provisioner:host $handoff_code is not absolute")
+	$handoff_hostname = $config->handoff_hostname <|> ""
+
+	# With the remote handoff, we don't install mgmt on the host. Once it
+	# has told us that it's installed, the handoff class connects to it as
+	# root over ssh with the private key for $sshkey, and runs mgmt there.
+	$handoff_remote = $handoff_type == "remote"
+	panic($handoff_remote and $sshkey == "", "provisioner:host $handoff remote needs an $sshkey")
+
+	# This is a giant driver://user:password@host:port/whatever URL...
+	$bmc_uri = $config->bmc_uri <|> ""
+
+	# unique host key which is usually a mac address unless it's a default
+	$hkey = if $mac == "" {
+		"default"
+	} else {
+		$mac
+	}
+	$provision_key = $hkey # XXX: what unique id should we use for the host? mac? name? hkey?
+
+	#$ret = world.getval($provision_key_done) # has it previously been provisioned?
+	#$val = if $ret->value == "" { # avoid an invalid string killing the parse_bool function
+	#	convert.format_bool(false) # "false"
+	#} else {
+	#	$ret->value
+	#}
+	#$provision = if not $ret->exists {
+	#	$provision_default
+	#} else {
+	#	not convert.parse_bool($val) # XXX: should an invalid string return false or error here?
+	#}
+	$provision = true
+
+	$nbp_path = if $bios {
+		"/pxelinux.0" # for bios clients
+	} else {
+		if $host_ipxe {
+			"/" + ipxe_efi_filename($arch) # for uefi clients with ipxe
+		} else {
+			if $is_debian {
+				# the debian shim loads its grub from the same dir
+				"/uefi/${repouid}/shimx64.efi" # for uefi clients
+			} else {
+				"/uefi/shim.efi" # for uefi clients
+			}
+		}
+	}
+	$nbp = "tftp://${router_ip}${nbp_path}"
+
+	# Without a mac address, the range class adds the dhcp part.
+	if $mac != "" and ($network != "" or $host_proxy) {
+		dhcp:host "${name}" { # the hostname
+			mac => $mac,
+			ip => $ip, # cidr notation is required, optional with proxy
+
+			nbp => $provision ?: $nbp,
+			nbp_path => $provision ?: $nbp_path, # with leading slash
+			ipxe => $host_ipxe ?: $ipxe_script, # ipxe gets this instead
+
+			proxy => $host_proxy,
+
+			Depend => Tftp:Server[":69"],
+		}
+	}
+
+	$menu_template = struct{
+		distro => $distro,
+		version => $version, # 39 for fedora 39
+		arch => $arch, # could also be aarch64
+		flavour => "Everything", # The install repo uses "Everything" even for "Workstation" or "Server"
+
+		ks => "http://${router_ip}:${http_port_str}/fedora/kickstart/${hkey}.ks", # usually $mac or `default`
+		inst_repo_base => $inst_repo_base,
+		server_base => $server_base,
+		http_host => "${router_ip}:${http_port_str}", # for grub, eg: (http,192.168.42.1:4280)
+
+		auto_args => $debian_auto_args,
+		manual_args => $debian_manual_args,
+	}
+
+	# The preseed file is downloaded after the network is configured, so the
+	# network settings and the hostname must be on the kernel command line.
+	# The manual install still uses our mirror, but asks everything else.
+	# The installer asks for name servers if the dhcp lease has none, and it
+	# ignores an empty answer here, so we give it our own ip. It never needs
+	# dns since it only talks to us, and with nothing listening, any lookups
+	# fail right away. The post script removes this from the installed host.
+	$mirror_host = "${router_ip}:${http_port_str}" # we are the debian mirror
+	$debian_hostname_arg = if $handoff_hostname == "" {
+		""
+	} else {
+		" netcfg/hostname=${handoff_hostname}"
+	}
+	# Before it starts the network, the installer looks for missing firmware
+	# (eg: rtl_nic for r8169) and offers to load it from removable media. A
+	# netboot has no firmware media to look on, and since trixie it can hang
+	# there forever so we turn this off. The firmware gets installed anyways
+	# since the preseed always includes the firmware packages. We only do it
+	# for trixie, since this also turns off the firmware that the installer
+	# would have added for some of the hardware that it found.
+	$debian_firmware_arg = if $codename == "trixie" {
+		" hw-detect/firmware-lookup=never" # XXX: workaround trixie bug?
+	} else {
+		""
+	}
+	$debian_auto_args = "auto=true priority=critical url=http://${mirror_host}/${preseed_suffix}${hkey}.cfg interface=auto netcfg/dhcp_timeout=60 netcfg/get_nameservers=${router_ip}${debian_hostname_arg}${debian_firmware_arg}"
+	$debian_manual_args = "mirror/country=manual mirror/http/hostname=${mirror_host} mirror/http/directory=/debian mirror/suite=${codename} apt-setup/security_host=${mirror_host}"
+
+	#
+	#	default menus
+	#
+	$safe_mac = if $mac == "" {
+		"00:00:00:00:00:00"
+	} else {
+		$mac
+	}
+	$old_mac = net.oldmacfmt($safe_mac)
+	# no idea why these need a 01- prefix
+	$bios_menu = if $mac == "" {
+		"/pxelinux.cfg/default"
+	} else {
+		# /pxelinux.cfg/01-00-11-22-33-44-55-66
+		"/pxelinux.cfg/01-${old_mac}"
+	}
+	$uefi_menu = if $is_debian {
+		# The shared debian grub.cfg picks one of these by mac address.
+		if $mac == "" {
+			"/debian-installer/${debarch}/grub/grub.cfg-default"
+		} else {
+			# /debian-installer/amd64/grub/grub.cfg-00:11:22:33:44:55
+			"/debian-installer/${debarch}/grub/grub.cfg-" + golang_strings.to_lower($mac)
+		}
+	} else {
+		# The fedora grub has this dir built in, just like the debian
+		# one does. It also tries the dir of the boot file in the dhcp
+		# ack first, but that isn't there with proxy dhcp, since grub
+		# doesn't look at the reply from our pxe boot server.
+		if $mac == "" {
+			"/EFI/fedora/grub.cfg"
+		} else {
+			# /EFI/fedora/grub.cfg-01-00-11-22-33-44-55-66
+			"/EFI/fedora/grub.cfg-01-${old_mac}"
+		}
+	}
+
+	$ipxe_menu = if $mac == "" {
+		"menu.ipxe"
+	} else {
+		"${safe_mac}.ipxe"
+	}
+
+	if $bios {
+		tftp:file "${bios_menu}" { # for bios
+			data => golang.template(deploy.readfile("/files/${distro}-bios-menu.tmpl"), $menu_template),
+		}
+	} else {
+		tftp:file "${uefi_menu}" { # for uefi
+			# XXX: linuxefi & initrdefi VS. kernel & append ?
+			data => golang.template(deploy.readfile("/files/${distro}-uefi-menu.tmpl"), $menu_template),
+
+			#Depend => Pkg[$pkgs_uefi],
+			#Depend => Exec["uefi-extract"],
+		}
+	}
+
+	# https://<ip>:4280/${mac}.ipxe # works for ipxe scripts!
+	http:server:file "/${ipxe_menu}" { # for ipxe
+		data => golang.template(deploy.readfile("/files/${distro}-ipxe-menu.tmpl"), $menu_template),
+	}
+	if $mac != "" { # generate old one but never the menu.ipxe default
+		http:server:file "/${old_mac}.ipxe" { # for ipxe
+			data => golang.template(deploy.readfile("/files/${distro}-ipxe-menu.tmpl"), $menu_template),
+		}
+	}
+
+	# If it's a dir we don't need a suffix, otherwise return the last chunk.
+	$handoff_code_chunk = if golang_strings.has_suffix($prefix, "/") {
+		""
+	} else {
+		golang_path_filepath.base($handoff_code)
+	}
+	if $handoff_code != "" { # it's a file path or dir!
+		$abs_tar = "${vardir}deploys/deploy-${provision_key}.tar"
+		$abs_gz = "${abs_tar}.gz"
+
+		# Tag this so that the folder purge doesn't remove it. (XXX: bug!)
+		file "${abs_tar}" {
+			owner => "root",
+			group => "root",
+			mode => "u=rw,g=rw,o=", # file
+
+			Meta:retry => -1, # changing the mode on this file can be racy
+		}
+		file "${abs_gz}" {
+			owner => "root",
+			group => "root",
+			mode => "u=rw,g=rw,o=", # file
+
+			Meta:retry => -1, # changing the mode on this file can be racy
+		}
+		tar "${abs_tar}" {
+			inputs => [
+				$handoff_code, # code comes in here!
+				golang_strings.trim_suffix($handoff_module_path, "/"), # remove trailing slash to include the dir name
+			],
+
+			Before => Gzip["${abs_gz}"],
+			Depend => File["${vardir}deploys/"], # make the dir first!
+		}
+		gzip "${abs_gz}" {
+			input => "${abs_tar}",
+		}
+		http:server:file "/mgmt/deploy-${provision_key}.tar.gz" {
+			path => "${abs_gz}",
+		}
+	}
+
+	$handoff_binary_path = "/usr/local/bin/mgmt" # we install it here
+	$firstboot_scripts_dir = "/var/lib/mgmt-firstboot/" # TODO: /usr/lib/ instead?
+	$firstboot_done_dir = "/var/lib/mgmt-firstboot/done/"
+	$deploy_dir = "/root/mgmt-deploy/" # deploy code dir
+	$modules_chunk = golang_path_filepath.base(golang_strings.trim_suffix($handoff_module_path, "/")) # "modules" typically
+	$deploy_dir_modules = "${deploy_dir}${modules_chunk}/"
+	# TODO: we can customize these more precisely based on $handoff_type
+	$handoff_packages = deploy.bootstrap_packages($distro) # TODO: catch errors here with <|> []
+	panic($handoff_type != "" and len($handoff_packages) == 0, "provisioner:host $handoff_packages list is empty")
+	#$handoff_packages_string = golang_strings.join($handoff_packages, " ")
+
+	$sshkey_type = "ed25519" # TODO: support other options
+	$sshkey_path = "/root/.ssh/id_${sshkey_type}"
+	$setup_sshkey = "mkdir -p '/root/.ssh/' -m 700 && ssh-keygen -N '' -t '${sshkey_type}' -f '${sshkey_path}'" # non-interactive
+	# Setting up the known_hosts file isn't needed since that can be done on
+	# the first run of mgmt, and the initial key can come in from --ssh-url.
+
+	# Fedora only makes its ssh host keys when sshd first starts, and it
+	# skips any that already exist, so we make them now so that the host can
+	# send us its public key in the same request which tells us that it's
+	# done. That's how remote handoff knows which host key to expect. Debian
+	# already made them when it installed openssh-server, so this is a no-op
+	# there. Like the fedora sshd-keygen script, we fix the selinux labels.
+	$hostkey_path = "/etc/ssh/ssh_host_${sshkey_type}_key.pub"
+	$setup_hostkey = "ssh-keygen -A && { ! command -v restorecon > /dev/null || restorecon -R /etc/ssh/; }"
+
+	# The remote handoff pushes its own binary when it connects, so it never
+	# needs one on the host, nor any firstboot service to start one.
+	$handoff_binary = if $handoff_type == "" or $handoff_remote {
+		""
+	} else {
+		# Copy over the actual mgmt binary. This enables a lot below...
+		"/usr/bin/wget -O '${handoff_binary_path}' 'http://${router_ip}:${http_port_str}/mgmt/binary' && /usr/bin/chmod u+x '${handoff_binary_path}'"
+	}
+	$handoff_cpcode = if $handoff_type == "code" {
+		# Download a tar ball of our code.
+		# TODO: Alternate mechanisms of getting the code are possible.
+		if $mac != "" {
+			"/usr/bin/wget -O /root/mgmt-deploy.tar.gz 'http://${router_ip}:${http_port_str}/mgmt/deploy-${provision_key}.tar.gz' && /usr/bin/mkdir '${deploy_dir}' && /usr/bin/tar -xf /root/mgmt-deploy.tar.gz --directory '${deploy_dir}'"
+		} else {
+			"/usr/bin/wget -O /root/mgmt-deploy.tar.gz 'http://${router_ip}:${http_port_str}/mgmt/deploy.tar.gz' && /usr/bin/mkdir '${deploy_dir}' && /usr/bin/tar -xf /root/mgmt-deploy.tar.gz --directory '${deploy_dir}'"
+		}
+	} else {
+		""
+	}
+	$handoff_service = if $handoff_type == "svc" { # TODO: maybe add it in other scenarios
+		# Setup the remote mgmt service, which starts on firstboot.
+		# NOTE: We use the short mgmt path because it's easier to pivot.
+		# XXX: read the ssh hostkey from a .known_hosts file instead
+		"${handoff_binary_path} setup svc --binary-path='mgmt' --install --enable --ssh-url='${handoff_svc_sshurl}' --ssh-hostkey='${handoff_svc_hostkey}' --ssh-id='${handoff_svc_sshid}' --seeds='http://127.0.0.1:2379'"
+	} else {
+		if $handoff_type == "code" {
+			# Setup the mgmt service, which starts on firstboot.
+			"${handoff_binary_path} setup svc --binary-path='${handoff_binary_path}' --install --enable"
+		} else {
+			""
+		}
+	}
+	$handoff_firstboot = if $handoff_type == "" or $handoff_remote {
+		""
+	} else {
+		# Setup the firstboot service itself.
+		"${handoff_binary_path} setup firstboot --binary-path='${handoff_binary_path}' --mkdir --install --enable --scripts-dir='${firstboot_scripts_dir}' --done-dir='${firstboot_done_dir}'"
+	}
+
+	$handoff_firstboot_exec = if $handoff_type == "exec" and $handoff_exec != "" {
+		# Add a script that will run by our firstboot service on boot.
+		# This usually just runs mgmt over the network to etcd.
+		"echo '#!/usr/bin/env bash' > ${firstboot_scripts_dir}mgmt-exec.sh && echo 'ulimit -n 16384' >> ${firstboot_scripts_dir}mgmt-exec.sh && echo '${handoff_exec}' >> ${firstboot_scripts_dir}mgmt-exec.sh && chmod u+x ${firstboot_scripts_dir}mgmt-exec.sh"
+	} else {
+		""
+	}
+
+	$handoff_firstboot_code = if $handoff_type == "code" {
+		# Add a script that will run by our firstboot service on boot.
+		# It seems that the deploy will hang until mgmt is started...
+		# NOTE: We need to add the $handoff_code arg the same way it was
+		# passed into the provisioner. It's just now in a deploy subdir.
+		# If it's a dir, then this becomes the empty strings.
+		"echo '#!/usr/bin/env bash' > ${firstboot_scripts_dir}mgmt-code.sh && echo '${handoff_binary_path} deploy lang --seeds=http://127.0.0.1:2379 --no-git --module-path=${deploy_dir_modules} ${deploy_dir}${handoff_code_chunk}' >> ${firstboot_scripts_dir}mgmt-code.sh && chmod u+x ${firstboot_scripts_dir}mgmt-code.sh"
+	} else {
+		""
+	}
+
+	# At the end of its install, the host tells the base class that it's
+	# done, and the base class stores what the host sent as its record.
+	# Without a mac address, we're the host class inside of a range, which
+	# installs many hosts from this one config. So the host looks up its own
+	# mac address to send, and it sends our $name as its source, which is
+	# how the range finds the records of the hosts that it installed. eg: a
+	# host from the range named mgmt sends mac=00:11:22:33:44:55 along with
+	# source=mgmt, but a host with a mac in its config sends no source.
+	$report_source = if $mac == "" {
+		$name
+	} else {
+		""
+	}
+	$provisioning_done = golang.template(deploy.readfile("/files/done.sh.tmpl"), struct{
+		url => "${server_base}action/done",
+		router_ip => $router_ip,
+		mac => $mac,
+		source => $report_source,
+		sshkey_path => "${sshkey_path}.pub",
+		hostkey_path => $hostkey_path,
+	})
+
+	# These install settings can be shared by the installers of each distro.
+	$install_comment = "hello!"
+	$install_lang = [
+		"en_CA.UTF-8",
+		"fr_CA.UTF-8",
+		"en_US.UTF-8",
+	]
+	$install_timezone = "UTC" # real servers all run in UTC
+	$install_ntp_servers = ["0.pool.ntp.org", "1.pool.ntp.org"] # TODO: set your own?
+	# We need $handoff_packages installed in the _KICKSTART_ environ
+	# so that we can actually run mgmt to do our work for us below!
+	$install_packages = list.concat($packages, $handoff_packages)
+	$install_sshkeys = {
+		"root" => "${sshkey}", # root ssh pub key to add
+	}
+	$install_post = [
+		$setup_sshkey, # setup the ssh key
+		$setup_hostkey, # setup the ssh host keys
+		$handoff_binary, # copy over the binary
+		$handoff_cpcode, # copy over a bundle of code
+		$handoff_service, # install a service for mgmt
+		$handoff_firstboot, # install firstboot service
+		$handoff_firstboot_exec, # install a firstboot script to exec
+		$handoff_firstboot_code, # install a firstboot script to deploy
+		$provisioning_done, # send a done signal back here
+	]
+
+	$http_kickstart_template = struct{
+		comment => $install_comment,
+		lang => $install_lang,
+		timezone => $install_timezone,
+		ntp_servers => $install_ntp_servers,
+		password => $password, # salted
+		bios => $bios,
+		part => $part,
+		luks => $luks, # set empty password
+		flavour => $flavour,
+		url => "http://${router_ip}:${http_port_str}/fedora/releases/${version}/Everything/${arch}/os/",
+		repos => {
+			#"fedora" => "http://${router_ip}:${http_port_str}/fedora/releases/${version}/Everything/${arch}/os/", # TODO: this vs url ?
+			"updates" => "http://${router_ip}:${http_port_str}/fedora/updates/${version}/Everything/${arch}/",
+		},
+		#repos => { # needs internet or blocks at storage https://bugzilla.redhat.com/show_bug.cgi?id=2269752
+		#	"fedora" => "https://mirrors.fedoraproject.org/mirrorlist?repo=fedora-\$releasever&arch=\$basearch",
+		#	"updates" => "https://mirrors.fedoraproject.org/mirrorlist?repo=updates-released-f\$releasever&arch=\$basearch",
+		#},
+		packages => $install_packages,
+		# XXX: is wget segfaulting in the kickstart environment? curl is OK.
+		#pre => [
+		#	"/usr/bin/mkdir /etc/yum.repos.d/",
+		#	"/usr/bin/wget 'http://${router_ip}:${http_port_str}/fedora/${repouid}/fedora.repo' -O /etc/yum.repos.d/fedora.repo",
+		#	"/usr/bin/wget 'http://${router_ip}:${http_port_str}/fedora/${repouid}/updates.repo' -O /etc/yum.repos.d/updates.repo",
+		#	"/usr/bin/dnf --enablerepo=fedora,updates install --assumeyes ${handoff_packages_string}",
+		#],
+		hostname => $handoff_hostname,
+		sshkeys => $install_sshkeys,
+		post => $install_post,
+	}
+
+	if $is_fedora {
+		$kickstart_file = "${kickstart_http_prefix}${hkey}.ks"
+		file "${kickstart_file}" {
+			state => $const.res.file.state.exists,
+			content => golang.template(deploy.readfile("/files/kickstart.ks.tmpl"), $http_kickstart_template),
+
+			Depend => File["${kickstart_http_prefix}"],
+		}
+
+		http:server:file "/fedora/kickstart/${hkey}.ks" { # usually $mac or `default`
+			#data => golang.template(deploy.readfile("/files/kickstart.ks.tmpl"), $http_kickstart_template),
+			path => $kickstart_file,
+
+			Before => Print["ready"],
+		}
+	}
+
+	# The debian installer uses the same settings as the kickstart does, but
+	# the post commands are in a separate script which preseed downloads.
+	$preseed_template = struct{
+		comment => $install_comment,
+		lang => $install_lang,
+		timezone => $install_timezone,
+		ntp_servers => $install_ntp_servers,
+		password => $password, # salted
+		bios => $bios,
+		part => $part,
+		luks => $luks, # set empty password
+		flavour => $flavour,
+		packages => $install_packages,
+		sshkeys => $install_sshkeys,
+		post => $install_post,
+
+		router_ip => $router_ip,
+		mirror_host => $mirror_host,
+		codename => $codename,
+		post_url => "http://${mirror_host}/${preseed_suffix}${hkey}.sh",
+		partman_hook_url => "http://${mirror_host}/${preseed_suffix}debian-partman-crypto.sh",
+		apt_hook_url => "http://${mirror_host}/${preseed_suffix}debian-apt-hook.sh",
+	}
+
+	if $is_debian {
+		$preseed_file = "${preseed_http_prefix}${hkey}.cfg"
+		file "${preseed_file}" {
+			state => $const.res.file.state.exists,
+			content => golang.template(deploy.readfile("/files/preseed.cfg.tmpl"), $preseed_template),
+
+			Depend => File["${preseed_http_prefix}"],
+		}
+		http:server:file "/${preseed_suffix}${hkey}.cfg" { # usually $mac or `default`
+			path => $preseed_file,
+
+			Before => Print["ready"],
+		}
+
+		$post_file = "${preseed_http_prefix}${hkey}.sh"
+		file "${post_file}" {
+			state => $const.res.file.state.exists,
+			content => golang.template(deploy.readfile("/files/debian-post.sh.tmpl"), $preseed_template),
+
+			Depend => File["${preseed_http_prefix}"],
+		}
+		http:server:file "/${preseed_suffix}${hkey}.sh" { # usually $mac or `default`
+			path => $post_file,
+
+			Before => Print["ready"],
+		}
+	}
+
+	if "${bmc_uri}" != "" {
+		bmc:power "${bmc_uri}" { # TODO: Name() API is not yet stable
+			#password => "hunter2",
+			insecure_password => true, # XXX: get from uri for now
+
+			state => "on",
+
+			Meta:poll => 60, # required until BMC's support real events!
+		}
+	}
+
+	# This is what the host sent us once it was installed, which the base
+	# class stored. Without a mac address, we're a range, which has many
+	# hosts, and so the range class looks at those records instead.
+	$empty_record = struct{
+		ip => "",
+		sshkey => "",
+		hostkey => "",
+		source => "",
+		name => "",
+		handoff => "",
+	}
+	$record = $hosts[$mac] <|> $empty_record # export this value to parent scope
+	$provisioned = $mac != "" and $mac in map.keys($hosts) # export this value to parent scope
+	$host_ip = $record->ip # export this value to parent scope
+	$host_sshkey = $record->sshkey # export this value to parent scope
+	$host_hostkey = $record->hostkey # export this value to parent scope
+
+	if $provisioned {
+		ssh:authorized_key "provisioner:${name}" { # magic name for collect
+			#file => "/var/lib/etcd/.ssh/authorized_keys",
+			#options => [
+			#	"command=\"echo 'Port forwarding only'; exit\"",
+			#	"no-agent-forwarding",
+			#	"no-pty",
+			#	"no-user-rc",
+			#	"no-X11-forwarding",
+			#	"permitopen=\"127.0.0.1:2379\"",
+			#],
+			type => "ssh-${sshkey_type}", # TODO: support other options
+			key => "${host_sshkey}",
+			comment => "root@${name}", # XXX: is this the right comment?
+			state => "exists",
+
+			Meta:hidden => true,
+			Meta:export => ["*"], # TODO: get the etcd hostname?
+		}
+	}
+}
+
+# The range class provisions any host that boots from our network, since we
+# don't have a mac address for it. It's a host without a mac, which serves the
+# default menus and installer files, plus a dhcp range which hands them out.
+class base:range($name, $config) {
+	$mac = $config->mac <|> ""
+	panic($mac != "", "provisioner:range $mac must be empty")
+
+	# This needs the master switch in the base class to be on as well. With
+	# proxy dhcp any uefi host that the other dhcp server gives an ip in our
+	# network gets provisioned. Unless you specify a smaller network for the
+	# range here, that's the whole existing network that we're on! A legacy
+	# bios client never asks us for its nbp once it has its lease, so we can
+	# never check its ip, and it would never get provisioned.
+	$range_proxy = $config->proxy <|> false
+	panic($range_proxy and not $proxy, "provisioner:range $proxy is not enabled in the base")
+	panic($range_proxy and ($config->bios <|> false), "provisioner:range $bios can't be used with $proxy")
+	$range_network_config = $config->network <|> ""
+	$range_network = if $range_proxy {
+		if $range_network_config == "" {
+			$router # the existing network, eg: 192.168.1.0/24
+		} else {
+			$range_network_config
+		}
+	} else {
+		$network
+	}
+	$range_skip []str = if $range_proxy {
+		[] # nothing gets allocated in proxy mode
+	} else {
+		[$router] # eg: 192.168.42.1/24
+	}
+
+	include host($name, $config) as host0
+
+	if $network != "" or $range_proxy {
+		# TODO: Our dhcp:range could send/recv a map from ip => mac address!
+		dhcp:range "${name}" {
+			network => $range_network, # eg: 192.168.42.0/24
+			skip => $range_skip,
+
+			nbp => $host0.provision ?: $host0.nbp,
+			nbp_path => $host0.provision ?: $host0.nbp_path, # with leading slash
+			ipxe => $host0.host_ipxe ?: $host0.ipxe_script, # ipxe gets this instead
+
+			proxy => $range_proxy,
+
+			Depend => Tftp:Server[":69"],
+		}
+	}
+
+	# Each host that we installed has our name as the source in its record,
+	# so this is true once any of them has been installed. Since we can have
+	# many hosts, their records are in $hosts, and the handoff class can use
+	# them with $any.
+	$source_records = iter.filter(map.values($hosts), func($record) {
+		$record->source == $name
+	})
+	$provisioned = len($source_records) > 0 # export this value to parent scope
+}
+
+# The handoff class is the second half of the remote handoff for the hosts that
+# were installed with that handoff. Once one of them is installed, it connects
+# to it as root over ssh, with the private key for the $sshkey of that host,
+# which it finds in our ~/.ssh/ dir unless you specify $sshid. It pushes our own
+# binary and runs it there as a transient child, which gets this same deploy. So
+# your code must check remote.is_child to know where it's running, and
+# remote.name is the name of that host. What the child does from then on,
+# including if it leaves anything else running, is entirely up to it. When it's
+# finished, it uses a remote:done resource with that same name, and then
+# remote.is_done with that name is true. Then we remove the record of that host
+# from our store, since it no longer needs us, so the $provisioned of its host
+# class is false again. It won't run there again until that's cleared, even if
+# it gets installed again.
+#
+# The $hosts that it hands off to are a map from the mac address of each host to
+# its name. It also hands off to each host which the runner class installed for
+# the remote handoff, with the name that it gave it. With $any, it also hands
+# off to every host with a source, which is every host that a range installed,
+# no matter which one it is. Those are named by the source_host_name function.
+# Nothing else in our store is ever used, since any host on our network can add
+# to it, and even with $any, we never take a host without a source, since that
+# was installed with a config of its own.
+class base:handoff($config) {
+	$empty_hosts map{str: str} = {}
+	$handoff_hosts = $config->hosts <|> $empty_hosts
+	$handoff_any = $config->any <|> false
+	$sshid = $config->sshid <|> "" # empty scans ~/.ssh/ for keys
+
+	forkv $mac, $record in $hosts {
+		# Only the runner class can name a record, since a host can't.
+		$runner_name = if $record->handoff == "remote" {
+			$record->name
+		} else {
+			""
+		}
+		$source_name = if $handoff_any and $record->source != "" and net.is_mac($mac) {
+			source_host_name($record->source, $mac)
+		} else {
+			""
+		}
+		$auto_name = if $runner_name != "" {
+			$runner_name
+		} else {
+			$source_name
+		}
+		$host_name = $handoff_hosts[$mac] <|> $auto_name
+		$ip = $record->ip
+
+		# The host tells us that it's done at the end of its install, so
+		# it must still reboot before sshd answers, and we keep trying
+		# until then. It can take a while for the child to finish, so
+		# this runs async, which lets us keep on swapping in new graphs,
+		# (eg: as other hosts report in) without waiting for it. We
+		# expect the host key which the host sent us, which is the same
+		# trust that we already give to the rest of what it sent. A host
+		# that sent an ip which we can't use is skipped, so that it
+		# can't change our ssh url.
+		if $host_name != "" and regexp.match("^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$", $ip) and $record->hostkey != "" {
+			remote "${host_name}" { # the child uses this name with remote:done
+				remote => "ssh://root@${ip}:22",
+				hostname => $host_name, # it must be unique in our cluster
+				ssh_id => $sshid != "" ?: $sshid,
+				hostkey => $record->hostkey,
+
+				caching => true, # cache the remote binary
+				transient => true, # remote:done needs a transient parent
+				tunnelled => true, # the child reaches our etcd through ssh
+
+				Meta:async => true,
+				Meta:retry => -1, # until the host has rebooted and sshd is up
+				Meta:delay => 10000, # ms between each try
+			}
+
+			# This is true once the child has used remote:done, even
+			# if it had an error. Then the host is on its own, so we
+			# remove its record, which also removes the remote
+			# resource above. Its done latch stays, so that it never
+			# runs twice, even if we stop before the record is gone.
+			# But if the host is then installed again, it won't run
+			# there again until that latch is cleared. If it's
+			# installed again and it sends us a new record before
+			# this removes the old one, then we'd remove the new one
+			# too. That's unlikely, but a timestamp in the record
+			# would let us only remove the one that we used. We'll
+			# skip implementing that complexity extension for now.
+			if remote.is_done($host_name) {
+				print "handoff-${host_name}" {
+					msg => "${host_name} has finished its remote handoff",
+
+					Meta:autogroup => false,
+				}
+
+				json:edit "provisioner-handoff-${host_name}" {
+					store => "etcd:///${store_key}",
+					edits => [
+						"del(.[\"${mac}\"])", # a valid mac, or one from $hosts
+					],
+				}
+			}
+		}
+	}
+}
+
+# The runner class installs each host that it's asked for while it's running, so
+# that we can be a long running provisioner service. To ask for a host, add an
+# entry with its name to our provisioner namespace in etcd, with its config as
+# json. Its mac address and its repo uid are required, for example:
+#
+#	etcdctl put /_mgmt/strings/provisioner/web1 '{"mac": "00:11:22:33:44:55", "uid": "fedora44-x86_64", "flavour": "Server", "luks": true}'
+#
+# We install that host with the host class, under that name. On our own network,
+# it needs an "ip" too. Once it's installed, and it has reported to us, we put
+# its name into its record, and then we remove its entry, since we've done what
+# it asked. That also stops us from installing it again if it boots from the
+# network again. An entry that we can't use is skipped, and we print why.
+#
+# By default, each host gets the remote handoff, so the handoff class then runs
+# mgmt on it with that name, and it removes its record once that's done. That
+# needs the handoff class, and an $sshkey for it to log in with. If you ask for
+# the same name again later, then we clear its done latch so that it's handed
+# off again. With "handoff": "svc" in its entry, the host instead runs mgmt as a
+# service on its own, which joins our cluster over ssh, and that needs the etcd
+# server to be in the provisioner_etcd_server key. Since we export the ssh key
+# that the host uses for that from its record, we keep that record.
+#
+# If you ask for a host while it still has a record from the last time that it
+# was asked for, such as with svc, or while its handoff is still running, then
+# we use that record, instead of installing it again. A timestamp in the entry
+# and in the record would let us tell those apart.
+class base:runner($config) {
+	$sshkey = $config->sshkey <|> "" # pub key installed on new host
+	$sshid = $config->sshid <|> "" # for svc: custom private key on new host used for client auth | empty: pass all available as possible signer
+
+	# This is the etcd server that the svc hosts join. It's all one json str
+	# so that it all changes at the same instant. Only svc hosts need it.
+	$etcd_server = world.getval("provisioner_etcd_server")->value # struct{value str; exists bool}
+	$etcd_server_json = if $etcd_server == "" {
+		"{}"
+	} else {
+		$etcd_server
+	}
+	$etcd_server_st = encoding.decode_json_flexible($etcd_server_json, "struct{host str; port int; hostkey str}")
+	$etcd_server_host = $etcd_server_st->host
+	$etcd_server_port = convert.int_to_str($etcd_server_st->port)
+	$etcd_server_hostkey = golang_strings.trim_space($etcd_server_st->hostkey) # AAAA...
+	$etcd_server_sshurl = "ssh://etcd@${etcd_server_host}:${etcd_server_port}" # eg: ssh://etcd@example.com:22
+
+	$available = world.kvlookup("provisioner") # map{str: str} (val is json)
+	forkv $k, $json_str in $available {
+		# The "flexible" version here lets us add new struct fields over
+		# time, even if they aren't initially present in the data yet...
+		$st = encoding.decode_json_flexible($json_str, "struct{uid str; flavour str; mac str; ip str; luks bool; handoff str}")
+
+		$uid str = $st->uid
+		$flavour str = $st->flavour
+		$mac str = golang_strings.to_lower($st->mac)
+		$ip str = $st->ip
+		$luks bool = $st->luks
+		$handoff = if $st->handoff == "" {
+			"remote" # the default
+		} else {
+			$st->handoff
+		}
+		$svc = $handoff == "svc"
+		$svc_sshurl = if $svc {
+			$etcd_server_sshurl
+		} else {
+			""
+		}
+		$svc_hostkey = if $svc {
+			$etcd_server_hostkey
+		} else {
+			""
+		}
+		$svc_sshid = if $svc {
+			$sshid
+		} else {
+			""
+		}
+
+		# A name must only be used by one host, so if a record from
+		# another host has this name, such as an svc host, then we wait
+		# until it's gone, since two of them would conflict. This host
+		# can have one.
+		$no_record = struct{
+			ip => "",
+			sshkey => "",
+			hostkey => "",
+			source => "",
+			name => "",
+			handoff => "",
+		}
+		$own_record = $hosts[$mac] <|> $no_record
+		$own_count = if $own_record->name == $k {
+			1
+		} else {
+			0
+		}
+		$named = iter.filter(map.values($hosts), func($record) {
+			$record->name == $k
+		})
+
+		# Anyone with access to our etcd can add an entry, so we check
+		# it, so that a bad one doesn't stop us from installing all of
+		# the others. The future security changes will make this harder.
+		$problems = iter.filter([
+			if len($named) > $own_count {
+				"another host's record has its name"
+			} else {
+				""
+			},
+			if regexp.match("^[a-z0-9]([a-z0-9-]*[a-z0-9])?$", $k) {
+				""
+			} else {
+				"its name must be a valid hostname"
+			},
+			if net.is_mac($mac) {
+				""
+			} else {
+				"its mac is invalid"
+			},
+			if regexp.match("^[a-z]+[0-9]+-[a-z0-9_]+$", $uid) {
+				""
+			} else {
+				"its uid is invalid"
+			},
+			if $network != "" and $ip == "" {
+				"it needs an ip on our own network"
+			} else {
+				""
+			},
+			if $handoff == "remote" or $svc {
+				""
+			} else {
+				"its handoff must be remote or svc"
+			},
+			if $handoff == "remote" and $sshkey == "" {
+				"the remote handoff needs an $sshkey"
+			} else {
+				""
+			},
+			if $svc and $etcd_server_hostkey == "" {
+				"svc needs the provisioner_etcd_server key, with a hostkey"
+			} else {
+				""
+			},
+		], func($problem) {
+			$problem != ""
+		})
+
+		if len($problems) > 0 {
+			print "provisioner-runner-${k}" {
+				msg => fmt.printf("skipping %s, since %s", $k, golang_strings.join($problems, ", and ")),
+
+				Meta:autogroup => false,
+			}
+		} else {
+			print "provisioner-runner-${k}" {
+				msg => fmt.printf("installing %s at %s with %s, for the %s handoff", $k, $mac, $uid, $handoff),
+
+				Meta:autogroup => false,
+			}
+
+			include host($k, struct{
+				repo => $uid,
+				flavour => $flavour,
+				mac => $mac,
+				ip => $ip, # only needed on our own network
+				proxy => $proxy, # it must match the base
+				#bios => false, # false or absent means use uefi
+				#password => "", # openssl passwd -6
+				sshkey => "${sshkey}", # root ssh pub key to add
+				#part => $st->part,
+				luks => $luks,
+				#packages => $st->packages,
+				#provision => true, # default if unspecified
+				handoff => $handoff,
+				handoff_svc_sshurl => $svc_sshurl,
+				handoff_svc_hostkey => $svc_hostkey,
+				handoff_svc_sshid => $svc_sshid,
+				#handoff => "exec", # sets up mgmt with handoff_exec
+				#handoff_exec => "mgmt run --ssh-url='${etcd_server_sshurl}' --ssh-hostkey='${etcd_server_hostkey}' --ssh-id='${sshid}' --seeds=http://127.0.0.1:2379 --no-autoedges --no-autogroup --no-pgp empty",
+				#handoff_code => "/etc/mgmt/", # one way to do it
+				#handoff_module_path => "/etc/mgmt/modules/",
+				handoff_hostname => $k,
+				#bmc_uri => $st->bmc_uri,
+			}) as host0
+
+			# Once it's installed, it has a record, which is either
+			# new or it already has our name, since we were doing
+			# this before. We put our name and our handoff into it
+			# so that it still has them once this entry is gone, and
+			# then we remove this entry, which is ours to remove,
+			# since it's in our namespace.
+			$record = $host0.record
+			if $host0.provisioned and ($record->name == "" or $record->name == $k) {
+				json:edit "provisioner-runner-${k}" {
+					store => "etcd:///${store_key}",
+					edits => [
+						".[\"${mac}\"].name = \"${k}\"",
+						".[\"${mac}\"].handoff = \"${handoff}\"",
+					],
+				}
+				kv "provisioner/${k}" {} # without a value, this removes the entry
+
+				Json:Edit["provisioner-runner-${k}"] -> Kv["provisioner/${k}"]
+			}
+
+			# If a host with this name had the handoff before, then
+			# its done latch is still there, so we clear it, so that
+			# this one has the handoff too. We only do that before
+			# it has a record, since the handoff needs one, so this
+			# can't make the handoff run twice.
+			if $handoff == "remote" and not $host0.provisioned and remote.is_done($k) {
+				remote "${k}" {
+					remote => "ssh://root@${k}:22", # this must be valid, but it's unused
+					clear => true,
+				}
+			}
+		}
+	}
+
+	# An svc host logs in to our etcd server with the root ssh key from its
+	# record, so we export it, which lets that server collect it. The host
+	# class does that until the entry for that host is gone, and then we do
+	# it, from its record, which we keep for that reason.
+	forkv $mac, $record in $hosts {
+		$name = $record->name
+		if $record->handoff == "svc" and $name != "" and not ($name in map.keys($available)) and $record->sshkey != "" {
+			ssh:authorized_key "provisioner:${name}" { # magic name for collect
+				type => "ssh-ed25519", # the host class makes this type of key
+				key => $record->sshkey,
+				comment => "root@${name}",
+				state => "exists",
+
+				Meta:hidden => true,
+				Meta:export => ["*"], # TODO: get the etcd hostname?
+			}
+		}
+	}
+}

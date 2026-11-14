@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,23 +13,36 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package resources
 
 import (
-	"crypto/rand"
+	"context"
 	"fmt"
-	"io/ioutil"
-	"math/big"
+	"io"
 	"os"
 	"path"
 	"strings"
 
 	"github.com/purpleidea/mgmt/engine"
 	"github.com/purpleidea/mgmt/engine/traits"
-	"github.com/purpleidea/mgmt/recwatch"
+	engineUtil "github.com/purpleidea/mgmt/engine/util"
+	"github.com/purpleidea/mgmt/util"
 	"github.com/purpleidea/mgmt/util/errwrap"
+	"github.com/purpleidea/mgmt/util/recwatch"
 )
 
 func init() {
@@ -37,11 +50,16 @@ func init() {
 }
 
 const (
-	alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-	newline  = "\n" // something not in alphabet that TrimSpace can trim
+	newline = "\n" // the standard newline
 )
 
-// PasswordRes is a no-op resource that returns a random password string.
+// PasswordRes is a no-op resource that generates a random password string. It
+// sends the generated password to other resources via send/recv, and also
+// publishes it over the local Bridge API so that it can be read back into the
+// language with the res/password value function, for example:
+// password.value("name") <|> "hunter2". That function returns a catchable error
+// until we've generated a password, which lets the except operator supply a
+// fallback in the meantime.
 type PasswordRes struct {
 	traits.Base // add the base methods without re-implementation
 	// TODO: it could be useful to group our tokens into a single write, and
@@ -52,13 +70,40 @@ type PasswordRes struct {
 
 	init *engine.Init
 
+	// Length is the number of characters to return. If you choose 0, then
+	// it is an error.
 	// FIXME: is uint16 too big?
-	Length        uint16 `yaml:"length"` // number of characters to return
-	Saved         bool   // this caches the password in the clear locally
-	CheckRecovery bool   // recovery from integrity checks by re-generating
+	Length uint16 `lang:"length" yaml:"length"`
 
-	path       string // the path to local storage
-	recWatcher *recwatch.RecWatcher
+	// Alphabet lets you specify the list of characters to use when
+	// generating a password. You may not include the newline. If you have
+	// duplicates, then statistics dictates that they will be more frequent
+	// in your password, we do not prevent this. If you do not specify this
+	// or if it is empty, then we will use a default "simple" alphabet.
+	Alphabet string `lang:"alphabet" yaml:"alphabet"`
+
+	// Write stores the password in the clear on disk. Without this your
+	// password will be ephemeral for the run of this resource. Once it is
+	// graph swapped away and back, that password will be gone. This also
+	// happens when you restart the mgmt process. If you want a password
+	// which is generated once and then kept across runs, set this to true.
+	Write bool `lang:"write" yaml:"write"`
+
+	// Newline spits out a newline at the end of the password. Useful if we
+	// are using send/recv to write it to a file, or when passing to a tool
+	// that expects a newline termination.
+	Newline bool `lang:"newline" yaml:"newline"`
+
+	// CheckRecovery specifies that we should recover from, regenerate, and
+	// carry on casually without erroring the resource if the "check"
+	// facility fails. This can happen when loading a saved password from
+	// disk which is not of the expected length. In this case, we'd discard
+	// the old saved password and create a new one without erroring. This is
+	// useful if you re-use a password resource and are changing the length.
+	CheckRecovery bool `lang:"check_recovery" yaml:"check_recovery"`
+
+	password string // when not stored on disk
+	path     string // the path to local storage
 }
 
 // Default returns some sensible defaults for this resource.
@@ -70,6 +115,13 @@ func (obj *PasswordRes) Default() engine.Res {
 
 // Validate if the params passed in are valid data.
 func (obj *PasswordRes) Validate() error {
+	if obj.Length == 0 {
+		return fmt.Errorf("password length is 0") // not allowed for security
+	}
+	if strings.Contains(obj.Alphabet, newline) {
+		return fmt.Errorf("the Alphabet contains a newline")
+	}
+
 	return nil
 }
 
@@ -88,58 +140,88 @@ func (obj *PasswordRes) Init(init *engine.Init) error {
 	return nil
 }
 
-// Close is run by the engine to clean up after the resource is done.
-func (obj *PasswordRes) Close() error {
-	return nil
+// Cleanup is run by the engine to clean up after the resource is done.
+func (obj *PasswordRes) Cleanup() error {
+	// Unpublish our password from the local Bridge API so that any consumer
+	// of the res/password value function reverts to erroring (and can pick
+	// up its except fallback) once we're no longer running.
+	return obj.init.Local.BridgeSet(context.Background(), obj.Kind(), obj.Name(), nil)
 }
 
+// publish sends the generated password to the local Bridge API so that the
+// res/password value function can read it back. We use our resource kind as the
+// namespace and our name as the uid. We publish the exact same value that we
+// send over send/recv (so it honours the Newline param) to avoid the surprise
+// of the function and send/recv disagreeing about our output. An empty password
+// is never published, so that consumers keep erroring (and can use the except
+// operator to fall back) until we've actually generated one.
+func (obj *PasswordRes) publish(ctx context.Context, password string) error {
+	if password == "" {
+		return nil // nothing valid to publish yet
+	}
+	return obj.init.Local.BridgeSet(ctx, obj.Kind(), obj.Name(), password)
+}
+
+// read is a helper to read the data from disk. This is similar to an engineUtil
+// function named ReadData but is kept separate for safety anyways.
 func (obj *PasswordRes) read() (string, error) {
 	file, err := os.Open(obj.path) // open a handle to read the file
 	if err != nil {
 		return "", err
 	}
 	defer file.Close()
-	data, err := ioutil.ReadAll(file)
+	data, err := io.ReadAll(file)
 	if err != nil {
 		return "", errwrap.Wrapf(err, "could not read from file")
 	}
-	return strings.TrimSpace(string(data)), nil
+	return strings.TrimSuffix(string(data), newline), nil
 }
 
+// write is a helper to store the data on disk. This is similar to an engineUtil
+// function named WriteData but is kept separate for safety anyways.
 func (obj *PasswordRes) write(password string) (int, error) {
-	file, err := os.Create(obj.path) // open a handle to create the file
+	uid, gid, err := engineUtil.GetUIDGID()
+	if err != nil {
+		return -1, err
+	}
+
+	// Chmod it before we write the secret data.
+	file, err := os.OpenFile(obj.path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return -1, errwrap.Wrapf(err, "can't create file")
 	}
 	defer file.Close()
-	var c int
-	if c, err = file.Write([]byte(password + newline)); err != nil {
+
+	// Chown it before we write the secret data.
+	if err := file.Chown(uid, gid); err != nil {
+		return -1, err
+	}
+
+	c, err := file.WriteString(password + newline)
+	if err != nil {
 		return c, errwrap.Wrapf(err, "can't write file")
 	}
 	return c, file.Sync()
 }
 
+// alphabet returns the alphabet we use for this resource.
+func (obj *PasswordRes) alphabet() string {
+	if obj.Alphabet != "" {
+		return obj.Alphabet
+	}
+
+	return util.RandomStringSimpleAlphabet
+}
+
 // generate generates a new password.
 func (obj *PasswordRes) generate() (string, error) {
-	max := len(alphabet) - 1 // last index
-	output := ""
-
-	// FIXME: have someone verify this is cryptographically secure & correct
-	for i := uint16(0); i < obj.Length; i++ {
-		big, err := rand.Int(rand.Reader, big.NewInt(int64(max)))
-		if err != nil {
-			return "", errwrap.Wrapf(err, "could not generate password")
-		}
-		ix := big.Int64()
-		output += string(alphabet[ix])
+	output, err := util.RandomStringAlphabet(obj.Length, obj.alphabet())
+	if err != nil {
+		return "", errwrap.Wrapf(err, "could not generate password")
 	}
 
 	if output == "" { // safety against empty passwords
 		return "", fmt.Errorf("password is empty")
-	}
-
-	if uint16(len(output)) != obj.Length { // safety against weird bugs
-		return "", fmt.Errorf("password length is too short") // bug!
 	}
 
 	return output, nil
@@ -147,20 +229,18 @@ func (obj *PasswordRes) generate() (string, error) {
 
 // check validates a stored password string
 func (obj *PasswordRes) check(value string) error {
-	length := uint16(len(value))
+	length := len(value)
 
-	if !obj.Saved && length == 0 { // expecting an empty string
-		return nil
-	}
-	if !obj.Saved && length != 0 { // should have no stored password
-		return fmt.Errorf("expected empty token only")
+	if length == 0 { // invalid password
+		return fmt.Errorf("password is empty")
 	}
 
-	if length != obj.Length {
+	if length != int(obj.Length) {
 		return fmt.Errorf("string length is not %d", obj.Length)
 	}
+	alphabet := obj.alphabet()
 Loop:
-	for i := uint16(0); i < length; i++ {
+	for i := 0; i < length; i++ {
 		for j := 0; j < len(alphabet); j++ {
 			if value[i] == alphabet[j] {
 				continue Loop
@@ -173,121 +253,152 @@ Loop:
 }
 
 // Watch is the primary listener for this resource and it outputs events.
-func (obj *PasswordRes) Watch() error {
-	var err error
-	obj.recWatcher, err = recwatch.NewRecWatcher(obj.path, false)
+func (obj *PasswordRes) Watch(ctx context.Context) error {
+	if !obj.Write {
+		if err := obj.init.Event(ctx); err != nil {
+			return err
+		}
+
+		select {
+		case <-ctx.Done(): // closed by the engine to signal shutdown
+		}
+
+		return ctx.Err()
+	}
+
+	recWatcher, err := recwatch.NewRecWatcher(ctx, obj.path, false)
 	if err != nil {
 		return err
 	}
-	defer obj.recWatcher.Close()
+	defer recWatcher.Cleanup()
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
-	var send = false // send event?
 	for {
 		select {
 		// NOTE: this part is very similar to the file resource code
-		case event, ok := <-obj.recWatcher.Events():
+		case event, ok := <-recWatcher.Events():
+			if ctx.Err() != nil {
+				return ctx.Err() // engine is shutting us down
+			}
 			if !ok { // channel shutdown
 				return nil
 			}
-			if err := event.Error; err != nil {
-				return errwrap.Wrapf(err, "unknown %s watcher error", obj)
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
 			}
-			send = true
+			if err := event.Error; err != nil {
+				return err
+			}
 
-		case <-obj.init.Done: // closed by the engine to signal shutdown
-			return nil
+		case <-ctx.Done(): // closed by the engine to signal shutdown
+			return ctx.Err()
 		}
 
-		// do all our event sending all together to avoid duplicate msgs
-		if send {
-			send = false
-			obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
 		}
 	}
 }
 
 // CheckApply method for Password resource. Does nothing, returns happy!
-func (obj *PasswordRes) CheckApply(apply bool) (bool, error) {
+func (obj *PasswordRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 	var refresh = obj.init.Refresh() // do we have a pending reload to apply?
-	var exists = true                // does the file (aka the token) exist?
+	var exists bool                  // do we already have a password?
 	var generate bool                // do we need to generate a new password?
-	var write bool                   // do we need to write out to disk?
 
-	password, err := obj.read() // password might be empty if just a token
-	if err != nil {
-		if !os.IsNotExist(err) {
+	if obj.Write {
+		obj.password = ""           // reset in case there's stale data
+		password, err := obj.read() // password might be empty if just a token
+		if err != nil && !os.IsNotExist(err) {
 			return false, errwrap.Wrapf(err, "unknown read error")
 		}
-		exists = false
+		if err == nil {
+			obj.password = password // load
+			exists = true
+		}
+	} else {
+		// An ephemeral password lives in memory for the lifetime of
+		// this resource so don't generate a new one on each CheckApply.
+		exists = obj.password != ""
 	}
 
 	if exists {
-		if err := obj.check(password); err != nil {
+		if err := obj.check(obj.password); err != nil {
 			if !obj.CheckRecovery {
 				return false, errwrap.Wrapf(err, "check failed")
 			}
 			obj.init.Logf("integrity check failed")
 			generate = true // okay to build a new one
-			write = true    // make sure to write over the old one
 		}
-	} else { // doesn't exist, write one
-		write = true
 	}
 
-	// if we previously had !obj.Saved, and now we want it, we re-generate!
-	if refresh || !exists || (obj.Saved && password == "") {
+	if refresh || !exists || obj.password == "" {
 		generate = true
 	}
 
-	// stored password isn't consistent with memory
-	//if p := obj.Password; obj.Saved && (p != nil && *p != password) {
-	//	write = true
-	//}
-
-	if !refresh && exists && !generate && !write { // nothing to do, done!
+	if !refresh && exists && !generate { // nothing to do, done!
+		p := obj.password
+		if obj.Newline {
+			p += newline
+		}
+		if err := obj.init.Send(&PasswordSends{
+			Password: &p,
+		}); err != nil {
+			return false, err
+		}
+		if err := obj.publish(ctx, p); err != nil {
+			return false, err
+		}
 		return true, nil
 	}
 	// a refresh was requested, the token doesn't exist, or the check failed
 
 	if !apply {
+		p := obj.password
+		if obj.Newline {
+			p += newline
+		}
+		if err := obj.init.Send(&PasswordSends{
+			Password: &p, // XXX: arbitrary since we're in noop mode
+		}); err != nil {
+			return false, err
+		}
 		return false, nil
 	}
 
 	if generate {
-		// we'll need to write this out...
-		if obj.Saved || (!obj.Saved && password != "") {
-			write = true
-		}
 		// generate the actual password
-		var err error
 		obj.init.Logf("generating new password...")
-		if password, err = obj.generate(); err != nil { // generate one!
+		password, err := obj.generate()
+		if err != nil { // generate one!
 			return false, errwrap.Wrapf(err, "could not generate password")
+		}
+		obj.password = password // store
+	}
+
+	if obj.Write {
+		// TODO: would it make sense to encrypt this password?
+		if _, err := obj.write(obj.password); err != nil {
+			return false, errwrap.Wrapf(err, "can't write to file")
 		}
 	}
 
 	// send
+	p := obj.password
+	if obj.Newline {
+		p += newline
+	}
 	if err := obj.init.Send(&PasswordSends{
-		Password: &password,
+		Password: &p,
 	}); err != nil {
 		return false, err
 	}
-
-	var output string // the string to write out
-
-	// if memory value != value on disk, save it
-	if write {
-		if obj.Saved { // save password as clear text
-			// TODO: would it make sense to encrypt this password?
-			output = password
-		}
-		// write either an empty token, or the password
-		obj.init.Logf("writing password token...")
-		if _, err := obj.write(output); err != nil {
-			return false, errwrap.Wrapf(err, "can't write to file")
-		}
+	if err := obj.publish(ctx, p); err != nil {
+		return false, err
 	}
 
 	return false, nil
@@ -304,10 +415,14 @@ func (obj *PasswordRes) Cmp(r engine.Res) error {
 	if obj.Length != res.Length {
 		return fmt.Errorf("the Length differs")
 	}
-	// TODO: we *could* optimize by allowing CheckApply to move from
-	// saved->!saved, by removing the file, but not likely worth it!
-	if obj.Saved != res.Saved {
-		return fmt.Errorf("the Saved differs")
+	if obj.Alphabet != res.Alphabet {
+		return fmt.Errorf("the Alphabet differs")
+	}
+	if obj.Write != res.Write {
+		return fmt.Errorf("the Write differs")
+	}
+	if obj.Newline != res.Newline {
+		return fmt.Errorf("the Newline differs")
 	}
 	if obj.CheckRecovery != res.CheckRecovery {
 		return fmt.Errorf("the CheckRecovery differs")

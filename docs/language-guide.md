@@ -46,7 +46,7 @@ golang's `float64`.
 
 #### list
 
-An ordered collection of values of the same type, eg: `[6, 7, 8, 9,]`. It is
+An ordered collection of values of the same type, eg: `[6, 7, 8, 9]`. It is
 worth mentioning that empty lists have a type, although without type hints it
 can be impossible to infer the item's type.
 
@@ -54,7 +54,7 @@ can be impossible to infer the item's type.
 
 An unordered set of unique keys of the same type and corresponding value pairs
 of another type, eg:
-`{"boiling" => 100, "freezing" => 0, "room" => 25, "house" => 22, "canada" => -30,}`.
+`{"boiling" => 100, "freezing" => 0, "room" => 25, "house" => 22, "canada" => -30}`.
 That is to say, all of the keys must have the same type, and all of the values
 must have the same type. You can use any type for either, although it is
 probably advisable to avoid using very complex types as map keys.
@@ -62,7 +62,7 @@ probably advisable to avoid using very complex types as map keys.
 #### struct
 
 An ordered set of field names and corresponding values, each of their own type,
-eg: `struct{answer => "42", james => "awesome", is_mgmt_awesome => true,}`.
+eg: `struct{answer => "42", james => "awesome!", is_mgmt_awesome => true}`.
 These are useful for combining more than one type into the same value. Note the
 syntactical difference between these and map's: the key's in map's have types,
 and as a result, string keys are enclosed in quotes, whereas struct _fields_ are
@@ -81,6 +81,47 @@ please consume
 [lang/interfaces/ast.go](https://github.com/purpleidea/mgmt/tree/master/lang/interfaces/ast.go).
 These docs will be expanded on when things are more certain to be stable.
 
+#### Except
+
+The `<|>` operator (the "except" operator) provides a fallback value for an
+expression which can error at runtime. Some functions return "catchable" errors,
+for example a list or map lookup with a missing index or key, or a division by
+zero. Normally any error in the function graph shuts the engine down, but if an
+expression which errored has an except operator attached, then the fallback
+expression is used instead. Both sides must have the same type.
+
+Other examples of functions which can return "catchable" errors include an
+invalid string conversion with `convert.str_to_int`, a missing file with
+`os.readfile`, or an unset variable with `sys.getenv`.
+
+```mcl
+$l = ["a", "b", "c"]
+$x = $l[42] <|> "default"	# list index missing, so we get "default"
+
+$y = 42 / 0 <|> 13.0	# division by zero is catchable too
+
+# they can also be chained, the first side that doesn't error is used
+$z = $l[41] <|> $l[42] <|> "default"
+```
+
+The fallback side is only added to the running function graph if an error
+actually occurs, so it can even contain slow or expensive code which would
+otherwise never run. Since values in mgmt are reactive, if the main expression
+later recovers (for example the list grew, and the index is now present) then
+the fallback side is torn back down, and the main value is used again. Errors
+are caught through dataflow, which means that an error which flows in through a
+variable is caught as well:
+
+```mcl
+$e = $l[42]	# no error here yet...
+$x = $e <|> "default"	# ...it is caught here instead
+```
+
+Note that a struct field lookup with a fallback, eg: `$st->field <|> "d"`, is
+special: whether the field is present or not in that struct is determined
+statically at compile time from the type of the struct, it is not a runtime
+error which gets caught.
+
 ### Statements
 
 There are a very small number of statements in our language. They include:
@@ -97,6 +138,24 @@ expression
 	} else {
 		# the else branch is optional for if statements
 		<statements>
+	}
+	```
+
+- **for**: loop over a list with a body of statements
+
+	```mcl
+	$list = ["a", "b", "c"]
+	for $index, $value in $list {
+		# some statements go here
+	}
+	```
+
+- **forkv**: loop over a map with a body of statements
+
+	```mcl
+	$map = {0 => "a", 1 => "b", 2 => "c"}
+	forkv $key, $val in $map {
+		# some statements go here
 	}
 	```
 
@@ -250,7 +309,7 @@ file "/tmp/f1" {
 		poll => 5,
 		limit => 4.2,
 		burst => 3,
-		sema => ["foo:1", "bar:3",],
+		sema => ["foo:1", "bar:3"],
 		autoedge => true,
 		autogroup => false,
 	},
@@ -282,6 +341,14 @@ Using this construct is a veiled form of looping (iteration). This technique is
 one of many ways you can perform iterative tasks that you might have
 traditionally used a `for` loop for instead. This is preferred, because flow
 control is error-prone and can make for less readable code.
+
+The single `str` variation, may only be used when it is possible for the
+compiler to determine statically that the value is of that type. Otherwise, it
+will assume it to be a list of strings. Programmers should explicitly wrap their
+variables in a string by interpolation to force this static `str` determination,
+or in square brackets to force a list. The former is generally preferable
+because it generates a smaller function graph since it doesn't need to build a
+list.
 
 ##### Internal edges
 
@@ -336,6 +403,28 @@ Pkg["drbd"] -> File["/etc/drbd.conf"] -> Svc["drbd"]
 to express a relationship between three resources. The first character in the
 resource kind must be capitalized so that the parser can't ascertain
 unambiguously that we are referring to a dependency relationship.
+
+##### Edge naming
+
+Each edge must have a unique name of type `str` that is used to uniquely
+identify that edge, and can be used in the functioning of the edge at its
+discretion.
+
+Alternatively, the name value may be a list of strings `[]str` to build a list
+of edges, each with a name from that list.
+
+Using this construct is a veiled form of looping (iteration). This technique is
+one of many ways you can perform iterative tasks that you might have
+traditionally used a `for` loop for instead. This is preferred, because flow
+control is error-prone and can make for less readable code.
+
+The single `str` variation, may only be used when it is possible for the
+compiler to determine statically that the value is of that type. Otherwise, it
+will assume it to be a list of strings. Programmers should explicitly wrap their
+variables in a string by interpolation to force this static `str` determination,
+or in square brackets to force a list. The former is generally preferable
+because it generates a smaller function graph since it doesn't need to build a
+list.
 
 #### Class
 
@@ -402,6 +491,38 @@ time.
 Recursive classes are not currently supported and it is not clear if they will
 be in the future. Discussion about this topic is welcome on the mailing list.
 
+A class names can contain colons to indicate it is nested inside of the class in
+the same scope which is named with the prefix indicated by colon separation.
+Instead of needing to repeatedly indent the child classes, we can instead prefix
+them at the definition site (where created with the class keyword) with the name
+of the parent class, followed by a colon, to get the desired embedded sugar.
+
+For example, instead of writing:
+
+```mcl
+class base() {
+	class inner() {
+		class deepest() {
+		}
+	}
+}
+```
+
+You can instead write:
+
+```mcl
+class base() {
+}
+class base:inner() {
+}
+class base:inner:deepest() {
+}
+```
+
+Of course, you can only access any of the inner classes by first including
+(with the include keyword) a parent class, and then subsequently including the
+inner one.
+
 #### Include
 
 The `include` statement causes the previously defined class to produce the
@@ -413,6 +534,57 @@ same scope or within different scopes. If a class uses inferred type input
 parameters, then the same class can even be called with different signatures.
 Whether the output is useful and whether there is a unique type unification
 solution is dependent on your code.
+
+Classes can be included under a new scoped prefix by using the `as` field and an
+identifier. When used in this manner, the captured scope of the class at its
+definition site are made available in the scope of the include. Variables,
+functions, and child classes are all exported.
+
+Variables are available in the include scope:
+
+```mcl
+import "fmt"
+
+class c1 {
+	test "t1" {}	# gets pulled out
+	$x = "hello"	# gets exported
+}
+include c1 as i1
+
+test "print0" {
+	anotherstr => fmt.printf("%s", $i1.x),	# hello
+	onlyshow => ["AnotherStr"], # displays nicer
+}
+```
+
+Classes are also available in the new scope:
+
+```mcl
+import "fmt"
+class c1 {
+	test "t1" {}	# gets pulled out
+	$x = "hello"	# gets exported
+
+	class c0 {
+		test "t2" {}
+		$x = "goodbye"
+	}
+}
+include c1 as i1
+include i1.c0 as i0
+
+test "print0" {
+	anotherstr => fmt.printf("%s", $i1.x),	# hello
+	onlyshow => ["AnotherStr"], # displays nicer
+}
+test "print1" {
+	anotherstr => fmt.printf("%s", $i0.x),	# goodbye
+	onlyshow => ["AnotherStr"], # displays nicer
+}
+```
+
+Of course classes can be parameterized too, and those variables specified during
+the `include`.
 
 #### Import
 
@@ -478,7 +650,7 @@ Lexing is done using [nex](https://github.com/blynn/nex). It is a pure-golang
 implementation which is similar to _Lex_ or _Flex_, but which produces golang
 code instead of C. It integrates reasonably well with golang's _yacc_ which is
 used for parsing. The token definitions are in:
-[lang/lexer.nex](https://github.com/purpleidea/mgmt/tree/master/lang/lexer.nex).
+[lang/lexer.nex](https://github.com/purpleidea/mgmt/tree/master/lang/parser/lexer.nex).
 Lexing and parsing run together by calling the `LexParse` method.
 
 #### Parsing
@@ -490,7 +662,7 @@ and trial and error. One small advantage yacc has over standard yacc is that it
 can produce error messages from examples. The best documentation is to examine
 the source. There is a short write up available [here](https://research.swtch.com/yyerror).
 The yacc file exists at:
-[lang/parser.y](https://github.com/purpleidea/mgmt/tree/master/lang/parser.y).
+[lang/parser.y](https://github.com/purpleidea/mgmt/tree/master/lang/parser/parser.y).
 Lexing and parsing run together by calling the `LexParse` method.
 
 #### Interpolation
@@ -501,6 +673,10 @@ which might contain expressions to be interpolated (eg: `"the answer is: ${foo}"
 and can be used for other scenarios in which one statement or expression would
 be better represented by a larger AST. Most nodes in the AST simply return their
 own node address, and do not modify the AST.
+
+This stage also implements the class nesting when it finds class names with
+colons that should be nested inside of a base class. Currently this does modify
+the AST for efficiency and simplicity.
 
 #### Scope propagation
 
@@ -522,23 +698,27 @@ so that each `Expr` node in the AST knows what to expect. Type annotation is
 allowed in situations when you want to explicitly specify a type, or when the
 compiler cannot deduce it, however, most of it can usually be inferred.
 
-For type inferrence to work, each node in the AST implements a `Unify` method
-which is able to return a list of invariants that must hold true. This starts at
-the top most AST node, and gets called through to it's children to assemble a
-giant list of invariants. The invariants can take different forms. They can
-specify that a particular expression must have a particular type, or they can
-specify that two expressions must have the same types. More complex invariants
-allow you to specify relationships between different types and expressions.
-Furthermore, invariants can allow you to specify that only one invariant out of
-a set must hold true.
+For type inference to work, each `Stmt` node in the AST implements a `TypeCheck`
+method which is able to return a list of invariants that must hold true. This
+starts at the top most AST node, and gets called through to it's children to
+assemble a giant list of invariants. The invariants all have the same form. They
+specify that a particular expression corresponds to two particular types which
+may both contain unification variables.
+
+Each `Expr` node in the AST implements an `Infer` and `Check` method. The
+`Infer` method returns the type of that node along with a list of invariants as
+described above. Unification variables can of course be used throughout. The
+`Check` method always uses a generic check implementation and generally doesn't
+need to be implemented by the user.
 
 Once the list of invariants has been collected, they are run through an
 invariant solver. The solver can return either return successfully or with an
-error. If the solver returns successfully, it means that it has found a trivial
+error. If the solver returns successfully, it means that it has found a single
 mapping between every expression and it's corresponding type. At this point it
 is a simple task to run `SetType` on every expression so that the types are
-known. If the solver returns in error, it is usually due to one of two
-possibilities:
+known. During this stage, each SetType method verifies that it's a compatible
+type that it can use. If either that method or if the solver returns in error,
+it is usually due to one of two possibilities:
 
 1. Ambiguity
 
@@ -558,16 +738,16 @@ possibilities:
 	always happens if the user has made a type error in their program.
 
 Only one solver currently exists, but it is possible to easily plug in an
-alternate implementation if someone more skilled in the art of solver design
-would like to propose a more logical or performant variant.
+alternate implementation if someone wants to experiment with the art of solver
+design and would like to propose a more logical or performant variant.
 
 #### Function graph generation
 
-At this point we have a fully type AST. The AST must now be transformed into a
+At this point we have a fully typed AST. The AST must now be transformed into a
 directed, acyclic graph (DAG) data structure that represents the flow of data as
 necessary for everything to be reactive. Note that this graph is *different*
 from the resource graph which is produced and sent to the engine. It is just a
-coincidence that both happen to be DAG's. (You don't freak out when you see a
+coincidence that both happen to be DAG's. (You aren't surprised when you see a
 list data structure show up in more than one place, do you?)
 
 To produce this graph, each node has a `Graph` method which it can call. This
@@ -575,9 +755,8 @@ starts at the top most node, and is called down through the AST. The edges in
 the graphs must represent the individual expression values which are passed
 from node to node. The names of the edges must match the function type argument
 names which are used in the definition of the corresponding function. These
-corresponding functions must exist for each expression node and are produced by
-calling that expression's `Func` method. These are usually called by the
-function engine during function creation and validation.
+corresponding functions must exist for each expression node and are produced as
+the vertices of this returned graph. This is built for the function engine.
 
 #### Function engine creation and validation
 
@@ -601,8 +780,9 @@ If you'd like to create a built-in, core function, you'll need to implement the
 function API interface named `Func`. It can be found in
 [lang/interfaces/func.go](https://github.com/purpleidea/mgmt/tree/master/lang/interfaces/func.go).
 Your function must have a specific type. For example, a simple math function
-might have a signature of `func(x int, y int) int`. As you can see, all the
-types are known _before_ compile time.
+might have a signature of `func(x int, y int) int`. The simple functions have
+their types known _before_ compile time. You may also include unification
+variables in the function signature as long as the top-level type is a function.
 
 A separate discussion on this matter can be found in the [function guide](function-guide.md).
 
@@ -630,12 +810,30 @@ added in the future. This method is usually called before any other, and should
 not depend on any other method being called first. Other methods must not depend
 on this method being called first.
 
+If you use any unification variables in the function signature, then your
+function will *not* be made available for use inside templates. This is a
+limitation of the `golang` templating library. In the future if this limitation
+proves to be significantly annoying, we might consider writing our own template
+library.
+
 #### Example
 
 ```golang
 func (obj *FooFunc) Info() *interfaces.Info {
 	return &interfaces.Info{
 		Sig: types.NewType("func(a str, b int) float"),
+	}
+}
+```
+
+#### Example
+
+This example contains unification variables.
+
+```golang
+func (obj *FooFunc) Info() *interfaces.Info {
+	return &interfaces.Info{
+		Sig: types.NewType("func(a ?1, b ?2, foo [?3]) ?1"),
 	}
 }
 ```
@@ -677,13 +875,13 @@ one value must be produced.
 
 ```golang
 Please see the example functions in
-[lang/funcs/core/](https://github.com/purpleidea/mgmt/tree/master/lang/funcs/core/).
+[lang/core/](https://github.com/purpleidea/mgmt/tree/master/lang/core/).
 ```
 
 ### Stream
 
 ```golang
-Stream() error
+Stream(context.Context) error
 ```
 
 Stream is called by the function engine when it is ready for your function to
@@ -692,73 +890,76 @@ value. Failure to produce at least one value will probably cause the function
 engine to hang waiting for your output. This function must close the `Output`
 channel when it has no more values to send. The engine will close the `Input`
 channel when it has no more values to send. This may or may not influence
-whether or not you close the `Output` channel.
+whether or not you close the `Output` channel. You must shutdown if the input
+context cancels.
 
 #### Example
 
 ```golang
 Please see the example functions in
-[lang/funcs/core/](https://github.com/purpleidea/mgmt/tree/master/lang/funcs/core/).
+[lang/core/](https://github.com/purpleidea/mgmt/tree/master/lang/core/).
 ```
 
-### Close
+### BuildableFunc Function API
 
-```golang
-Close() error
-```
-
-Close asks the particular function to shutdown its `Stream()` function and
-return.
-
-#### Example
-
-```golang
-Please see the example functions in
-[lang/funcs/core/](https://github.com/purpleidea/mgmt/tree/master/lang/funcs/core/).
-```
-
-### Polymorphic Function API
-
-For some functions, it might be helpful to be able to implement a function once,
-but to have multiple polymorphic variants that can be chosen at compile time.
-For this more advanced topic, you will need to use the
-[Polymorphic Function API](#polymorphic-function-api). This will help with code
-reuse when you have a small, finite number of possible type signatures, and also
-for more complicated cases where you might have an infinite number of possible
-type signatures. (eg: `[]str`, or `[][]str`, or `[][][]str`, etc...)
+For some functions, it might be helpful to have a function which needs a "build"
+step which is run after type unification. This step can be used to build the
+function using the determined type, but it may also just be used for checking
+that unification picked a valid solution.
 
 Suppose you want to implement a function which can assume different type
 signatures. The mgmt language does not support polymorphic types-- you must use
 static types throughout the language, however, it is legal to implement a
 function which can take different specific type signatures based on how it is
 used. For example, you might wish to add a math function which could take the
-form of `func(x int, x int) int` or `func(x float, x float) float` depending on
-the input values. You might also want to implement a function which takes an
-arbitrary number of input arguments (the number must be statically fixed at the
-compile time of your program though) and which returns a string.
+form of `func(x int, y int) int` or `func(x float, y float) float` depending on
+the input values. For this case you could use a signature containing unification
+variables, eg: `func(x ?1, y ?1) ?1`. At the end the buildable function would
+need to check that it received a `?1` type of either `int` or `float`, since
+this function might not support doing math on strings. Remember that type
+unification can only return zero or one solutions, it's not possible to return
+more than one, which is why this secondary validation step is a brilliant way to
+filter out invalid solutions without needing to encode them as algebraic
+conditions during the solver state, which would otherwise make it exponential.
 
-The `PolyFunc` interface adds additional methods which you must implement to
-satisfy such a function implementation. If you'd like to implement such a
-function, then please notify the project authors, and they will expand this
-section with a longer description of the process.
+### InferableFunc Function API
 
-#### Examples
+You might also want to implement a function which takes an arbitrary number of
+input arguments (the number must be statically fixed at the compile time of your
+program though) and which returns a string or something else.
 
-What follows are a few examples that might help you understand some of the
-language details.
+The `InferableFunc` interface adds ad additional `FuncInfer` method which you
+must implement to satisfy such a function implementation. This lets you
+dynamically generate a type signature (including unification variables) and a
+list of invariants before running the type unification solver. It takes as input
+a list of the statically known input types and input values (if any) and as well
+the number of input arguments specified. This is usually enough information to
+generate a fixed type signature of a fixed size.
 
-##### Example Foo
-
-TODO: please add an example here!
-
-##### Example Bar
-
-TODO: please add an example here!
+Using this API should generally be pretty rare, but it is how certain special
+functions such as `fmt.printf` are built. If you'd like to implement such a
+function, then please notify the project authors as we're curious about your
+use case.
 
 ## Frequently asked questions
 
 (Send your questions as a patch to this FAQ! I'll review it, merge it, and
 respond by commit with the answer.)
+
+### Why am I getting a deploy.readfile error when the file actually exists?
+
+You may be seeing an error like:
+
+`readfile`: open /*/files/foo: file does not exist can't read file `/files/foo`?
+
+If you look, the `foo` file is indeed in the `files/` directory. The problem is
+that the `files/` directory won't be seen if you didn't specify to include it as
+part of your deploy. To do so, chances are that all you need to do is add a
+`metadata.yaml` file into the parent directory to that files folder. This will
+be used as the entrypoint instead of the naked `main.mcl` file that you have
+there, and with that metadata entrypoint, you get a default `files/` directory
+added. You can of course change the `files/` path by setting a key in the
+`metadata.yaml` file, but we recommend you leave it as the default.
 
 ### What is the difference between `ExprIf` and `StmtIf`?
 
@@ -843,7 +1044,7 @@ Not really, but practically it can be used as such. The `class` statement is not
 a singleton since it can be called multiple times in different locations, and it
 can also be parameterized and called multiple times (with `include`) using
 different input parameters. The reason it can be used as such is that statement
-output (from multple classes) that is compatible (and usually identical) will
+output (from multiple classes) that is compatible (and usually identical) will
 be automatically collated and have the duplicates removed. In that way, you can
 assume that an unparameterized class is always a singleton, and that
 parameterized classes can often be singletons depending on their contents and if
@@ -885,7 +1086,7 @@ thing FRP experts might notice is that some of the concepts from FRP are either
 named differently, or are notably absent.
 
 In mgmt, we don't talk about behaviours, events, or signals in the strict FRP
-definitons of the words. Firstly, because we only support discretized, streams
+definitions of the words. Firstly, because we only support discretized, streams
 of values with no plan to add continuous semantics. Secondly, because we prefer
 to use terms which are more natural and relatable to what our target audience is
 expecting. Our users are more likely to have a background in Physiology, or

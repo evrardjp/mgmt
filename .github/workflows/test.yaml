@@ -27,30 +27,32 @@ jobs:
           # macos tests are currently failing in CI
           #- macos-latest
         golang_version:
-          # TODO: add 1.17.x and tip
+          # TODO: add 1.27.x and tip
           # minimum required and latest published go_version
-          - 1.16
+          - "1.26"
         test_block:
           - basic
           - shell
           - race
-      #fail-fast: false
+      fail-fast: false
 
     steps:
-      # Do not shallow fetch, will fail when building bindata/
-      # The path can't be absolute, so we need to move it to the
-      # expected location later.
+      # Do not shallow fetch. The path can't be absolute, so we need to move it
+      # to the expected location later.
       - name: Clone mgmt
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 0
           path: ./go/src/github.com/purpleidea/mgmt
 
       - name: Install Go ${{ matrix.golang_version }}
-        uses: actions/setup-go@v2
+        uses: actions/setup-go@v4
         with:
           go-version: ${{ matrix.golang_version }}
+          cache: true
+          cache-dependency-path: |
+            go/src/github.com/purpleidea/mgmt/go.sum
 
       # Install & configure ruby, fixes gem permissions error
       - name: Install Ruby

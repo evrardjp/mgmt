@@ -1,14 +1,14 @@
-#!/bin/bash -e
+#!/usr/bin/env -S bash -e
 
 . "$(dirname "$0")/../util.sh"
 
-if in_ci travis jenkins; then
+if in_env travis jenkins; then
 	# inotify doesn't seem to work properly on travis
 	echo "Travis and Jenkins give wonky results here, skipping test!"
 	exit
 fi
 
-if in_ci github; then
+if in_env github; then
 	# TODO: consider debugging this
 	echo "This is failing in github, skipping test!"
 	exit
@@ -18,11 +18,11 @@ fi
 mkdir -p "${MGMT_TMPDIR}"mgmt{A..C}
 
 # run till completion
-$TIMEOUT "$MGMT" run --converged-timeout=5 --no-watch --tmp-prefix yaml t3-a.yaml &
+$TIMEOUT "$MGMT" run --converger-timeout=5 --converged-exit --no-watch --tmp-prefix yaml t3-a.yaml &
 pid1=$!
-$TIMEOUT "$MGMT" run --converged-timeout=5 --no-watch --tmp-prefix yaml t3-b.yaml &
+$TIMEOUT "$MGMT" run --converger-timeout=5 --converged-exit --no-watch --tmp-prefix yaml t3-b.yaml &
 pid2=$!
-$TIMEOUT "$MGMT" run --converged-timeout=5 --no-watch --tmp-prefix yaml t3-c.yaml &
+$TIMEOUT "$MGMT" run --converger-timeout=5 --converged-exit --no-watch --tmp-prefix yaml t3-c.yaml &
 pid3=$!
 
 wait $pid1	# get exit status

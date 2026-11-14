@@ -1,0 +1,14 @@
+-- main.mcl --
+# variable shadowing inner
+# this should be okay, because var is shadowed
+$x = "hello"
+if true {
+	$x = "world" # shadowed
+	test "t" {
+		stringptr => $x,
+	}
+}
+-- OUTPUT --
+Edge: const: bool(true) -> stmtif # condition
+Vertex: const: bool(true)
+Vertex: stmtif

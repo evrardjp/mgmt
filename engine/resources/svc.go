@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,16 +13,30 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 // DOCS: https://godoc.org/github.com/coreos/go-systemd/dbus
 
 package resources
 
 import (
+	"context"
 	"fmt"
 	"os/user"
 	"path"
+	"time"
 
 	"github.com/purpleidea/mgmt/engine"
 	"github.com/purpleidea/mgmt/engine/traits"
@@ -39,6 +53,46 @@ func init() {
 	engine.RegisterResource("svc", func() engine.Res { return &SvcRes{} })
 }
 
+var _ engine.EdgeableRes = &SvcRes{} // compile time check
+
+// The SystemdUnitMode* constants do the following from the docs:
+//
+// The mode needs to be one of replace, fail, isolate, ignore-dependencies,
+// ignore-requirements. If "replace" the call will start the unit and its
+// dependencies, possibly replacing already queued jobs that conflict with this.
+// If "fail" the call will start the unit and its dependencies, but will fail if
+// this would change an already queued job. If "isolate" the call will start the
+// unit in question and terminate all units that aren't dependencies of it. If
+// "ignore-dependencies" it will start a unit but ignore all its dependencies.
+// If "ignore-requirements" it will start a unit but only ignore the requirement
+// dependencies. It is not recommended to make use of the latter two options.
+const (
+	SystemdUnitModeReplace            = "replace"
+	SystemdUnitModeFail               = "fail"
+	SystemdUnitModeIsolate            = "isolate"
+	SystemdUnitModeIgnoreDependencies = "ignore-dependencies"
+	SystemdUnitModeIgnoreRequirements = "ignore-requirements"
+)
+
+// The SystemdUnitResult* constants do the following from the docs:
+//
+// If the provided channel is non-nil, a result string will be sent to it upon
+// job completion: one of done, canceled, timeout, failed, dependency, skipped.
+// "done" indicates successful execution of a job. "canceled" indicates that a
+// job has been canceled before it finished execution. "timeout" indicates that
+// the job timeout was reached. "failed" indicates that the job failed.
+// "dependency" indicates that a job this job has been depending on failed and
+// the job hence has been removed too. "skipped" indicates that a job was
+// skipped because it didn't apply to the units current state.
+const (
+	SystemdUnitResultDone       = "done"
+	SystemdUnitResultCanceled   = "canceled"
+	SystemdUnitResultTimeout    = "timeout"
+	SystemdUnitResultFailed     = "failed"
+	SystemdUnitResultDependency = "dependency"
+	SystemdUnitResultSkipped    = "skipped"
+)
+
 // SvcRes is a service resource for systemd units.
 type SvcRes struct {
 	traits.Base // add the base methods without re-implementation
@@ -48,9 +102,24 @@ type SvcRes struct {
 
 	init *engine.Init
 
-	State   string `yaml:"state"`   // state: running, stopped, undefined
-	Startup string `yaml:"startup"` // enabled, disabled, undefined
-	Session bool   `yaml:"session"` // user session (true) or system?
+	// State is the desired state for this resource. Valid values include:
+	// running, stopped, and undefined (empty string).
+	State string `lang:"state" yaml:"state"`
+
+	// Startup specifies what should happen on startup. Values can be:
+	// enabled, disabled, and undefined (empty string).
+	Startup string `lang:"startup" yaml:"startup"`
+
+	// Session specifies if this is for a system service (false) or a user
+	// session specific service (true).
+	Session bool `lang:"session" yaml:"session"` // user session (true) or system?
+
+	// Restart specifies what a refresh notification does to a running
+	// service. When false (the default) we attempt a systemd reload, and
+	// fall back to a restart if the unit does not support reloading. When
+	// true we always do a full restart (stop then start) which re-runs the
+	// unit's ExecStart.
+	Restart bool `lang:"restart" yaml:"restart"`
 }
 
 // Default returns some sensible defaults for this resource.
@@ -75,26 +144,32 @@ func (obj *SvcRes) Init(init *engine.Init) error {
 	return nil
 }
 
-// Close is run by the engine to clean up after the resource is done.
-func (obj *SvcRes) Close() error {
+// Cleanup is run by the engine to clean up after the resource is done.
+func (obj *SvcRes) Cleanup() error {
 	return nil
 }
 
+// svc is a helper that returns the systemd name.
+func (obj *SvcRes) svc() string {
+	return fmt.Sprintf("%s.service", obj.Name())
+}
+
 // Watch is the primary listener for this resource and it outputs events.
-func (obj *SvcRes) Watch() error {
-	// obj.Name: svc name
+func (obj *SvcRes) Watch(ctx context.Context) error {
 	if !systemdUtil.IsRunningSystemd() {
 		return fmt.Errorf("systemd is not running")
 	}
 
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel() // make sure we always close any below ctx just in case!
+
 	var conn *systemd.Conn
-	var bus *dbus.Conn
 	var err error
 	if obj.Session {
-		conn, err = systemd.NewUserConnection() // user session
+		conn, err = systemd.NewUserConnectionContext(ctx) // user session
 	} else {
-		// we want NewSystemConnection but New falls back to this
-		conn, err = systemd.New() // needs root access
+		// we want NewSystemConnectionContext but New... falls back to this
+		conn, err = systemd.NewWithContext(ctx) // needs root access
 	}
 	if err != nil {
 		return errwrap.Wrapf(err, "failed to connect to systemd")
@@ -102,6 +177,7 @@ func (obj *SvcRes) Watch() error {
 	defer conn.Close()
 
 	// if we share the bus with others, we will get each others messages!!
+	var bus *dbus.Conn
 	if obj.Session {
 		bus, err = util.SessionBusPrivateUsable()
 	} else {
@@ -112,165 +188,290 @@ func (obj *SvcRes) Watch() error {
 	}
 	defer bus.Close()
 
-	// XXX: will this detect new units?
-	bus.BusObject().Call("org.freedesktop.DBus.AddMatch", 0,
-		"type='signal',interface='org.freedesktop.systemd1.Manager',member='Reloading'")
-	buschan := make(chan *dbus.Signal, 10)
-	defer close(buschan) // NOTE: closing a chan that contains a value is ok
-	bus.Signal(buschan)
-	defer bus.RemoveSignal(buschan) // not needed here, but nice for symmetry
+	// NOTE: I guess it's not the worst-case scenario if we drop signal or
+	// if it fills up and we block. Whichever way the upstream implements it
+	// we'll have a back log of signals to loop through which is just fine.
+	chBus := make(chan *dbus.Signal, 10) // TODO: what size if any?
+	defer close(chBus)                   // NOTE: closing a chan that contains a value is ok
+	bus.Signal(chBus)
+	defer bus.RemoveSignal(chBus) // not needed here, but nice for symmetry
 
-	obj.init.Running() // when started, notify engine that we're running
+	// Legacy way to do this matching...
+	//method := "org.freedesktop.DBus.AddMatch"
+	//flags := dbus.Flags(0)
+	//args := []interface{}{"type='signal',interface='org.freedesktop.systemd1.Manager',member='Reloading'"}
+	//call := bus.BusObject().CallWithContext(ctx, method, flags, args...) // *dbus.Call
+	//if err := call.Err; err != nil {
+	//	return errwrap.Wrapf(err, "failed to connect signal on bus")
+	//}
+	matchOptions := []dbus.MatchOption{
+		dbus.WithMatchInterface("org.freedesktop.systemd1.Manager"),
+		dbus.WithMatchMember("Reloading"),
+	}
+	if err := bus.AddMatchSignalContext(ctx, matchOptions...); err != nil {
+		return errwrap.Wrapf(err, "failed to add match signal on bus")
+	}
+	defer func() {
+		// On shutdown, we prefer to give this a chance to run. If we
+		// use the main ctx, then it will error because ctx cancelled.
+		ctx, cancel := context.WithTimeout(context.Background(), 1000*time.Millisecond)
+		defer cancel()
+		if err := bus.RemoveMatchSignalContext(ctx, matchOptions...); err != nil {
+			obj.init.Logf("failed to remove match signal on bus: %+v", err)
+		}
+	}()
 
-	var svc = fmt.Sprintf("%s.service", obj.Name()) // systemd name
-	var send = false                                // send event?
-	var invalid = false                             // does the svc exist or not?
-	var previous bool                               // previous invalid value
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
-	// TODO: do we first need to call conn.Subscribe() ?
+	svc := obj.svc() // systemd name
+
 	set := conn.NewSubscriptionSet() // no error should be returned
-	subChannel, subErrors := set.Subscribe()
-	//defer close(subChannel) // cannot close receive-only channel
-	//defer close(subErrors) // cannot close receive-only channel
-	var activeSet = false
+	// XXX: dynamic bugs: https://github.com/coreos/go-systemd/issues/474
+	set.Add(svc) // it's okay if the svc doesn't exist yet
+	chSub, chSubErr := set.SubscribeContext(ctx)
+	//defer close(chSub) // cannot close receive-only channel
+	//defer close(chSubErr) // cannot close receive-only channel
+	defer func() { // drain to avoid deadlock with this crappy function
+		// The go-systemd subscribe goroutine only closes chSub and
+		// chSubErr once the ctx we passed to SubscribeContext is done.
+		// Our defer cancel() above runs *after* this defer (they run
+		// LIFO) so if Watch is returning because of an error rather
+		// than a cancelled ctx, those channels would never close and
+		// this drain would block forever. Cancel here first so they
+		// close.
+		cancel()
+		// XXX: https://github.com/coreos/go-systemd/pull/514 or similar
+		// The main loop above sets chSub or chSubErr to nil once it has
+		// seen it close. A receive on a nil channel blocks forever, so
+		// treat an already-nil channel as already-drained, otherwise we
+		// deadlock in the select below waiting on a close we can never
+		// observe.
+		chSubClosed := chSub == nil
+		chSubErrClosed := chSubErr == nil
+		for {
+			if chSubClosed && chSubErrClosed {
+				return
+			}
+
+			select {
+			case _, ok := <-chSub:
+				if !ok {
+					chSubClosed = true
+					chSub = nil
+				}
+			case _, ok := <-chSubErr:
+				if !ok {
+					chSubErrClosed = true
+					chSubErr = nil
+				}
+			}
+		}
+	}()
 
 	for {
-		// XXX: watch for an event for new units...
-		// XXX: detect if startup enabled/disabled value changes...
-
-		previous = invalid
-		invalid = false
-
-		// firstly, does svc even exist or not?
-		loadstate, err := conn.GetUnitProperty(svc, "LoadState")
-		if err != nil {
-			obj.init.Logf("failed to get property: %+v", err)
-			invalid = true
+		if obj.init.Debug {
+			obj.init.Logf("watching...")
 		}
+		select {
 
-		if !invalid {
-			var notFound = (loadstate.Value == dbus.MakeVariant("not-found"))
-			if notFound { // XXX: in the loop we'll handle changes better...
-				obj.init.Logf("failed to find svc")
-				invalid = true // XXX: ?
+		case sig, ok := <-chBus:
+			if !ok {
+				chBus = nil
+				return fmt.Errorf("unexpected close") // we close this one!
 			}
-		}
-
-		if previous != invalid { // if invalid changed, send signal
-			send = true
-		}
-
-		if invalid {
-			obj.init.Logf("waiting fo service") // waiting for svc to appear...
-			if activeSet {
-				activeSet = false
-				set.Remove(svc) // no return value should ever occur
+			if obj.init.Debug {
+				obj.init.Logf("sig: %+v", sig)
 			}
 
-			select {
-			case <-buschan: // XXX: wait for new units event to unstick
-				// loop so that we can see the changed invalid signal
-				obj.init.Logf("daemon reload")
+			// This event happens if we `systemctl daemon-reload` or
+			// if `systemctl enable/disable <svc>` is run. For both
+			// of these situations we seem to always get two events.
+			// The first seems to have `Body:[true]`, and the second
+			// has `Body:[false]`.
 
-			case <-obj.init.Done: // closed by the engine to signal shutdown
-				return nil
+			// https://pkg.go.dev/github.com/godbus/dbus/v5#Signal
+			//eg: &{Sender::1.287 Path:/org/freedesktop/systemd1 Name:org.freedesktop.systemd1.Manager.Reloading Body:[false] Sequence:7}
+			if sig.Name != "org.freedesktop.systemd1.Manager.Reloading" {
+				// not for us
+				continue
 			}
-		} else {
-			if !activeSet {
-				activeSet = true
-				set.Add(svc) // no return value should ever occur
+
+			if len(sig.Body) == 0 {
+				// does this ever happen? send a signal for now
+				obj.init.Logf("daemon reload with empty body")
+				break // break out of select and send event now
 			}
 
-			obj.init.Logf("watching...") // attempting to watch...
-			select {
-			case event := <-subChannel:
+			if len(sig.Body) > 1 {
+				// does this ever happen? send a signal for now
+				obj.init.Logf("daemon reload with big body")
+				break // break out of select and send event now
+			}
 
-				obj.init.Logf("event: %+v", event)
-				// NOTE: the value returned is a map for some reason...
-				if event[svc] != nil {
-					// event[svc].ActiveState is not nil
+			b, ok := sig.Body[0].(bool)
+			if !ok {
+				// does this ever happen? send a signal for now
+				obj.init.Logf("daemon reload with badly typed body")
+				break // break out of select and send event now
+			}
 
-					switch event[svc].ActiveState {
-					case "active":
-						obj.init.Logf("started")
-					case "inactive":
-						obj.init.Logf("stopped")
-					case "reloading":
-						obj.init.Logf("reloading")
-					case "failed":
-						obj.init.Logf("failed")
-					case "activating":
-						obj.init.Logf("activating")
-					case "deactivating":
-						obj.init.Logf("deactivating")
-					default:
-						return fmt.Errorf("unknown svc state: %s", event[svc].ActiveState)
-					}
-				} else {
-					// svc stopped (and ActiveState is nil...)
-					obj.init.Logf("stopped")
+			// We do all of this annoying parsing to cut our event
+			// count by half, since these signals seem to come in
+			// pairs. We skip the "true" one that comes first.
+			if b {
+				if obj.init.Debug {
+					obj.init.Logf("skipping daemon-reload start")
 				}
-				send = true
-
-			case err := <-subErrors:
-				return errwrap.Wrapf(err, "unknown %s error", obj)
-
-			case <-obj.init.Done: // closed by the engine to signal shutdown
-				return nil
+				continue
 			}
+			if obj.init.Debug {
+				obj.init.Logf("daemon reload") // success!
+			}
+
+		case event, ok := <-chSub:
+			if !ok {
+				chSub = nil
+				continue
+			}
+			if obj.init.Debug {
+				obj.init.Logf("event: %+v", event)
+			}
+
+			// The value returned is a map in case we monitor many.
+			unitStatus, ok := event[svc]
+			if !ok { // not me
+				continue
+			}
+
+			if unitStatus == nil {
+				if obj.init.Debug {
+					obj.init.Logf("service stopped")
+				}
+				break // break out of select and send event now
+			}
+
+			msg := ""
+			switch event[svc].ActiveState { // string
+			case "active":
+				msg = "service started"
+			case "inactive":
+				msg = "service stopped"
+			case "reloading":
+				msg = "service reloading"
+			case "failed":
+				msg = "service failed"
+			case "activating":
+				msg = "service activating"
+			case "deactivating":
+				msg = "service deactivating"
+			default:
+				return fmt.Errorf("unknown service state: %s", event[svc].ActiveState)
+			}
+			if obj.init.Debug {
+				obj.init.Logf("%s", msg)
+			}
+
+		case err, ok := <-chSubErr:
+			if !ok {
+				chSubErr = nil
+				continue
+			}
+			if err == nil {
+				obj.init.Logf("unexpected nil error")
+				continue
+			}
+			// I think this happens if systemd package is updating.
+			// XXX: if chSubErr returns an err does it keep working?
+			// XXX: Do we have to restart the set.Subscribe ?
+			if err.Error() == "Remote peer disconnected" {
+				obj.init.Logf("remote peer disconnected")
+				select {
+				case <-time.After(1 * time.Second):
+					obj.init.Logf("remote peer retrying")
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				continue
+			}
+			return errwrap.Wrapf(err, "unknown error")
+
+		case <-ctx.Done(): // closed by the engine to signal shutdown
+			return ctx.Err()
 		}
 
-		if send {
-			send = false
-			obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
 		}
 	}
 }
 
 // CheckApply checks the resource state and applies the resource if the bool
 // input is true. It returns error info and if the state check passed or not.
-func (obj *SvcRes) CheckApply(apply bool) (bool, error) {
+func (obj *SvcRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 	if !systemdUtil.IsRunningSystemd() {
 		return false, fmt.Errorf("systemd is not running")
 	}
 
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel() // make sure we always close any below ctx just in case!
+
 	var conn *systemd.Conn
 	var err error
 	if obj.Session {
-		conn, err = systemd.NewUserConnection() // user session
+		conn, err = systemd.NewUserConnectionContext(ctx) // user session
 	} else {
-		// we want NewSystemConnection but New falls back to this
-		conn, err = systemd.New() // needs root access
+		// we want NewSystemConnectionContext but New... falls back to this
+		conn, err = systemd.NewWithContext(ctx) // needs root access
 	}
 	if err != nil {
 		return false, errwrap.Wrapf(err, "failed to connect to systemd")
 	}
 	defer conn.Close()
 
-	var svc = fmt.Sprintf("%s.service", obj.Name()) // systemd name
+	// if we share the bus with others, we will get each others messages!!
+	//var bus *dbus.Conn
+	//if obj.Session {
+	//	bus, err = util.SessionBusPrivateUsable()
+	//} else {
+	//	bus, err = util.SystemBusPrivateUsable()
+	//}
+	//if err != nil {
+	//	return errwrap.Wrapf(err, "failed to connect to bus")
+	//}
+	//defer bus.Close()
 
-	loadstate, err := conn.GetUnitProperty(svc, "LoadState")
+	svc := obj.svc() // systemd name
+
+	loadState, err := conn.GetUnitPropertyContext(ctx, svc, "LoadState")
 	if err != nil {
 		return false, errwrap.Wrapf(err, "failed to get load state")
 	}
 
 	// NOTE: we have to compare variants with other variants, they are really strings...
-	var notFound = (loadstate.Value == dbus.MakeVariant("not-found"))
+	notFound := (loadState.Value == dbus.MakeVariant("not-found"))
 	if notFound {
-		return false, errwrap.Wrapf(err, "failed to find svc: %s", svc)
+		return false, fmt.Errorf("failed to find svc: %s", svc)
 	}
 
-	// XXX: check svc "enabled at boot" or not status...
-
-	//conn.GetUnitProperties(svc)
-	activestate, err := conn.GetUnitProperty(svc, "ActiveState")
+	//conn.GetUnitPropertiesContexts(svc)
+	activeState, err := conn.GetUnitPropertyContext(ctx, svc, "ActiveState")
 	if err != nil {
 		return false, errwrap.Wrapf(err, "failed to get active state")
 	}
 
-	var running = (activestate.Value == dbus.MakeVariant("active"))
-	var stateOK = ((obj.State == "") || (obj.State == "running" && running) || (obj.State == "stopped" && !running))
-	var startupOK = true // XXX: DETECT AND SET
+	running := (activeState.Value == dbus.MakeVariant("active"))
+	stateOK := ((obj.State == "") || (obj.State == "running" && running) || (obj.State == "stopped" && !running))
+
+	startupState, err := conn.GetUnitPropertyContext(ctx, svc, "UnitFileState")
+	if err != nil {
+		return false, errwrap.Wrapf(err, "failed to get unit file state")
+	}
+
+	enabled := (startupState.Value == dbus.MakeVariant("enabled"))
+	disabled := (startupState.Value == dbus.MakeVariant("disabled"))
+	startupOK := ((obj.Startup == "") || (obj.Startup == "enabled" && enabled) || (obj.Startup == "disabled" && disabled))
 
 	// NOTE: if this svc resource is embedded as a composite resource inside
 	// of another resource using a technique such as `makeComposite()`, then
@@ -281,7 +482,7 @@ func (obj *SvcRes) CheckApply(apply bool) (bool, error) {
 	// trait to the parent resource, or we'll panic when we call this line.)
 	// It might not be recommended to use the Watch method without a thought
 	// to what actually happens when we would run Send(), and other methods.
-	var refresh = obj.init.Refresh() // do we have a pending reload to apply?
+	refresh := obj.init.Refresh() // do we have a pending reload to apply?
 
 	if stateOK && startupOK && !refresh {
 		return true, nil // we are in the correct state
@@ -293,63 +494,177 @@ func (obj *SvcRes) CheckApply(apply bool) (bool, error) {
 	}
 
 	// apply portion
-	obj.init.Logf("Apply")
-	var files = []string{svc} // the svc represented in a list
-	if obj.Startup == "enabled" {
-		_, _, err = conn.EnableUnitFiles(files, false, true)
 
-	} else if obj.Startup == "disabled" {
-		_, err = conn.DisableUnitFiles(files, false)
+	if !startupOK && obj.Startup != "" {
+		files := []string{svc} // the svc represented in a list
+		if obj.Startup == "enabled" {
+			_, _, err = conn.EnableUnitFilesContext(ctx, files, false, true)
+		} else if obj.Startup == "disabled" {
+			_, err = conn.DisableUnitFilesContext(ctx, files, false)
+		} else {
+			// pass
+		}
+		if err != nil {
+			return false, errwrap.Wrapf(err, "unable to change startup status")
+		}
+		if obj.Startup == "enabled" {
+			obj.init.Logf("service enabled")
+		} else if obj.Startup == "disabled" {
+			obj.init.Logf("service disabled")
+		}
 	}
 
-	if err != nil {
-		return false, errwrap.Wrapf(err, "unable to change startup status")
+	if !stateOK && obj.State != "" {
+		// This channel must be buffered: go-systemd delivers the job
+		// result with a blocking send while holding its jobListener
+		// lock, so an unbuffered channel with no ready receiver would
+		// deadlock every future job on this conn. See waitJob for how
+		// and when it is safe to close.
+		result := make(chan string, 1) // catch result information
+		if obj.State == "running" {
+			_, err = conn.StartUnitContext(ctx, svc, SystemdUnitModeFail, result)
+		} else if obj.State == "stopped" {
+			_, err = conn.StopUnitContext(ctx, svc, SystemdUnitModeFail, result)
+		} else { // skip through this section
+			// TODO: should we do anything here instead?
+			result <- "" // chan is buffered, so won't block
+		}
+		if err != nil {
+			return false, errwrap.Wrapf(err, "unable to change running status")
+		}
+		if refresh {
+			obj.init.Logf("skipping reload, due to pending start/stop")
+		}
+		refresh = false // We did a start or stop, so a reload is not needed.
+
+		status, err := obj.waitJob(ctx, result)
+		if err != nil {
+			return false, err
+		}
+
+		switch status {
+		case "":
+			// pass
+
+		case SystemdUnitResultDone:
+			if obj.State == "running" {
+				obj.init.Logf("service started")
+			} else if obj.State == "stopped" {
+				obj.init.Logf("service stopped")
+			}
+
+		case SystemdUnitResultCanceled:
+			// TODO: should this be context.Canceled?
+			return false, fmt.Errorf("operation cancelled")
+
+		case SystemdUnitResultTimeout:
+			return false, fmt.Errorf("operation timed out")
+
+		case SystemdUnitResultFailed:
+			return false, fmt.Errorf("svc failed (selinux?)")
+
+		default:
+			return false, fmt.Errorf("unknown systemd return string: %s", status)
+		}
 	}
 
-	// XXX: do we need to use a buffered channel here?
+	if !refresh { // Do we need to reload or restart the service?
+		return false, nil // success
+	}
+
+	if obj.init.Debug {
+		if obj.Restart {
+			obj.init.Logf("restarting...")
+		} else {
+			obj.init.Logf("reloading...")
+		}
+	}
+
+	// From: https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.systemd1.html
+	// If a service is restarted that isn't running, it will be started
+	// unless the "Try" flavour is used in which case a service that isn't
+	// running is not affected by the restart. The ReloadOrRestart flavours
+	// attempts a reload if the unit supports it and uses restart otherwise.
 	result := make(chan string, 1) // catch result information
-
-	if obj.State == "running" {
-		_, err = conn.StartUnit(svc, "fail", result)
-		if err != nil {
-			return false, errwrap.Wrapf(err, "failed to start unit")
+	if obj.Restart {
+		_, err = conn.RestartUnitContext(ctx, svc, SystemdUnitModeFail, result)
+	} else {
+		_, err = conn.ReloadOrTryRestartUnitContext(ctx, svc, SystemdUnitModeFail, result)
+	}
+	if err != nil {
+		if obj.Restart {
+			return false, errwrap.Wrapf(err, "failed to restart unit")
 		}
-		if refresh {
-			obj.init.Logf("Skipping reload, due to pending start")
-		}
-		refresh = false // we did a start, so a reload is not needed
-	} else if obj.State == "stopped" {
-		_, err = conn.StopUnit(svc, "fail", result)
-		if err != nil {
-			return false, errwrap.Wrapf(err, "failed to stop unit")
-		}
-		if refresh {
-			obj.init.Logf("Skipping reload, due to pending stop")
-		}
-		refresh = false // we did a stop, so a reload is not needed
+		return false, errwrap.Wrapf(err, "failed to reload unit")
 	}
 
-	status := <-result
-	if &status == nil {
-		return false, fmt.Errorf("systemd service action result is nil")
+	status, err := obj.waitJob(ctx, result)
+	if err != nil {
+		return false, err
 	}
+
 	switch status {
-	case "done":
+	case "":
 		// pass
-	case "failed":
-		return false, fmt.Errorf("svc failed (selinux?)")
+
+	case SystemdUnitResultDone:
+		if obj.Restart {
+			obj.init.Logf("service restarted")
+		} else {
+			obj.init.Logf("service reloaded")
+		}
+
+	case SystemdUnitResultCanceled:
+		// TODO: should this be context.Canceled?
+		return false, fmt.Errorf("operation cancelled")
+
+	case SystemdUnitResultTimeout:
+		return false, fmt.Errorf("operation timed out")
+
+	case SystemdUnitResultFailed:
+		if obj.Restart {
+			return false, fmt.Errorf("svc restart failed (selinux?)")
+		}
+		return false, fmt.Errorf("svc reload failed (selinux?)")
+
 	default:
 		return false, fmt.Errorf("unknown systemd return string: %v", status)
 	}
 
-	if refresh { // we need to reload the service
-		// XXX: run a svc reload here!
-		obj.init.Logf("Reloading...")
-	}
-
-	// XXX: also set enabled on boot
-
 	return false, nil // success
+}
+
+// waitJob blocks until systemd reports the result of a job that was previously
+// started with the given buffered result channel, or until ctx is cancelled.
+//
+// On a real result it closes the channel before returning. This is safe because
+// go-systemd removes the channel from its job listener as soon as it delivers
+// the result, so no further send can race with our close. On ctx cancellation
+// the job may still be in flight, and go-systemd delivers results from an
+// asynchronous, non-joinable dispatcher goroutine, so there is no moment at
+// which we can prove that no further send will happen; closing then would risk
+// a panic from a send on a closed channel. We therefore leave the channel to
+// the garbage collector (the deferred conn.Close in the caller stops that
+// dispatcher) and return promptly, since the engine requires CheckApply to
+// return soon after its context is cancelled.
+// XXX: get the go-systemd project to fix their crummy API
+func (obj *SvcRes) waitJob(ctx context.Context, result chan string) (string, error) {
+	for {
+		// TODO: Should we permanently error after a long timeout here?
+		select {
+		case status, ok := <-result:
+			if ok { // it's now safe to free the channel explicitly
+				close(result)
+			}
+			return status, nil
+
+		case <-time.After(10 * time.Second):
+			obj.init.Logf("systemd job is slow, still waiting...")
+
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
 }
 
 // Cmp compares two resources and returns an error if they are not equivalent.
@@ -369,8 +684,105 @@ func (obj *SvcRes) Cmp(r engine.Res) error {
 	if obj.Session != res.Session {
 		return fmt.Errorf("the Session differs")
 	}
+	if obj.Restart != res.Restart {
+		return fmt.Errorf("the Restart differs")
+	}
 
 	return nil
+}
+
+// GroupCmp returns whether two resources can be grouped together or not.
+//func (obj *SvcRes) GroupCmp(r engine.GroupableRes) error {
+//	_, ok := r.(*SvcRes)
+//	if !ok {
+//		return fmt.Errorf("resource is not the same kind")
+//	}
+//	// TODO: depending on if the systemd service api allows batching, we
+//	// might be able to build this, although not sure how useful it is...
+//	// it might just eliminate parallelism by bunching up the graph
+//	return fmt.Errorf("not possible at the moment")
+//}
+
+// UnmarshalYAML is the custom unmarshal handler for this struct. It is
+// primarily useful for setting the defaults.
+func (obj *SvcRes) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	type rawRes SvcRes // indirection to avoid infinite recursion
+
+	def := obj.Default()     // get the default
+	res, ok := def.(*SvcRes) // put in the right format
+	if !ok {
+		return fmt.Errorf("could not convert to SvcRes")
+	}
+	raw := rawRes(*res) // convert; the defaults go here
+
+	if err := unmarshal(&raw); err != nil {
+		return err
+	}
+
+	*obj = SvcRes(raw) // restore from indirection with type conversion!
+	return nil
+}
+
+// AutoEdges returns the AutoEdge interface. In this case, systemd unit file
+// resources and cron (systemd-timer) resources.
+func (obj *SvcRes) AutoEdges(ctx context.Context) (engine.AutoEdge, error) {
+	var data []engine.ResUID
+	var svcFiles []string
+
+	svc := obj.svc() // systemd name
+
+	svcFiles = []string{
+		// root svc
+		fmt.Sprintf("/etc/systemd/system/%s", svc),     // takes precedence
+		fmt.Sprintf("/usr/lib/systemd/system/%s", svc), // pkg default
+	}
+	if obj.Session {
+		// user svc
+		u, err := user.Current()
+		if err != nil {
+			return nil, errwrap.Wrapf(err, "error getting current user")
+		}
+		if u.HomeDir == "" {
+			return nil, fmt.Errorf("user has no home directory")
+		}
+		svcFiles = []string{
+			path.Join(u.HomeDir, "/.config/systemd/user/", svc),
+		}
+	}
+	for _, x := range svcFiles {
+		var reversed = true
+		data = append(data, &FileUID{
+			BaseUID: engine.BaseUID{
+				Name:     obj.Name(),
+				Kind:     obj.Kind(),
+				Reversed: &reversed,
+			},
+			path: x, // what matters
+		})
+	}
+
+	fileEdge := &FileResAutoEdges{
+		data:    data,
+		pointer: 0,
+		found:   false,
+	}
+	cronEdge := &SvcResAutoEdgesCron{
+		session: obj.Session,
+		unit:    svc,
+	}
+
+	return engineUtil.AutoEdgeCombiner(fileEdge, cronEdge)
+}
+
+// UIDs includes all params to make a unique identification of this object. Most
+// resources only return one, although some resources can return multiple.
+func (obj *SvcRes) UIDs() []engine.ResUID {
+	x := &SvcUID{
+		BaseUID: engine.BaseUID{Name: obj.Name(), Kind: obj.Kind()},
+		name:    obj.Name(),  // svc name
+		session: obj.Session, // user session
+	}
+	return []engine.ResUID{x}
 }
 
 // SvcUID is the UID struct for SvcRes.
@@ -464,95 +876,4 @@ func (obj *SvcResAutoEdgesCron) Next() []engine.ResUID {
 // should continue.
 func (obj *SvcResAutoEdgesCron) Test([]bool) bool {
 	return false // only get one svc -> cron edge
-}
-
-// AutoEdges returns the AutoEdge interface. In this case, systemd unit file
-// resources and cron (systemd-timer) resources.
-func (obj *SvcRes) AutoEdges() (engine.AutoEdge, error) {
-	var data []engine.ResUID
-	var svcFiles []string
-	svcFiles = []string{
-		// root svc
-		fmt.Sprintf("/etc/systemd/system/%s.service", obj.Name()),     // takes precedence
-		fmt.Sprintf("/usr/lib/systemd/system/%s.service", obj.Name()), // pkg default
-	}
-	if obj.Session {
-		// user svc
-		u, err := user.Current()
-		if err != nil {
-			return nil, errwrap.Wrapf(err, "error getting current user")
-		}
-		if u.HomeDir == "" {
-			return nil, fmt.Errorf("user has no home directory")
-		}
-		svcFiles = []string{
-			path.Join(u.HomeDir, "/.config/systemd/user/", fmt.Sprintf("%s.service", obj.Name())),
-		}
-	}
-	for _, x := range svcFiles {
-		var reversed = true
-		data = append(data, &FileUID{
-			BaseUID: engine.BaseUID{
-				Name:     obj.Name(),
-				Kind:     obj.Kind(),
-				Reversed: &reversed,
-			},
-			path: x, // what matters
-		})
-	}
-
-	fileEdge := &FileResAutoEdges{
-		data:    data,
-		pointer: 0,
-		found:   false,
-	}
-	cronEdge := &SvcResAutoEdgesCron{
-		session: obj.Session,
-		unit:    fmt.Sprintf("%s.service", obj.Name()),
-	}
-
-	return engineUtil.AutoEdgeCombiner(fileEdge, cronEdge)
-}
-
-// UIDs includes all params to make a unique identification of this object. Most
-// resources only return one, although some resources can return multiple.
-func (obj *SvcRes) UIDs() []engine.ResUID {
-	x := &SvcUID{
-		BaseUID: engine.BaseUID{Name: obj.Name(), Kind: obj.Kind()},
-		name:    obj.Name(),  // svc name
-		session: obj.Session, // user session
-	}
-	return []engine.ResUID{x}
-}
-
-// GroupCmp returns whether two resources can be grouped together or not.
-//func (obj *SvcRes) GroupCmp(r engine.GroupableRes) error {
-//	_, ok := r.(*SvcRes)
-//	if !ok {
-//		return fmt.Errorf("resource is not the same kind")
-//	}
-//	// TODO: depending on if the systemd service api allows batching, we
-//	// might be able to build this, although not sure how useful it is...
-//	// it might just eliminate parallelism by bunching up the graph
-//	return fmt.Errorf("not possible at the moment")
-//}
-
-// UnmarshalYAML is the custom unmarshal handler for this struct. It is
-// primarily useful for setting the defaults.
-func (obj *SvcRes) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	type rawRes SvcRes // indirection to avoid infinite recursion
-
-	def := obj.Default()     // get the default
-	res, ok := def.(*SvcRes) // put in the right format
-	if !ok {
-		return fmt.Errorf("could not convert to SvcRes")
-	}
-	raw := rawRes(*res) // convert; the defaults go here
-
-	if err := unmarshal(&raw); err != nil {
-		return err
-	}
-
-	*obj = SvcRes(raw) // restore from indirection with type conversion!
-	return nil
 }

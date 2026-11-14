@@ -2,8 +2,8 @@
 
 ## Overview
 
-The `mgmt` tool is a next generation config management prototype. It's not yet
-ready for production, but we hope to get there soon. Get involved today!
+The `mgmt` tool is a next generation config management solution. It's ready for
+production, and we hope you try out the future soon. Get involved today!
 
 ## Project Description
 
@@ -17,7 +17,6 @@ For more information, you may like to read some blog posts from the author:
 * [Automatic edges in mgmt](https://purpleidea.com/blog/2016/03/14/automatic-edges-in-mgmt/)
 * [Automatic grouping in mgmt](https://purpleidea.com/blog/2016/03/30/automatic-grouping-in-mgmt/)
 * [Automatic clustering in mgmt](https://purpleidea.com/blog/2016/06/20/automatic-clustering-in-mgmt/)
-* [Remote execution in mgmt](https://purpleidea.com/blog/2016/10/07/remote-execution-in-mgmt/)
 * [Send/Recv in mgmt](https://purpleidea.com/blog/2016/12/07/sendrecv-in-mgmt/)
 * [Metaparameters in mgmt](https://purpleidea.com/blog/2017/03/01/metaparameters-in-mgmt/)
 
@@ -100,14 +99,14 @@ with the `--seeds` variable.
 You can read the introductory blog post about this topic here:
 [https://purpleidea.com/blog/2016/06/20/automatic-clustering-in-mgmt/](https://purpleidea.com/blog/2016/06/20/automatic-clustering-in-mgmt/)
 
-### Remote ("agent-less") mode
+### Remote execution ("agent-less")
 
-Remote mode is a special mode that lets you kick off mgmt runs on one or more
-remote machines which are only accessible via SSH. In this mode the initiating
-host connects over SSH, copies over the `mgmt` binary, opens an SSH tunnel, and
-runs the remote program while simultaneously passing the etcd traffic back
-through the tunnel so that the initiators etcd cluster can be used to exchange
-resource data.
+Remote execution lets you kick off mgmt runs on one or more remote machines
+which are only accessible via SSH. This is done via the `remote` resource. Here
+the initiating host connects over SSH, copies over the `mgmt` binary, opens an
+SSH tunnel, and runs the remote program while simultaneously passing the etcd
+traffic back through the tunnel so that the initiators etcd cluster can be used
+to exchange resource data.
 
 The interesting benefit of this architecture is that multiple hosts which can't
 connect directly use the initiator to pass the important traffic through to each
@@ -117,46 +116,14 @@ leaving no residual agent.
 This mode can also be useful for bootstrapping a new host where you'd like to
 have the service run continuously and as part of an mgmt cluster normally.
 
-In particular, when combined with the `--converged-timeout` parameter, the
+In particular, when combined with the `--converger-timeout` parameter, the
 entire set of running mgmt agents will need to all simultaneously converge for
 the group to exit. This is particularly useful for bootstrapping new clusters
 which need to exchange information that is only available at run time.
 
 This existed in earlier versions of mgmt as a `--remote` option, but it has been
-removed and is being ported to a more powerful variant where you can remote
+removed and has being ported to the more powerful variant where you can remote
 execute via a `remote` resource.
-
-#### Blog post
-
-You can read the introductory blog post about this topic here:
-[https://purpleidea.com/blog/2016/10/07/remote-execution-in-mgmt/](https://purpleidea.com/blog/2016/10/07/remote-execution-in-mgmt/)
-
-### Puppet support
-
-You can supply a Puppet manifest instead of creating the (YAML) graph manually.
-Puppet must be installed and in `mgmt`'s search path. You also need the
-[ffrank-mgmtgraph Puppet module](https://forge.puppet.com/ffrank/mgmtgraph).
-
-Invoke `mgmt` with the `--puppet` switch, which supports 3 variants:
-
-1. Request the configuration from the Puppet Master (like `puppet agent` does)
-
-	`mgmt run puppet --puppet agent`
-
-2. Compile a local manifest file (like `puppet apply`)
-
-	`mgmt run puppet --puppet /path/to/my/manifest.pp`
-
-3. Compile an ad hoc manifest from the commandline (like `puppet apply -e`)
-
-	`mgmt run puppet --puppet 'file { "/etc/ntp.conf": ensure => file }'`
-
-For more details and caveats see [puppet-guide.md](puppet-guide.md).
-
-#### Blog post
-
-An introductory post on the Puppet support is on
-[Felix's blog](http://ffrank.github.io/features/2016/06/19/puppet-powered-mgmt/).
 
 ## Reference
 
@@ -217,12 +184,12 @@ resource is replaced with a simple polling mechanism. In general, this is not
 recommended, unless you have a very good reason for doing so.
 
 Please keep in mind that if you have a resource which changes every `I` seconds,
-and you poll it every `J` seconds, and you've asked for a converged timeout of
+and you poll it every `J` seconds, and you've asked for a converger timeout of
 `K` seconds, and `I <= J <= K`, then your graph will likely never converge.
 
 When polling, the system detects that a resource is not converged if its
 `CheckApply` method returns false. This allows a resource which changes every
-`I` seconds, and which is polled every `J` seconds, and with a converged timeout
+`I` seconds, and which is polled every `J` seconds, and with a converger timeout
 of `K` seconds to still converge when `J <= K`, as long as `I > J || I > K`,
 which is another way of saying that if the resource finally settles down to give
 the graph enough time, it can probably converge.
@@ -264,15 +231,71 @@ back as a new vertex, thus causing it to run again. This is different from the
 this is exhausted that we're in permanent worker failure, and only then can we
 rely on this metaparam.
 
-#### Realize
+#### Dollar
 
-Boolean. Realize ensures that the resource is guaranteed to converge at least
-once before a potential graph swap removes or changes it. This guarantee is
-useful for fast changing graphs, to ensure that the brief creation of a resource
-is seen. This guarantee does not prevent against the engine quitting normally,
-and it can't guarantee it if the resource is blocked because of a failed
-pre-requisite resource.
-*XXX: This is currently not implemented!*
+Boolean. Dollar allows you to have a resource name that starts with a `$` sign.
+This is false by default. This helps you catch cases when you write code like:
+
+```mcl
+$foo = "/tmp/file1"
+file "$foo" {} # incorrect!
+```
+
+The above code would ignore the `$foo` variable and attempt to make a file named
+`$foo` which would obviously not work. To correctly interpolate a variable, you
+need to surround the name with curly braces.
+
+```mcl
+$foo = "/tmp/file1"
+file "${foo}" {} # correct!
+```
+
+This meta param is a safety measure to make your life easier. It works for all
+resources. If someone comes up with a resource which would routinely start with
+a dollar sign, then we can revisit the default for this resource kind.
+
+#### Hidden
+
+Boolean. Hidden means that this resource will not get executed on the resource
+graph on which it is defined. This can be used as a simple boolean switch, or,
+more commonly in combination with the Export meta param which specifies that the
+resource params are exported into the shared database. When this is true, it
+does not prevent export. In fact, it is commonly used in combination with
+Export. Using this option will still include it in the resource graph, but it
+will exist there in a special "mode" where it will not conflict with any other
+identically named resources. It can even be used as part of an edge or via a
+send/recv receiver. It can NOT be a sending vertex. These properties
+differentiate the use of this instead of simply wrapping a resource in an "if"
+statement.
+
+#### Export
+
+List of strings. Export is a list of hostnames (and/or the special "*" entry)
+which if set, will mark this resource data as intended for export to those
+hosts. This does not prevent any users of the shared data storage from reading
+these values, so if you want to guarantee secrecy, use the encryption
+primitives. This only labels the data accordingly, so that other hosts can know
+what data is available for them to collect. The (kind, name, host) export triple
+must be unique from any given exporter. In other words, you may not export two
+different instances of a kind+name to the same host, the exports must not
+conflict. On resource collect, this parameter is not preserved.
+
+```mcl
+file "/tmp/foo" {
+	state => "exists",
+	content => "i'm exported!\n",
+
+	Meta:hidden => true,
+	Meta:export => ["h1"],
+}
+
+file "/tmp/foo" {
+	state => "exists",
+	content => "i'm exported AND i'm used here\n",
+
+	Meta:export => ["h1"],
+}
+```
 
 #### Reverse
 
@@ -290,6 +313,53 @@ resource that is being "reversed".
 It might be wise to combine the use of this meta parameter with the use of the
 `realize` meta parameter to ensure that your reversed resource actually runs at
 least once, if there's a chance that it might be gone for a while.
+
+#### Realize
+
+Boolean. Realize ensures that the resource is guaranteed to run at least once
+before a potential graph swap removes or changes it. A resource needs to run if
+it has never run, or if it received an event or a poke which it hasn't
+successfully acted on yet. A graph swap waits for such a resource, including
+through any retry or rate limit delay it is in. This guarantee is useful for
+fast changing graphs, to ensure that the brief creation of a resource is seen.
+This guarantee does not prevent against the engine quitting normally, or via an
+interrupt, and it can't guarantee it if the resource is blocked because of a
+failed pre-requisite resource.
+
+Because a resource can only run correctly once its prerequisites have run, it
+also makes a resource downstream of an async res hold up the swap until that
+async CheckApply finishes and it has run itself, since the async metaparam is
+otherwise never held up by what's below it. This also waits for the whole chain
+of prerequisites leading up to a realize resource, and pauses each of them only
+after it has run. This can decrease the expected asynchronous behaviour that was
+specified upstream, as well as increasing the cost of a graph swap, so it is
+rare that you will want to use this metaparam.
+
+This metaparam forces the async behaviour on any res to false since the two
+can't be combined.
+
+#### Async
+
+Boolean. Async tells the engine that the CheckApply operation of this resource
+may continue running in the background, even while the rest of the engine pauses
+to perform a graph swap. This is useful for resources which have long-running
+CheckApply operations (such as building a virtual machine image) where you don't
+want to block the rest of the engine from applying a new version of the graph
+while that work is happening.
+
+If the resource is removed from the graph during a swap while its CheckApply is
+still running, then the swap blocks while the CheckApply operation finishes, in
+the same way it would if it wasn't async. Anything downstream of the resource
+waits for that CheckApply to finish before it runs, exactly as it would have if
+the swap had not happened. The `FilteredGraph` API is not available to an async
+resource, since its CheckApply can overlap with a graph swap.
+
+The default behaviour depends on if the resource has the `traits.Async` property
+set or not. This metaparam can override it when set. If the override setting is
+incompatible with the resource (for example, a resource which may *not* run in
+an async way) then this can be caught during the res Validate.
+
+This metaparam is incompatible with the realize metaparam.
 
 ### Lang metadata file
 
@@ -339,9 +409,13 @@ recommended that you use this, since it's preferable to write code in the
 The main interface to the `mgmt` tool is the command line. For the most recent
 documentation, please run `mgmt --help`.
 
-#### `--converged-timeout <seconds>`
+#### `--converger-timeout <seconds>`
 
-Exit if the machine has converged for approximately this many seconds.
+Consider the machine converged if idle for approximately this many seconds.
+
+#### `--converged-exit`
+
+Exit if the machine has converged as per the `converger-timeout`.
 
 #### `--max-runtime <seconds>`
 
@@ -362,28 +436,12 @@ size of 42, you can expect a semaphore if named: `:42`. It is expected that
 consumers of the semaphore metaparameter always include a prefix to avoid a
 collision with this globally defined semaphore. The size value must be greater
 than zero at this time. The traditional non-parallel execution found in config
-management tools such as `Puppet` can be obtained with `--sema 1`.
-
-#### `--allow-interactive`
-
-Allow interactive prompting for SSH passwords if there is no authentication
-method that works.
+management tools such as `puppet` can be obtained with `--sema 1`.
 
 #### `--ssh-priv-id-rsa`
 
 Specify the path for finding SSH keys. This defaults to `~/.ssh/id_rsa`. To
 never use this method of authentication, set this to the empty string.
-
-#### `--cconns`
-
-The maximum number of concurrent remote ssh connections to run. This defaults
-to `0`, which means unlimited.
-
-#### `--no-caching`
-
-Don't allow remote caching of the remote execution binary. This will require
-the binary to be copied over for every remote execution, but it limits the
-likelihood that there is leftover information from the configuration process.
 
 #### `--prefix <path>`
 
@@ -453,7 +511,7 @@ directory in the git source repository. It is available from:
 
 ### Systemd:
 
-See [`misc/mgmt.service`](misc/mgmt.service) for a sample systemd unit file.
+See [`misc/mgmt.service`](../misc/mgmt.service) for a sample systemd unit file.
 This unit file is part of the RPM.
 
 To specify your custom options for `mgmt` on a systemd distro:
@@ -464,7 +522,7 @@ sudo mkdir -p /etc/systemd/system/mgmt.service.d/
 cat > /etc/systemd/system/mgmt.service.d/env.conf <<EOF
 # Environment variables:
 MGMT_SEEDS=http://127.0.0.1:2379
-MGMT_CONVERGED_TIMEOUT=-1
+MGMT_CONVERGER_TIMEOUT=-1
 MGMT_MAX_RUNTIME=0
 
 # Other CLI options if necessary.
@@ -486,7 +544,7 @@ To report any bugs, please file a ticket at: [https://github.com/purpleidea/mgmt
 
 ## Authors
 
-Copyright (C) 2013-2021+ James Shubin and the project contributors
+Copyright (C) James Shubin and the project contributors
 
 Please see the
 [AUTHORS](https://github.com/purpleidea/mgmt/tree/master/AUTHORS) file

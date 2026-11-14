@@ -1,5 +1,5 @@
 # Mgmt
-# Copyright (C) 2013-2021+ James Shubin and the project contributors
+# Copyright (C) James Shubin and the project contributors
 # Written by James Shubin <james@shubin.ca> and the project contributors
 #
 # This program is free software: you can redistribute it and/or modify
@@ -13,30 +13,43 @@
 # GNU General Public License for more details.
 #
 # You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# Additional permission under GNU GPL version 3 section 7
+#
+# If you modify this program, or any covered work, by linking or combining it
+# with embedded mcl code and modules (and that the embedded mcl code and
+# modules which link with this program, contain a copy of their source code in
+# the authoritative form) containing parts covered by the terms of any other
+# license, the licensors of this program grant you additional permission to
+# convey the resulting work. Furthermore, the licensors of this program grant
+# the original author, James Shubin, additional permission to update this
+# additional permission if he deems it necessary to achieve the goals of this
+# additional permission.
 
-SHELL = /usr/bin/env bash
+SHELL = bash
 .PHONY: all build clean fuzz
 
 all: build
 
 build: parser/lexer.nn.go parser/y.go interpolate/parse.generated.go
-	@# recursively run make in child dir named types
-	@$(MAKE) --quiet -C types
 
 clean:
-	$(MAKE) --quiet -C types clean
 	@rm -f parser/lexer.nn.go parser/y.go parser/y.output interpolate/parse.generated.go || true
 
 parser/lexer.nn.go: parser/lexer.nex
 	@echo "Generating: lexer..."
 	nex -e -o $@ $<
-	@ROOT="$$( cd "$$( dirname "$${BASH_SOURCE[0]}" )" && cd .. && pwd )" && $$ROOT/misc/header.sh 'parser/lexer.nn.go'
+	sed -i $$'/^import (/ {N;N;N;N;/^import (\\n\t"bufio"\\n\t"io"\\n\t"strings"\\n)/d;}' $@ # get rid of the duplicate imports
+	gofmt -s -w $@
+	@ROOT="$$( cd "$$( dirname "$${BASH_SOURCE[0]}" )" && cd .. && pwd )" && $$ROOT/misc/header.sh '$@'
 
 parser/y.go: parser/parser.y
 	@echo "Generating: parser..."
 	goyacc -v parser/y.output -o $@ $<
-	@ROOT="$$( cd "$$( dirname "$${BASH_SOURCE[0]}" )" && cd .. && pwd )" && $$ROOT/misc/header.sh 'parser/y.go'
+	gofmt -s -w $@
+	goimports -l -w $@ > /dev/null # needed because it's a mess
+	@ROOT="$$( cd "$$( dirname "$${BASH_SOURCE[0]}" )" && cd .. && pwd )" && $$ROOT/misc/header.sh '$@'
 
 interpolate/parse.generated.go: interpolate/parse.rl
 	@echo "Generating: interpolation..."

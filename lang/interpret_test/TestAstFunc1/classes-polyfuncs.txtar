@@ -1,0 +1,25 @@
+-- main.mcl --
+import "fmt"
+
+include c1([13, 42, 0, -37])
+class c1($b) {
+	test [fmt.printf("len is: %d", len($b))] {} # len is 4
+}
+-- OUTPUT --
+Edge: composite: []int -> len # 0
+Edge: const: int(-37) -> composite: []int # 3
+Edge: const: int(0) -> composite: []int # 2
+Edge: const: int(13) -> composite: []int # 0
+Edge: const: int(42) -> composite: []int # 1
+Edge: const: str("len is: %d") -> printf: func(format str, a int) str # format
+Edge: len -> printf: func(format str, a int) str # a
+Edge: printf: func(format str, a int) str -> composite: []str # 0
+Vertex: composite: []int
+Vertex: composite: []str
+Vertex: const: int(-37)
+Vertex: const: int(0)
+Vertex: const: int(13)
+Vertex: const: int(42)
+Vertex: const: str("len is: %d")
+Vertex: len
+Vertex: printf: func(format str, a int) str

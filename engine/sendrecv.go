@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,9 +13,25 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package engine
+
+import (
+	"fmt"
+)
 
 // SendableRes is the interface a resource must implement to support sending
 // named parameters. You must specify to the engine what kind of values (and
@@ -36,10 +52,44 @@ type SendableRes interface {
 	// error if the data is malformed or doesn't type check. You should use
 	// the GenerateSendFunc helper function to build this function for use
 	// in the resource internal state handle.
+	//
+	// The struct passed to Send is published as an immutable snapshot. The
+	// engine may read it concurrently from other resource workers (for
+	// example, while a receiver processes a send/recv edge) even as this
+	// resource runs CheckApply again. The caller MUST NOT mutate the
+	// struct, or anything it transitively points to, after Send returns. To
+	// send updated data, construct and Send a new value instead.
 	Send(st interface{}) error
 
-	// Sent returns the most recently sent data. This is used by the engine.
+	// Sent returns the most recently published snapshot. This is used by
+	// the engine and may be called concurrently with Send. Treat the result
+	// as read-only. It should not be called if an upstream value has not
+	// already been produced since that would violate the DAG properties. If
+	// no payload has been sent yet, a nil may be returned, but we must not
+	// rely on this behaviour as it may change.
 	Sent() interface{}
+
+	// SendActive let's the resource know if it must send a value. This is
+	// usually called during CheckApply, but it's probably safe to check it
+	// during Init as well.
+	// XXX: Not doing this for now. If a send/recv edge wasn't initially on,
+	// and the sender ran CheckApply, but didn't cache the value to send,
+	// and then the edge flipped on, we'd have to error. Better to always
+	// generate the cache, and only consider adding this if we have a more
+	// important privacy or performance situation that requires it.
+	//SendActive() bool
+
+	// SendSetActive is used by the compiler to store the "SendActive" bool
+	// so that it will later know if it will need to send or not. Only the
+	// engine should call this function.
+	// TODO: We could instead pass in the various edges we will be sending,
+	// and store a map of those for the resource to know more precisely.
+	// XXX: Not doing this for now. If a send/recv edge wasn't initially on,
+	// and the sender ran CheckApply, but didn't cache the value to send,
+	// and then the edge flipped on, we'd have to error. Better to always
+	// generate the cache, and only consider adding this if we have a more
+	// important privacy or performance situation that requires it.
+	//SendSetActive(bool)
 }
 
 // RecvableRes is the interface a resource must implement to support receiving
@@ -51,7 +101,11 @@ type RecvableRes interface {
 	Res
 
 	// SetRecv stores the map of sendable data which should arrive here. It
-	// is called by the GAPI when building the resource.
+	// is called by the GAPI when building the resource. Unlike the Send and
+	// Sent payload (which is published and read across resource workers and
+	// is therefore synchronized) this map is set once during graph build,
+	// before any Worker starts, and only read afterwards, so it does not
+	// need its own synchronization.
 	SetRecv(recv map[string]*Send)
 
 	// Recv is used by the resource to get information on changes. This data
@@ -63,10 +117,29 @@ type RecvableRes interface {
 
 // Send points to a value that a resource will send.
 type Send struct {
-	Res SendableRes // a handle to the resource which is sending a value
-	Key string      // the key in the resource that we're sending
+	// Kind and Name identify the resource which is sending a value. This
+	// pair allows this survive a graph swap without needing a pointer
+	// refresh. A direct pointer would not survive: the graph sync decides
+	// for each resource separately whether to keep the one it has or take
+	// the incoming one, so a receiver could easily be left holding a sender
+	// which isn't in the graph, never runs, and never sends. The engine
+	// resolves these to the resource which is actually running.
+	Kind string
+	Name string
 
-	Changed bool // set to true if this key was updated, read only!
+	Key string // the key in the resource that we're sending
+
+	// Changed is set to true when a new value was transferred into this
+	// key, and it stays true until the engine has run a CheckApply which
+	// had the opportunity to consume it. It is read only for resources.
+	//
+	// It must be sticky like this because Send/Recv can run more than once
+	// for each CheckApply, and because a CheckApply might get skipped or
+	// might error and get retried. Once a value has been transferred into
+	// the receiver field, a subsequent Send/Recv run finds the field it
+	// already wrote there and won't see a difference, so if this flag was
+	// recomputed on each run, then the notification would be silently lost.
+	Changed bool
 }
 
 // GenerateSendFunc generates the Send function using the resource of our choice
@@ -77,7 +150,7 @@ func GenerateSendFunc(res Res) func(interface{}) error {
 		//fmt.Printf("send: %+v\n", st)
 		r, ok := res.(SendableRes)
 		if !ok {
-			panic("res does not support the Sendable trait")
+			panic(fmt.Sprintf("res of kind `%s` does not support the Sendable trait", res.Kind()))
 		}
 		// XXX: type check this
 		//expected := r.Sends()
@@ -95,7 +168,7 @@ func GenerateRecvFunc(res Res) func() map[string]*Send {
 	return func() map[string]*Send { // TODO: change this API?
 		r, ok := res.(RecvableRes)
 		if !ok {
-			panic("res does not support the Recvable trait")
+			panic(fmt.Sprintf("res of kind `%s` does not support the Recvable trait", res.Kind()))
 		}
 		return r.Recv()
 	}

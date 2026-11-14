@@ -1,5 +1,5 @@
 # Mgmt
-# Copyright (C) 2013-2021+ James Shubin and the project contributors
+# Copyright (C) James Shubin and the project contributors
 # Written by James Shubin <james@shubin.ca> and the project contributors
 #
 # This program is free software: you can redistribute it and/or modify
@@ -13,15 +13,32 @@
 # GNU General Public License for more details.
 #
 # You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# Additional permission under GNU GPL version 3 section 7
+#
+# If you modify this program, or any covered work, by linking or combining it
+# with embedded mcl code and modules (and that the embedded mcl code and
+# modules which link with this program, contain a copy of their source code in
+# the authoritative form) containing parts covered by the terms of any other
+# license, the licensors of this program grant you additional permission to
+# convey the resulting work. Furthermore, the licensors of this program grant
+# the original author, James Shubin, additional permission to update this
+# additional permission if he deems it necessary to achieve the goals of this
+# additional permission.
 
-SHELL = /usr/bin/env bash
-.PHONY: all fuzz
+SHELL = bash
+.PHONY: all fuzz seed
+
+FUZZTIME ?= 30s
 
 all: fuzz
 
-fuzz:
-	mkdir -p corpus/
-	find ../.. -name \*.mcl -exec cp {} corpus/ \;
-	go-fuzz-build
-	go-fuzz -bin=./fuzz-fuzz.zip -workdir=.
+# Seed the native Go fuzz corpus from existing .mcl files in the project.
+seed:
+	mkdir -p testdata/fuzz/FuzzLexParse/
+	find ../.. -name \*.mcl -exec sh -c 'cp "$$1" "testdata/fuzz/FuzzLexParse/$$(basename $$1)"' _ {} \;
+
+# Run the native Go fuzz test. Override FUZZTIME to run longer.
+fuzz: seed
+	go test -fuzz=FuzzLexParse -fuzztime=$(FUZZTIME)

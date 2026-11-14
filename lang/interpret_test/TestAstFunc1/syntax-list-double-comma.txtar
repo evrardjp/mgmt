@@ -1,0 +1,12 @@
+-- CONFIG --
+{
+	"nofmt": true
+}
+-- main.mcl --
+$mylist = ["w", "o", , "r", "l", "d"]
+
+test "unreachable" {
+	slicestring => $mylist,
+}
+-- OUTPUT --
+# err: errLexParse: parser: `syntax error: unexpected COMMA`: /main.mcl @ 1:22-1:23

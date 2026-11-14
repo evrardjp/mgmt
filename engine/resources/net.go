@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,16 +13,28 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
-// +build !darwin
+//go:build !darwin
 
 package resources
 
 import (
 	"bytes"
+	"context"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"path"
@@ -32,37 +44,81 @@ import (
 
 	"github.com/purpleidea/mgmt/engine"
 	"github.com/purpleidea/mgmt/engine/traits"
-	"github.com/purpleidea/mgmt/recwatch"
+	engineUtil "github.com/purpleidea/mgmt/engine/util"
+	"github.com/purpleidea/mgmt/lang/funcs/vars"
+	"github.com/purpleidea/mgmt/lang/interfaces"
+	"github.com/purpleidea/mgmt/lang/types"
 	"github.com/purpleidea/mgmt/util"
 	"github.com/purpleidea/mgmt/util/errwrap"
+	"github.com/purpleidea/mgmt/util/recwatch"
 	"github.com/purpleidea/mgmt/util/socketset"
 
-	// XXX: Do NOT use subscribe methods from this lib, as they are racey and
-	// do not clean up spawned goroutines. Should be replaced when a suitable
-	// alternative is available.
+	// XXX: Do NOT use subscribe methods from this lib, as they are racey
+	// and do not clean up spawned goroutines. Should be replaced when a
+	// suitable alternative is available.
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
 
 func init() {
-	engine.RegisterResource("net", func() engine.Res { return &NetRes{} })
+	engine.RegisterResource(KindNet, func() engine.Res { return &NetRes{} })
+
+	// const.res.net.state.up = "up"
+	// const.res.net.state.down = "down"
+	vars.RegisterResourceParams(KindNet, map[string]map[string]func() interfaces.Var{
+		ParamNetState: {
+			NetStateUp: func() interfaces.Var {
+				return &types.StrValue{
+					V: NetStateUp,
+				}
+			},
+			NetStateDown: func() interfaces.Var {
+				return &types.StrValue{
+					V: NetStateDown,
+				}
+			},
+			// TODO: consider removing this field entirely
+			"undefined": func() interfaces.Var {
+				return &types.StrValue{
+					V: NetStateUndefined, // empty string
+				}
+			},
+		},
+	})
 }
 
 const (
-	// IfacePrefix is the prefix used to identify unit files for managed links.
+	// KindNet is the kind string used to identify this resource.
+	KindNet = "net"
+
+	// ParamNetState is the name of the state field parameter.
+	ParamNetState = "state"
+
+	// NetStateUp is the string that represents that the net state should be
+	// up. This is the on interface state.
+	NetStateUp = "up"
+
+	// NetStateDown is the string that represents that the net state should
+	// be down. This is the off interface state.
+	NetStateDown = "down"
+
+	// NetStateUndefined means the net state has not been specified.
+	// TODO: consider moving to *string and express this state as a nil.
+	NetStateUndefined = ""
+
+	// IfacePrefix is the prefix used to identify unit files for managed
+	// links.
 	IfacePrefix = "mgmt-"
-	// networkdUnitFileDir is the location of networkd unit files which define
-	// the systemd network connections.
+
+	// networkdUnitFileDir is the location of networkd unit files which
+	// define the systemd network connections.
 	networkdUnitFileDir = "/etc/systemd/network/"
+
 	// networkdUnitFileExt is the file extension for networkd unit files.
 	networkdUnitFileExt = ".network"
+
 	// networkdUnitFileUmask sets the permissions on the systemd unit file.
 	networkdUnitFileUmask = 0644
-
-	// ifaceUp is the up (on) interface state.
-	ifaceUp = "up"
-	// ifaceDown is the down (off) interface state.
-	ifaceDown = "down"
 
 	// Netlink multicast groups to watch for events. For all groups see:
 	// https://github.com/torvalds/linux/blob/master/include/uapi/linux/rtnetlink.h
@@ -84,10 +140,12 @@ const (
 // NetRes is a network interface resource based on netlink. It manages the state
 // of a network link. Configuration is also stored in a networkd configuration
 // file, so the network is available upon reboot. The name of the resource is
-// the string representing the network interface name. This could be "eth0" for
-// example.
+// the string representing the network interface name. This could be "meth0" for
+// example. It supports flipping the state if you ask for it to be reversible.
 type NetRes struct {
 	traits.Base // add the base methods without re-implementation
+
+	traits.Reversible
 
 	init *engine.Init
 
@@ -105,7 +163,8 @@ type NetRes struct {
 	// IPForward is a boolean that sets whether we should forward incoming
 	// packets onward when this is set. It default to unspecified, which
 	// downstream (in the systemd-networkd configuration) defaults to false.
-	// XXX: this could also be "ipv4" or "ipv6", add those as a second option?
+	// XXX: this could also be "ipv4" or "ipv6", add those as a second
+	// option?
 	IPForward *bool `lang:"ip_forward" yaml:"ip_forward"`
 
 	iface        *iface // a struct containing the net.Interface and netlink.Link
@@ -129,15 +188,18 @@ func (obj *NetRes) Default() engine.Res {
 // Validate if the params passed in are valid data.
 func (obj *NetRes) Validate() error {
 	// validate state
-	if obj.State != ifaceUp && obj.State != ifaceDown && obj.State != "" {
+	if obj.State != NetStateUp && obj.State != NetStateDown && obj.State != "" {
 		return fmt.Errorf("state must be up, down or empty")
 	}
 
 	// validate network address input
 	if obj.Addrs != nil {
-		for _, addr := range obj.Addrs {
+		for i, addr := range obj.Addrs {
 			if _, _, err := net.ParseCIDR(addr); err != nil {
-				return errwrap.Wrapf(err, "error parsing address: %s", addr)
+				if len(obj.Addrs) == 1 {
+					return errwrap.Wrapf(err, "error parsing addr")
+				}
+				return errwrap.Wrapf(err, "error parsing addrs[%d]", i)
 			}
 		}
 	}
@@ -185,24 +247,23 @@ func (obj *NetRes) Init(init *engine.Init) error {
 	return nil
 }
 
-// Close cleans up when we're done.
-func (obj *NetRes) Close() error {
-	var errList error
-
+// Cleanup is run by the engine to clean up after the resource is done.
+func (obj *NetRes) Cleanup() error {
 	if obj.socketFile == "/" {
 		return fmt.Errorf("socket file should not be the root path")
 	}
 	if obj.socketFile != "" { // safety
-		errList = errwrap.Append(errList, os.Remove(obj.socketFile))
+		if err := os.Remove(obj.socketFile); err != nil && !os.IsNotExist(err) {
+			return err
+		}
 	}
-
-	return errList
+	return nil
 }
 
 // Watch listens for events from the specified interface via a netlink socket.
 // TODO: currently gets events from ALL interfaces, would be nice to reject
 // events from other interfaces.
-func (obj *NetRes) Watch() error {
+func (obj *NetRes) Watch(ctx context.Context) error {
 	// create a netlink socket for receiving network interface events
 	conn, err := socketset.NewSocketSet(rtmGrps, obj.socketFile, unix.NETLINK_ROUTE)
 	if err != nil {
@@ -219,12 +280,12 @@ func (obj *NetRes) Watch() error {
 	defer conn.Shutdown() // close the netlink socket and unblock conn.receive()
 
 	// watch the systemd-networkd configuration file
-	recWatcher, err := recwatch.NewRecWatcher(obj.unitFilePath, false)
+	recWatcher, err := recwatch.NewRecWatcher(ctx, obj.unitFilePath, false)
 	if err != nil {
 		return err
 	}
 	// close the recwatcher when we're done
-	defer recWatcher.Close()
+	defer recWatcher.Cleanup()
 
 	// channel for netlink messages
 	nlChan := make(chan *nlChanStruct) // closed from goroutine
@@ -248,6 +309,7 @@ func (obj *NetRes) Watch() error {
 				case <-closeChan:
 					return
 				}
+				continue
 			}
 			select {
 			case nlChan <- &nlChanStruct{
@@ -259,16 +321,20 @@ func (obj *NetRes) Watch() error {
 		}
 	}()
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
-	var send = false // send event?
 	var done bool
 	for {
 		select {
 		case s, ok := <-nlChan:
+			if ctx.Err() != nil {
+				return ctx.Err() // engine is shutting us down
+			}
 			if !ok {
 				if done {
-					return nil
+					return ctx.Err()
 				}
 				done = true
 				continue
@@ -277,43 +343,40 @@ func (obj *NetRes) Watch() error {
 				return errwrap.Wrapf(s.err, "unknown netlink error")
 			}
 			if obj.init.Debug {
-				obj.init.Logf("Event: %+v", s.msg)
+				obj.init.Logf("event: %+v", s.msg)
 			}
-
-			send = true
 
 		case event, ok := <-recWatcher.Events():
-			if !ok {
-				if done {
-					return nil
-				}
-				done = true
-				continue
+			if ctx.Err() != nil {
+				return ctx.Err() // engine is shutting us down
+			}
+			if !ok { // channel shutdown
+				return fmt.Errorf("unexpected close")
+			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
 			}
 			if err := event.Error; err != nil {
-				return errwrap.Wrapf(err, "unknown recwatcher error")
+				return err
 			}
 			if obj.init.Debug {
-				obj.init.Logf("Event(%s): %v", event.Body.Name, event.Body.Op)
+				obj.init.Logf("event(%s): %v", event.Body.Name, event.Body.Op)
 			}
 
-			send = true
-
-		case <-obj.init.Done: // closed by the engine to signal shutdown
-			return nil
+		case <-ctx.Done(): // closed by the engine to signal shutdown
+			return ctx.Err()
 		}
 
-		// do all our event sending all together to avoid duplicate msgs
-		if send {
-			send = false
-			obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
 		}
 	}
 }
 
 // ifaceCheckApply checks the state of the network device and brings it up or
 // down as necessary.
-func (obj *NetRes) ifaceCheckApply(apply bool) (bool, error) {
+func (obj *NetRes) ifaceCheckApply(ctx context.Context, apply bool) (bool, error) {
 	// check the interface state
 	state, err := obj.iface.state()
 	if err != nil {
@@ -340,9 +403,9 @@ func (obj *NetRes) ifaceCheckApply(apply bool) (bool, error) {
 
 // addrCheckApply checks if the interface has the correct addresses and then
 // adds/deletes addresses as necessary.
-func (obj *NetRes) addrCheckApply(apply bool) (bool, error) {
+func (obj *NetRes) addrCheckApply(ctx context.Context, apply bool) (bool, error) {
 	// get the link's addresses
-	ifaceAddrs, err := obj.iface.getAddrs()
+	ifaceAddrs, err := obj.iface.getAddrs(obj.Addrs)
 	if err != nil {
 		return false, errwrap.Wrapf(err, "error getting addresses from %s", obj.Name())
 	}
@@ -368,7 +431,9 @@ func (obj *NetRes) addrCheckApply(apply bool) (bool, error) {
 	if !apply {
 		return false, nil
 	}
-	obj.init.Logf("addrCheckApply(%t)", apply)
+	if obj.init.Debug {
+		obj.init.Logf("addrCheckApply(%t)", apply)
+	}
 
 	// check each address and delete the ones that aren't in the definition
 	if err := obj.iface.addrApplyDelete(obj.Addrs); err != nil {
@@ -388,7 +453,7 @@ func (obj *NetRes) addrCheckApply(apply bool) (bool, error) {
 
 // gatewayCheckApply checks if the interface has the correct default gateway and
 // adds/deletes routes as necessary.
-func (obj *NetRes) gatewayCheckApply(apply bool) (bool, error) {
+func (obj *NetRes) gatewayCheckApply(ctx context.Context, apply bool) (bool, error) {
 	// get all routes from the interface
 	routes, err := netlink.RouteList(obj.iface.link, netlink.FAMILY_V4)
 	if err != nil {
@@ -440,24 +505,38 @@ func (obj *NetRes) gatewayCheckApply(apply bool) (bool, error) {
 }
 
 // fileCheckApply checks and maintains the systemd-networkd unit file contents.
-func (obj *NetRes) fileCheckApply(apply bool) (bool, error) {
+// TODO: replace this with a file resource if we can do so cleanly.
+func (obj *NetRes) fileCheckApply(ctx context.Context, apply bool) (bool, error) {
+	// if the state is unspecified, we're done
+	if obj.State == "" {
+		return true, nil
+	}
+
 	// check if the unit file exists
 	_, err := os.Stat(obj.unitFilePath)
 	if err != nil && !os.IsNotExist(err) {
 		return false, errwrap.Wrapf(err, "error checking file")
 	}
-	// build the unit file contents from the definition
-	contents := obj.unitFileContents()
-	// check the file contents
-	if err == nil {
-		unitFile, err := ioutil.ReadFile(obj.unitFilePath)
+
+	exists := err == nil
+	if obj.State == NetStateDown && !exists {
+		return true, nil
+	}
+
+	fileContents := []byte{}
+	if exists {
+		// check the file contents
+		byt, err := os.ReadFile(obj.unitFilePath)
 		if err != nil {
 			return false, errwrap.Wrapf(err, "error reading file")
 		}
-		// return if the file is good
-		if bytes.Equal(unitFile, contents) {
-			return true, nil
-		}
+		fileContents = byt
+	}
+	// build the unit file contents from the definition
+	contents := obj.unitFileContents()
+
+	if obj.State == NetStateUp && exists && bytes.Equal(fileContents, contents) {
+		return true, nil
 	}
 
 	if !apply {
@@ -465,8 +544,15 @@ func (obj *NetRes) fileCheckApply(apply bool) (bool, error) {
 	}
 	obj.init.Logf("fileCheckApply(%t)", apply)
 
-	// write the file
-	if err := ioutil.WriteFile(obj.unitFilePath, contents, networkdUnitFileUmask); err != nil {
+	if obj.State == NetStateDown && exists {
+		if err := os.Remove(obj.unitFilePath); err != nil {
+			return false, errwrap.Wrapf(err, "error removing configuration file")
+		}
+		return false, nil
+	}
+
+	// all other situations, we write the file
+	if err := os.WriteFile(obj.unitFilePath, contents, networkdUnitFileUmask); err != nil {
 		return false, errwrap.Wrapf(err, "error writing configuration file")
 	}
 	return false, nil
@@ -475,42 +561,37 @@ func (obj *NetRes) fileCheckApply(apply bool) (bool, error) {
 // CheckApply is run to check the state and, if apply is true, to apply the
 // necessary changes to reach the desired state. This is run before Watch and
 // again if Watch finds a change occurring to the state.
-func (obj *NetRes) CheckApply(apply bool) (bool, error) {
+func (obj *NetRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 	checkOK := true
 
+	// check the networkd unit file
+	if c, err := obj.fileCheckApply(ctx, apply); err != nil {
+		return false, err
+	} else if !c {
+		checkOK = false
+	}
+
 	// check the network device
-	if c, err := obj.ifaceCheckApply(apply); err != nil {
+	if c, err := obj.ifaceCheckApply(ctx, apply); err != nil {
 		return false, err
 	} else if !c {
 		checkOK = false
 	}
 
 	// if the interface is supposed to be down, we're done
-	if obj.State == ifaceDown {
+	if obj.State == NetStateDown {
 		return checkOK, nil
 	}
 
 	// check the addresses
-	if c, err := obj.addrCheckApply(apply); err != nil {
+	if c, err := obj.addrCheckApply(ctx, apply); err != nil {
 		return false, err
 	} else if !c {
 		checkOK = false
 	}
 
 	// check the gateway
-	if c, err := obj.gatewayCheckApply(apply); err != nil {
-		return false, err
-	} else if !c {
-		checkOK = false
-	}
-
-	// if the state is unspecified, we're done
-	if obj.State == "" {
-		return checkOK, nil
-	}
-
-	// check the networkd unit file
-	if c, err := obj.fileCheckApply(apply); err != nil {
+	if c, err := obj.gatewayCheckApply(ctx, apply); err != nil {
 		return false, err
 	} else if !c {
 		checkOK = false
@@ -538,6 +619,9 @@ func (obj *NetRes) Cmp(r engine.Res) error {
 	}
 	if obj.Gateway != res.Gateway {
 		return fmt.Errorf("the Gateway differs")
+	}
+	if err := engineUtil.BoolPtrCmp(obj.IPForward, res.IPForward); err != nil {
+		return errwrap.Wrapf(err, "the IPForward differs")
 	}
 
 	return nil
@@ -593,6 +677,55 @@ func (obj *NetRes) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	return nil
 }
 
+// Copy copies the resource. Don't call it directly, use engine.ResCopy instead.
+// TODO: should this copy internal state?
+func (obj *NetRes) Copy() engine.CopyableRes {
+	addrs := []string{}
+	for _, addr := range obj.Addrs {
+		addrs = append(addrs, addr)
+	}
+	var ipforward *bool
+	if obj.IPForward != nil { // copy the content, not the pointer...
+		b := *obj.IPForward
+		ipforward = &b
+	}
+	return &NetRes{
+		State:     obj.State,
+		Addrs:     addrs,
+		Gateway:   obj.Gateway,
+		IPForward: ipforward,
+	}
+}
+
+// Reversed returns the "reverse" or "reciprocal" resource. This is used to
+// "clean" up after a previously defined resource has been removed.
+func (obj *NetRes) Reversed(ctx context.Context) (engine.ReversibleRes, error) {
+	cp, err := engine.ResCopy(obj)
+	if err != nil {
+		return nil, errwrap.Wrapf(err, "could not copy")
+	}
+	rev, ok := cp.(engine.ReversibleRes)
+	if !ok {
+		return nil, fmt.Errorf("not reversible")
+	}
+	rev.ReversibleMeta().Disabled = true // the reverse shouldn't run again
+
+	res, ok := cp.(*NetRes)
+	if !ok {
+		return nil, fmt.Errorf("copied res was not our kind")
+	}
+
+	// Only one field to reverse for now. It also removes the config file.
+	if obj.State == NetStateUp {
+		res.State = NetStateDown
+	}
+	if obj.State == NetStateDown {
+		res.State = NetStateUp
+	}
+
+	return res, nil
+}
+
 // unitFileContents builds the unit file contents from the definition.
 func (obj *NetRes) unitFileContents() []byte {
 	// build the unit file contents
@@ -630,26 +763,27 @@ func (obj *iface) state() (string, error) {
 	}
 	// if the interface's "up" flag is 0, it's down
 	if obj.iface.Flags&net.FlagUp == 0 {
-		return ifaceDown, nil
+		return NetStateDown, nil
 	}
 	// otherwise it's up
-	return ifaceUp, nil
+	return NetStateUp, nil
 }
 
 // linkUpDown brings the interface up or down, depending on input value.
 func (obj *iface) linkUpDown(state string) error {
-	if state != ifaceUp && state != ifaceDown {
+	if state != NetStateUp && state != NetStateDown {
 		return fmt.Errorf("state must be up or down")
 	}
-	if state == ifaceUp {
+	if state == NetStateUp {
 		return netlink.LinkSetUp(obj.link)
 	}
 	return netlink.LinkSetDown(obj.link)
 }
 
-// getAddrs returns a list of strings containing all of the interface's IP
-// addresses in CIDR format.
-func (obj *iface) getAddrs() ([]string, error) {
+// getAddrs returns the interface addresses which this resource manages in CIDR
+// format. It excludes automatically managed IPv6 link-local addresses unless
+// they are explicitly configured.
+func (obj *iface) getAddrs(objAddrs []string) ([]string, error) {
 	var ifaceAddrs []string
 	a, err := obj.iface.Addrs()
 	if err != nil {
@@ -657,7 +791,32 @@ func (obj *iface) getAddrs() ([]string, error) {
 	}
 	// we're only interested in the strings (not the network)
 	for _, addr := range a {
-		ifaceAddrs = append(ifaceAddrs, addr.String())
+		s := addr.String()
+		configured := false
+		for _, objAddr := range objAddrs {
+			if s == objAddr {
+				configured = true
+				break
+			}
+		}
+
+		// IPv6 link-local addresses are normally maintained
+		// automatically by the kernel or a network manager. Unless one
+		// is explicitly listed, leave it outside the resource's
+		// authoritative address set. Deleting an automatic address can
+		// make its owner restore it, causing an endless add/delete
+		// netlink event loop.
+		if !configured {
+			ip, _, err := net.ParseCIDR(s)
+			if err != nil {
+				return nil, errwrap.Wrapf(err, "error parsing interface addr: %s", s)
+			}
+			if ip.To4() == nil && ip.IsLinkLocalUnicast() {
+				continue
+			}
+		}
+
+		ifaceAddrs = append(ifaceAddrs, s)
 	}
 	return ifaceAddrs, nil
 }
@@ -673,11 +832,14 @@ func (obj *iface) kernelCheck(addrs []string) (bool, error) {
 		return false, errwrap.Wrapf(err, "error getting routes")
 	}
 	// check each route against each addr
-	for _, addr := range addrs {
+	for i, addr := range addrs {
 		routeOK = false
 		ip, ipNet, err := net.ParseCIDR(addr)
 		if err != nil {
-			return false, errwrap.Wrapf(err, "error parsing addr: %s", addr)
+			if len(addrs) == 1 {
+				return false, errwrap.Wrapf(err, "error parsing addr")
+			}
+			return false, errwrap.Wrapf(err, "error parsing addrs[%d]", i)
 		}
 		for _, r := range routes {
 			// if src, dst and protocol are correct, the kernel route exists
@@ -697,10 +859,13 @@ func (obj *iface) kernelCheck(addrs []string) (bool, error) {
 // kernelApply adds or replaces each address' kernel route as necessary.
 func (obj *iface) kernelApply(addrs []string) error {
 	// for each addr, add or replace the corresponding kernel route
-	for _, addr := range addrs {
+	for i, addr := range addrs {
 		ip, ipNet, err := net.ParseCIDR(addr)
 		if err != nil {
-			return errwrap.Wrapf(err, "error parsing addr: %s", addr)
+			if len(addrs) == 1 {
+				return errwrap.Wrapf(err, "error parsing addr")
+			}
+			return errwrap.Wrapf(err, "error parsing addrs[%d]", i)
 		}
 		// kernel route needed for the network to be reachable from a given ip
 		if err := netlink.RouteReplace(&netlink.Route{
@@ -719,7 +884,7 @@ func (obj *iface) kernelApply(addrs []string) error {
 // addrApplyDelete, checks the interface's addresses and deletes any that are
 // not in the list/definition.
 func (obj *iface) addrApplyDelete(objAddrs []string) error {
-	ifaceAddrs, err := obj.getAddrs()
+	ifaceAddrs, err := obj.getAddrs(objAddrs)
 	if err != nil {
 		return errwrap.Wrapf(err, "error getting addrs from interface: %s", obj.iface.Name)
 	}
@@ -747,7 +912,7 @@ func (obj *iface) addrApplyDelete(objAddrs []string) error {
 // addrApplyAdd checks if the interface has each address in the supplied list,
 // and if it doesn't, it adds them.
 func (obj *iface) addrApplyAdd(objAddrs []string) error {
-	ifaceAddrs, err := obj.getAddrs()
+	ifaceAddrs, err := obj.getAddrs(objAddrs)
 	if err != nil {
 		return errwrap.Wrapf(err, "error getting addrs from interface: %s", obj.iface.Name)
 	}

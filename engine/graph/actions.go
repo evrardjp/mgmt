@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,17 +13,31 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package graph
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/purpleidea/mgmt/engine"
+	engineUtil "github.com/purpleidea/mgmt/engine/util"
 	"github.com/purpleidea/mgmt/pgraph"
 	"github.com/purpleidea/mgmt/util/errwrap"
 
@@ -36,17 +50,34 @@ func (obj *Engine) OKTimestamp(vertex pgraph.Vertex) bool {
 }
 
 // BadTimestamps returns the list of vertices that are causing our timestamp to
-// be bad.
+// be bad. A prerequisite is bad if it hasn't completed a Process since we last
+// ran. A prerequisite with a Process in flight zeroes its own timestamp for the
+// duration, which makes it bad for everyone, including a vertex which has never
+// run, such as one just added by a graph swap. Otherwise the zero timestamp of
+// that vertex would let it start while a prerequisite is in the middle of a
+// CheckApply, and before that work is done.
 func (obj *Engine) BadTimestamps(vertex pgraph.Vertex) []pgraph.Vertex {
+	obj.tlock.RLock()
+	state := obj.state[vertex]
+	obj.tlock.RUnlock()
+
 	vs := []pgraph.Vertex{}
-	ts := obj.state[vertex].timestamp
+	state.mutex.RLock()   // concurrent read start
+	ts := state.timestamp // race
+	state.mutex.RUnlock() // concurrent read end
 	// these are all the vertices pointing TO vertex, eg: ??? -> vertex
 	for _, v := range obj.graph.IncomingGraphVertices(vertex) {
+		obj.tlock.RLock()
+		state := obj.state[v]
+		obj.tlock.RUnlock()
+
 		// If the vertex has a greater timestamp than any prerequisite,
 		// then we can't run right now. If they're equal (eg: initially
 		// with a value of 0) then we also can't run because we should
 		// let our pre-requisites go first.
-		t := obj.state[v].timestamp
+		state.mutex.RLock()   // concurrent read start
+		t := state.timestamp  // race
+		state.mutex.RUnlock() // concurrent read end
 		if obj.Debug {
 			obj.Logf("OKTimestamp: %d >= %d (%s): !%t", ts, t, v.String(), ts >= t)
 		}
@@ -58,12 +89,33 @@ func (obj *Engine) BadTimestamps(vertex pgraph.Vertex) []pgraph.Vertex {
 	return vs // formerly "true" if empty
 }
 
+// errWatchRestart is the sentinel which the Watch retry loop hands to the
+// process loop when Watch failed and is about to restart. Receiving it (which
+// can only happen when no Process is running) withdraws the started state until
+// the replacement Watch sends its initial startup event.
+var errWatchRestart = engine.Error("watch restart")
+
 // Process is the primary function to execute a particular vertex in the graph.
-func (obj *Engine) Process(vertex pgraph.Vertex) error {
+func (obj *Engine) Process(ctx context.Context, vertex pgraph.Vertex) error {
 	res, isRes := vertex.(engine.Res)
 	if !isRes {
 		return fmt.Errorf("vertex is not a Res")
 	}
+
+	// The user asked us to stop waiting, so don't start any new work. Watch
+	// keeps running until we're paused, and every event it sends would
+	// otherwise start a fresh CheckApply that we'd then have to wait for.
+	// We leave the state dirty, since we didn't converge it.
+	if obj.interrupted() {
+		if obj.Debug {
+			obj.Logf("%s: interrupted, skipping Process", vertex)
+		}
+		return ctx.Err()
+	}
+
+	obj.tlock.RLock()
+	state := obj.state[vertex]
+	obj.tlock.RUnlock()
 
 	// backpoke! (can be async)
 	if vs := obj.BadTimestamps(vertex); len(vs) > 0 {
@@ -83,8 +135,28 @@ func (obj *Engine) Process(vertex pgraph.Vertex) error {
 
 		}
 		wg.Wait()
-		return nil // can't continue until timestamp is in sequence
+
+		// can't continue until timestamp is in sequence, defer for now
+		return engine.ErrBackPoke
 	}
+
+	// We're going to run, so our timestamp no longer describes a completed
+	// run that anyone downstream can rely on. Zeroing it blocks all of them
+	// until the update at the end, since any timestamp is >= zero. This
+	// must come after the backpoke check above, which needs our real
+	// timestamp. If we don't get as far as that update, it stays zero, and
+	// downstream waits until a retry succeeds, or until a graph swap
+	// replaces us.
+	//
+	// How could this matter in real life? Suppose we have an async resource
+	// which initially starts running, but during graph swap a new dependent
+	// resource appears downstream. Initially it has a zero timestamp, which
+	// would let it start running even though the async pre-requisite is not
+	// done. As a result, we set this to zero so that the prerequisite won't
+	// run until this finishes with a larger timestamp. Then we're all done!
+	state.mutex.Lock()   // concurrent write start
+	state.timestamp = 0  // running (race)
+	state.mutex.Unlock() // concurrent write end
 
 	// semaphores!
 	// These shouldn't ever block an exit, since the graph should eventually
@@ -108,24 +180,97 @@ func (obj *Engine) Process(vertex pgraph.Vertex) error {
 
 	// sendrecv!
 	// connect any senders to receivers and detect if values changed
-	if res, ok := vertex.(engine.RecvableRes); ok {
-		if updated, err := obj.SendRecv(res); err != nil {
-			return errwrap.Wrapf(err, "could not SendRecv")
-		} else if len(updated) > 0 {
-			for _, changed := range updated {
-				if changed { // at least one was updated
-					// invalidate cache, mark as dirty
-					obj.state[vertex].tuid.StopTimer()
-					obj.state[vertex].isStateOK = false
-					break
-				}
+	// this actually checks and sends into resource trees recursively...
+
+	// XXX: This code is duplicated in the fancier autogrouping code below!
+	//if res, ok := vertex.(engine.RecvableRes); ok {
+	//	if obj.Debug {
+	//		obj.Logf("SendRecv: %s", res) // receiving here
+	//	}
+	//	if updated, err := obj.sendRecv(res, nil); err != nil {
+	//		return errwrap.Wrapf(err, "could not SendRecv")
+	//	} else if len(updated) > 0 {
+	//		//for _, s := range graph.UpdatedStrings(updated) {
+	//		//	obj.Logf("SendRecv: %s", s)
+	//		//}
+	//		for r, m := range updated { // map[engine.RecvableRes]map[string]*engine.Send
+	//			v, ok := r.(pgraph.Vertex)
+	//			if !ok {
+	//				continue
+	//			}
+	//			_, stateExists := obj.state[v] // autogrouped children probably don't have a state
+	//			if !stateExists {
+	//				continue
+	//			}
+	//			for s, send := range m {
+	//				if !send.Changed {
+	//					continue
+	//				}
+	//				obj.Logf("Send/Recv: %v.%s -> %v.%s", engine.Repr(send.Kind, send.Name), send.Key, r, s)
+	//				// if send.Changed == true, at least one was updated
+	//				// invalidate cache, mark as dirty
+	//				obj.state[v].setDirty()
+	//				//break // we might have more vertices now
+	//			}
+	//
+	//			// re-validate after we change any values
+	//			if err := engine.Validate(r); err != nil {
+	//				return errwrap.Wrapf(err, "failed Validate after SendRecv")
+	//			}
+	//		}
+	//	}
+	//}
+
+	// Send/Recv *can* receive from someone that was grouped! The sender has
+	// to use *their* send/recv handle/implementation, which has to be setup
+	// properly by the parent resource during Init(). See: http:server:flag.
+	// NOTE: SendRecv recurses into everything grouped in here, so we don't
+	// collect those resources ourselves. It must run even when this vertex
+	// can't receive on its own fields, because a groupable parent (such as
+	// http:server) is commonly not recvable while its children are.
+	if updated, err := obj.sendRecv(res, nil); err != nil {
+		return errwrap.Wrapf(err, "could not SendRecv")
+	} else if len(updated) > 0 {
+		//for _, s := range graph.UpdatedStrings(updated) {
+		//	obj.Logf("SendRecv: %s", s)
+		//}
+		for r, m := range updated { // map[engine.RecvableRes]map[string]*engine.Send
+			v, ok := r.(pgraph.Vertex)
+			if !ok {
+				continue
 			}
+			state, stateExists := obj.state[v] // autogrouped children probably don't have a state
+			if !stateExists {
+				// An autogrouped child doesn't have a state of
+				// its own, so the vertex which owns it is the
+				// one to dirty. That parent CheckApply is what
+				// runs the child, so if we skipped this, then
+				// it could stay clean and the received value
+				// would never get applied.
+				state = obj.state[vertex]
+			}
+			for s, send := range m {
+				if !send.Changed {
+					continue
+				}
+				obj.Logf("Send/Recv: %v.%s -> %v.%s", engine.Repr(send.Kind, send.Name), send.Key, r, s)
+				// if send.Changed == true, at least one was updated
+				// invalidate cache, mark as dirty
+				state.setDirty()
+				//break // we might have more vertices now
+			}
+			if !stateExists {
+				continue // only re-validate our own
+			}
+
 			// re-validate after we change any values
-			if err := engine.Validate(res); err != nil {
+			if err := engine.Validate(r); err != nil {
 				return errwrap.Wrapf(err, "failed Validate after SendRecv")
 			}
 		}
 	}
+	// XXX: this might not work with two merged "CompatibleRes" resources...
+	// XXX: fix that so we can have the mappings to do it in lang/interpret.go ?
 
 	var ok = true
 	var applied = false              // did we run an apply?
@@ -141,21 +286,72 @@ func (obj *Engine) Process(vertex pgraph.Vertex) error {
 		refreshableRes.SetRefresh(refresh) // tell the resource
 	}
 
+	// Run the exported resource exporter!
+	var exportOK bool
+	var exportErr error
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	// (Run this concurrently with the CheckApply related stuff below...)
+	go func() {
+		defer wg.Done()
+		// doesn't really need to be in parallel, but we can...
+		exportOK, exportErr = obj.Exporter.Export(ctx, res)
+	}()
+
+	// Did we actually run CheckApply? If we didn't, then the resource never
+	// got the chance to look at its send/recv changed flags, and so we must
+	// leave them alone for a subsequent run to consume.
+	ranCheckApply := false
+
 	// Check cached state, to skip CheckApply, but can't skip if refreshing!
 	// If the resource doesn't implement refresh, skip the refresh test.
 	// FIXME: if desired, check that we pass through refresh notifications!
-	if (!refresh || !isRefreshableRes) && obj.state[vertex].isStateOK {
+	if (!refresh || !isRefreshableRes) && state.isStateOK.Load() { // mutex RLock/RUnlock
 		checkOK, err = true, nil
 
 	} else if noop && (refresh && isRefreshableRes) { // had a refresh to do w/ noop!
 		checkOK, err = false, nil // therefore the state is wrong
 
-		// run the CheckApply!
+	} else if res.MetaParams().Hidden {
+		// We're not running CheckApply
+		if obj.Debug {
+			obj.Logf("%s: Hidden", res)
+		}
+		checkOK, err = true, nil // default
+
 	} else {
-		obj.Logf("%s: CheckApply(%t)", res, !noop)
+		// run the CheckApply!
+		if obj.Debug {
+			obj.Logf("%s: CheckApply(%t)", res, !noop)
+		}
 		// if this fails, don't UpdateTimestamp()
-		checkOK, err = res.CheckApply(!noop)
-		obj.Logf("%s: CheckApply(%t): Return(%t, %+v)", res, !noop, checkOK, err)
+		ranCheckApply = true
+		if state.async {
+			checkOK, err = obj.asyncCheckApply(ctx, state, res, !noop)
+		} else {
+			checkOK, err = safeCheckApply(ctx, res, !noop)
+		}
+		if !checkOK && obj.Debug { // don't log on (checkOK == true)
+			obj.Logf("%s: CheckApply(%t): Return(%t, %s)", res, !noop, checkOK, engineUtil.CleanError(err))
+		}
+	}
+	wg.Wait()
+
+	// The resource has now had its chance to consume any send/recv changed
+	// flags, so turn them off. We wait for the exporter above to finish
+	// first, because it reads those flags too. If CheckApply errored, then
+	// we leave them on, because the Worker retry loop runs us again, and
+	// SendRecv won't report the same transfer a second time. This is also
+	// why we don't do this when CheckApply was skipped entirely.
+	if ranCheckApply && err == nil {
+		ClearRecv(res)
+	}
+
+	checkOK = checkOK && exportOK // always combine
+	if err == nil {               // If CheckApply didn't error, look at exportOK.
+		// This is because if CheckApply errors we don't need to care or
+		// tell anyone about an exporting error.
+		err = exportErr
 	}
 
 	if checkOK && err != nil { // should never return this way
@@ -163,7 +359,7 @@ func (obj *Engine) Process(vertex pgraph.Vertex) error {
 	}
 
 	if !checkOK { // something changed, restart timer
-		obj.state[vertex].cuid.ResetTimer() // activity!
+		state.cuid.ResetTimer() // activity!
 		if obj.Debug {
 			obj.Logf("%s: converger: reset timer", res)
 		}
@@ -171,8 +367,10 @@ func (obj *Engine) Process(vertex pgraph.Vertex) error {
 
 	// if CheckApply ran without noop and without error, state should be good
 	if !noop && err == nil { // aka !noop || checkOK
-		obj.state[vertex].tuid.StartTimer()
-		obj.state[vertex].isStateOK = true // reset
+		state.tuid.StartTimer()
+		//state.mutex.Lock()
+		state.isStateOK.Store(true) // reset
+		//state.mutex.Unlock()
 		if refresh {
 			obj.SetUpstreamRefresh(vertex, false) // refresh happened, clear the request
 			if isRefreshableRes {
@@ -209,7 +407,9 @@ func (obj *Engine) Process(vertex pgraph.Vertex) error {
 		wg := &sync.WaitGroup{}
 		// update this timestamp *before* we poke or the poked
 		// nodes might fail due to having a too old timestamp!
-		obj.state[vertex].timestamp = time.Now().UnixNano() // update timestamp
+		state.mutex.Lock()                      // concurrent write start
+		state.timestamp = time.Now().UnixNano() // update timestamp (race)
+		state.mutex.Unlock()                    // concurrent write end
 		for _, v := range obj.graph.OutgoingGraphVertices(vertex) {
 			if !obj.OKTimestamp(v) {
 				// there is at least another one that will poke this...
@@ -220,7 +420,7 @@ func (obj *Engine) Process(vertex pgraph.Vertex) error {
 			// so that the graph doesn't go on running forever until
 			// it's completely done. This is an optional feature and
 			// we can select it via ^C on user exit or via the GAPI.
-			if obj.fastPause {
+			if obj.fastPause.Load() {
 				obj.Logf("%s: fast pausing, poke skipped", res)
 				continue
 			}
@@ -235,7 +435,7 @@ func (obj *Engine) Process(vertex pgraph.Vertex) error {
 		wg.Wait()
 	}
 
-	return errwrap.Wrapf(err, "error during Process()")
+	return err
 }
 
 // Worker is the common run frontend of the vertex. It handles all of the retry
@@ -243,53 +443,80 @@ func (obj *Engine) Process(vertex pgraph.Vertex) error {
 // vertex execution. This function cannot be "re-run" for the same vertex. The
 // retry mechanism stuff happens inside of this. To actually "re-run" you need
 // to remove the vertex and build a new one. The engine guarantees that we do
-// not allow CheckApply to run while we are paused. That is enforced here.
+// not allow CheckApply to run while we are paused. That is enforced here. The
+// one exception is an async resource, whose CheckApply may keep running across
+// a pause. See asyncCheckApply for how that stays safe.
 func (obj *Engine) Worker(vertex pgraph.Vertex) error {
 	res, isRes := vertex.(engine.Res)
 	if !isRes {
 		return fmt.Errorf("vertex is not a resource")
 	}
 
+	obj.tlock.RLock()
+	state := obj.state[vertex]
+	obj.tlock.RUnlock()
+
 	// bonus safety check
 	if res.MetaParams().Burst == 0 && !(res.MetaParams().Limit == rate.Inf) { // blocked
 		return fmt.Errorf("permanently limited (rate != Inf, burst = 0)")
 	}
 
-	//defer close(obj.state[vertex].stopped) // done signal
+	// initialize or reinitialize the meta state for this resource uid
+	// if we're using a Hidden resource, we don't support this feature
+	// TODO: should we consider supporting it? is it really necessary?
+	// XXX: to support this for Hidden, we'd need to handle dupe names
+	metas := &engine.MetaState{
+		CheckApplyRetry: res.MetaParams().Retry, // lookup the retry value
+	}
+	if !res.MetaParams().Hidden {
+		// Skip this if Hidden since we can have a hidden res that has
+		// the same kind+name as a regular res, and this would conflict.
+		obj.mlock.Lock()
+		if _, exists := obj.metas[engine.PtrUID(res)]; !exists || res.MetaParams().Reset {
+			obj.metas[engine.PtrUID(res)] = &engine.MetaState{
+				CheckApplyRetry: res.MetaParams().Retry, // lookup the retry value
+			}
+		}
+		metas = obj.metas[engine.PtrUID(res)] // handle
+		obj.mlock.Unlock()
+	}
 
-	obj.state[vertex].cuid = obj.Converger.Register()
-	obj.state[vertex].tuid = obj.Converger.Register()
+	//defer close(state.stopped) // done signal
+
+	state.cuid = obj.Converger.Register()
+	state.tuid = obj.Converger.Register()
 	// must wait for all users of the cuid to finish *before* we unregister!
 	// as a result, this defer happens *before* the below wait group Wait...
-	defer obj.state[vertex].cuid.Unregister()
-	defer obj.state[vertex].tuid.Unregister()
+	defer state.cuid.Unregister()
+	defer state.tuid.Unregister()
 
-	defer obj.state[vertex].wg.Wait() // this Worker is the last to exit!
+	defer state.wg.Wait() // this Worker is the last to exit!
 
-	obj.state[vertex].wg.Add(1)
+	state.wg.Add(1)
 	go func() {
-		defer obj.state[vertex].wg.Done()
-		defer close(obj.state[vertex].eventsChan) // we close this on behalf of res
+		defer state.wg.Done()
+		defer close(state.eventsChan) // we close this on behalf of res
 
 		// This is a close reverse-multiplexer. If any of the channels
-		// close, then it will cause the doneChan to close. That way,
+		// close, then it will cause the doneCtx to cancel. That way,
 		// multiple different folks can send a close signal, without
 		// every worrying about duplicate channel close panics.
-		obj.state[vertex].wg.Add(1)
+		state.wg.Add(1)
 		go func() {
-			defer obj.state[vertex].wg.Done()
+			defer state.wg.Done()
 
 			// reverse-multiplexer: any close, causes *the* close!
 			select {
-			case <-obj.state[vertex].processDone:
-			case <-obj.state[vertex].watchDone:
-			case <-obj.state[vertex].limitDone:
-			case <-obj.state[vertex].removeDone:
-			case <-obj.state[vertex].eventsDone:
+			case <-state.processDone:
+			case <-state.watchDone:
+			case <-state.limitDone:
+			case <-state.retryDone:
+			case <-state.removeDone:
+			case <-state.eventsDone:
 			}
 
 			// the main "done" signal gets activated here!
-			close(obj.state[vertex].doneChan)
+			state.doneCtxCancel() // cancels doneCtx
 		}()
 
 		var err error
@@ -300,15 +527,16 @@ func (obj *Engine) Worker(vertex pgraph.Vertex) error {
 			if delay > 0 {
 				errDelayExpired := engine.Error("delay exit")
 				err = func() error { // slim watch main loop
+					//nolint:gosec // G115: delay is trusted operator config in ms; only wraps above 2^63
 					timer := time.NewTimer(time.Duration(delay) * time.Millisecond)
-					defer obj.state[vertex].init.Logf("the Watch delay expired!")
+					defer state.init.Logf("the Watch delay expired!")
 					defer timer.Stop() // it's nice to cleanup
 					for {
 						select {
 						case <-timer.C: // the wait is over
 							return errDelayExpired // special
 
-						case <-obj.state[vertex].init.Done:
+						case <-state.doneCtx.Done():
 							return nil
 						}
 					}
@@ -317,29 +545,70 @@ func (obj *Engine) Worker(vertex pgraph.Vertex) error {
 					delay = 0 // reset
 					continue
 				}
+
+			} else if res.MetaParams().Hidden {
+				// We're not running Watch
+				if obj.Debug {
+					obj.Logf("%s: Hidden", res)
+				}
+				state.cuid.StartTimer() // TODO: Should we do this?
+				err = state.hidden(state.doneCtx)
+				state.cuid.StopTimer() // TODO: Should we do this?
+
 			} else if interval := res.MetaParams().Poll; interval > 0 { // poll instead of watching :(
-				obj.state[vertex].cuid.StartTimer()
-				err = obj.state[vertex].poll(interval)
-				obj.state[vertex].cuid.StopTimer() // clean up nicely
+				state.cuid.StartTimer()
+				err = state.poll(state.doneCtx, interval)
+				state.cuid.StopTimer() // clean up nicely
+
+			} else if interval := res.MetaParams().Poll; interval < 0 { // run once instead of watching
+				state.cuid.StartTimer()
+				err = state.once(state.doneCtx)
+				state.cuid.StopTimer() // clean up nicely
+
 			} else {
-				obj.state[vertex].cuid.StartTimer()
-				obj.Logf("Watch(%s)", vertex)
-				err = res.Watch() // run the watch normally
-				obj.Logf("Watch(%s): Exited(%+v)", vertex, err)
-				obj.state[vertex].cuid.StopTimer() // clean up nicely
+				state.cuid.StartTimer()
+				if obj.Debug {
+					obj.Logf("%s: Watch...", vertex)
+				}
+				err = safeWatch(state.doneCtx, res)  // run the watch normally
+				err = errwrap.NoContextCanceled(err) // strip
+				if s := engineUtil.CleanError(err); err != nil {
+					obj.Logf("%s: Watch Error: %s", vertex, s)
+				} else if obj.Debug {
+					obj.Logf("%s: Watch Exited...", vertex)
+				}
+				state.cuid.StopTimer() // clean up nicely
 			}
 			if err == nil { // || err == engine.ErrClosed
 				return // exited cleanly, we're done
 			}
+			if err == context.Canceled {
+				return // we shutdown nicely on request
+			}
 			// we've got an error...
 			delay = res.MetaParams().Delay
+
+			// A failed Watch must never overlap with a running
+			// Process, and no new Process may run until our
+			// replacement Watch sends its initial startup event.
+			// Interrupt any running Process, and then synchronize
+			// with the process loop through this sentinel, which it
+			// can only consume when no Process is running.
+			state.cancelProcess() // cancel any running Process
+			if retry != 0 {       // we're going to retry Watch
+				select {
+				case state.eventsChan <- errWatchRestart:
+				case <-state.doneCtx.Done():
+					// we're shutting down instead
+				}
+			}
 
 			if retry < 0 { // infinite retries
 				continue
 			}
 			if retry > 0 { // don't decrement past 0
 				retry--
-				obj.state[vertex].init.Logf("retrying Watch after %.4f seconds (%d left)", float64(delay)/1000, retry)
+				state.init.Logf("retrying Watch after %.4f seconds (%d left)", float64(delay)/1000, retry)
 				continue
 			}
 			//if retry == 0 { // optional
@@ -352,75 +621,104 @@ func (obj *Engine) Worker(vertex pgraph.Vertex) error {
 		// If the CheckApply loop exits and THEN the Watch fails with an
 		// error, then we'd be stuck here if exit signal didn't unblock!
 		select {
-		case obj.state[vertex].eventsChan <- errwrap.Wrapf(err, "watch failed"):
+		case state.eventsChan <- errwrap.Wrapf(err, "watch failed"):
 			// send
 		}
 	}()
 
 	// If this exits cleanly, we must unblock the reverse-multiplexer.
 	// I think this additional close is unnecessary, but it's not harmful.
-	defer close(obj.state[vertex].eventsDone) // causes doneChan to close
+	defer close(state.eventsDone) // causes doneCtx to cancel
 	limiter := rate.NewLimiter(res.MetaParams().Limit, res.MetaParams().Burst)
 	var reserv *rate.Reservation
 	var reterr error
-	var failed bool // has Process permanently failed?
+	var failed bool  // has Process permanently failed?
+	var closed bool  // has the resumeSignal channel closed?
+	var started bool // has Watch sent the initial startup event?
+
+	// Worker starts paused, so wait for resume signal before we CheckApply.
+	// (it's okay to let Watch run immediately)
+	select {
+	case _, ok := <-state.resumeSignal: // channel closes
+		if !ok {
+			closed = true
+		}
+
+		// XXX: Should we have an easy exit here? Or let it exit below?
+		//case <-state.doneCtx.Done():
+		//	return nil
+	}
+
 Loop:
 	for { // process loop
+		// This is the main select where things happen and where we exit
+		// from. It's similar to the two "satellite" select's which we
+		// might spend some time in if we're retrying or rate limiting.
+		// This select is also the main event receiver and is also the
+		// only place where we read from the poke channel.
 		select {
-		case err, ok := <-obj.state[vertex].eventsChan: // read from watch channel
+		case err, ok := <-state.eventsChan: // read from watch channel
 			if !ok {
 				return reterr // we only return when chan closes
+			}
+			if err == errWatchRestart {
+				// Watch failed and is restarting. It already
+				// interrupted any running Process, and since we
+				// only receive between Process invocations, it
+				// now knows that none is running. Require a new
+				// initial event before we run any new Process.
+				started = false
+				continue
 			}
 			// If the Watch method exits with an error, then this
 			// channel will get that error propagated to it, which
 			// we then save so we can return it to the caller of us.
 			if err != nil {
 				failed = true
-				close(obj.state[vertex].watchDone)   // causes doneChan to close
+				close(state.watchDone)               // causes doneCtx to cancel
 				reterr = errwrap.Append(reterr, err) // permanent failure
 				continue
 			}
 			if obj.Debug {
 				obj.Logf("event received")
 			}
+			// We mark the state dirty on receive, not on send,
+			// since no Process can be running right now, so this
+			// mark can't get clobbered by the completion of an
+			// earlier Process.
+			state.setDirty()
+			started = true                           // the resource is now running
 			reserv = limiter.ReserveN(time.Now(), 1) // one event
 			// reserv.OK() seems to always be true here!
 
-		case _, ok := <-obj.state[vertex].pokeChan: // read from buffered poke channel
+		case _, ok := <-state.pokeChan: // read from buffered poke channel
 			if !ok { // we never close it
 				panic("unexpected close of poke channel")
 			}
 			if obj.Debug {
 				obj.Logf("poke received")
 			}
+			// we're already marked unrealized by Poke() at the send
 			reserv = nil // we didn't receive a real event here...
-		}
-		if failed { // don't Process anymore if we've already failed...
-			continue Loop
-		}
 
-		// drop redundant pokes
-		for len(obj.state[vertex].pokeChan) > 0 {
-			select {
-			case <-obj.state[vertex].pokeChan:
-			default:
-				// race, someone else read one!
+		case _, ok := <-state.pauseSignal: // one message
+			if !ok {
+				state.pauseSignal = nil
+				continue // this is not a new pause message
 			}
-		}
-
-		// pause if one was requested...
-		select {
-		case <-obj.state[vertex].pauseSignal: // channel closes
-			// NOTE: If we allowed a doneChan below to let us out
+			// NOTE: If we allowed a doneCtx below to let us out
 			// of the resumeSignal wait, then we could loop around
 			// and run this again, causing a panic. Instead of this
 			// being made safe with a sync.Once, we instead run a
-			// Resume() call inside of the vertexRemoveFn function,
-			// which should unblock it when we're going to need to.
-			obj.state[vertex].pausedAck.Ack() // send ack
+			// close() call inside of the vertexRemoveFn function,
+			// which should unblock resumeSignal so we can shutdown.
+
 			// we are paused now, and waiting for resume or exit...
 			select {
-			case <-obj.state[vertex].resumeSignal: // channel closes
+			case _, ok := <-state.resumeSignal: // channel closes
+				if !ok {
+					closed = true
+				}
 				// resumed!
 				// pass through to allow a Process to try to run
 				// TODO: consider adding this fast pause here...
@@ -429,10 +727,29 @@ Loop:
 				//	continue
 				//}
 			}
-		default:
-			// no pause requested, keep going...
 		}
-		if failed { // don't Process anymore if we've already failed...
+
+		// drop redundant pokes
+		for len(state.pokeChan) > 0 {
+			select {
+			case <-state.pokeChan:
+			default:
+				// race, someone else read one!
+			}
+		}
+
+		// don't Process anymore if we've already failed or shutdown...
+		if failed || closed {
+			continue Loop
+		}
+
+		// We must never Process (and CheckApply) before the initial
+		// event from Watch tells us that the resource is started and
+		// ready. A poke from a neighbouring resource can arrive before
+		// that, and the resume signal passthrough can also get us here
+		// early. It's safe to skip both, since the guaranteed initial
+		// event always runs Process, which subsumes them.
+		if !started {
 			continue Loop
 		}
 
@@ -442,43 +759,69 @@ Loop:
 			d = reserv.DelayFrom(time.Now())
 		}
 		if reserv != nil && d > 0 { // delay
-			obj.state[vertex].init.Logf("limited (rate: %v/sec, burst: %d, next: %v)", res.MetaParams().Limit, res.MetaParams().Burst, d)
-			timer := time.NewTimer(time.Duration(d) * time.Millisecond)
+			state.init.Logf("limited (rate: %v/sec, burst: %d, next: %dms)", res.MetaParams().Limit, res.MetaParams().Burst, d/time.Millisecond)
+			timer := time.NewTimer(d)
 		LimitWait:
 			for {
+				// This "satellite" select doesn't need a poke
+				// channel because we're already in "event
+				// received" mode, and poke doesn't block.
 				select {
 				case <-timer.C: // the wait is over
 					break LimitWait
 
 				// consume other events while we're waiting...
-				case e, ok := <-obj.state[vertex].eventsChan: // read from watch channel
+				case e, ok := <-state.eventsChan: // read from watch channel
 					if !ok {
 						return reterr // we only return when chan closes
 					}
+					if e == errWatchRestart {
+						started = false // wait for the new initial event
+						continue
+					}
 					if e != nil {
 						failed = true
-						close(obj.state[vertex].limitDone) // causes doneChan to close
+						close(state.limitDone)             // causes doneCtx to cancel
 						reterr = errwrap.Append(reterr, e) // permanent failure
 						break LimitWait
 					}
 					if obj.Debug {
 						obj.Logf("event received in limit")
 					}
+					state.setDirty() // on receive, see the main select
 					// TODO: does this get added in properly?
 					limiter.ReserveN(time.Now(), 1) // one event
+
+				// this pause/resume block is the same as the upper main one
+				case _, ok := <-state.pauseSignal:
+					if !ok {
+						state.pauseSignal = nil
+						break LimitWait
+					}
+					select {
+					case _, ok := <-state.resumeSignal: // channel closes
+						if !ok {
+							closed = true
+						}
+						// resumed!
+					}
 				}
 			}
 			timer.Stop() // it's nice to cleanup
-			obj.state[vertex].init.Logf("rate limiting expired!")
+			state.init.Logf("rate limiting expired!")
 		}
-		if failed { // don't Process anymore if we've already failed...
+		// don't Process anymore if we've already failed or shutdown...
+		if failed || closed {
+			continue Loop
+		}
+		if !started { // a restarting Watch withdrew our readiness...
 			continue Loop
 		}
 		// end of limit delay
 
 		// retry...
 		var err error
-		var retry = res.MetaParams().Retry // lookup the retry value
+		//var retry = res.MetaParams().Retry // lookup the retry value
 		var delay uint64
 	RetryLoop:
 		for { // retry loop
@@ -486,58 +829,168 @@ Loop:
 				timer := time.NewTimer(time.Duration(delay) * time.Millisecond)
 			RetryWait:
 				for {
+					// This "satellite" select doesn't need
+					// a poke channel because we're already
+					// in "event received" mode, and poke
+					// doesn't block.
 					select {
 					case <-timer.C: // the wait is over
 						break RetryWait
 
 					// consume other events while we're waiting...
-					case e, ok := <-obj.state[vertex].eventsChan: // read from watch channel
+					case e, ok := <-state.eventsChan: // read from watch channel
 						if !ok {
 							return reterr // we only return when chan closes
 						}
+						if e == errWatchRestart {
+							started = false // wait for the new initial event
+							continue
+						}
 						if e != nil {
 							failed = true
-							close(obj.state[vertex].limitDone) // causes doneChan to close
+							close(state.retryDone)             // causes doneCtx to cancel
 							reterr = errwrap.Append(reterr, e) // permanent failure
 							break RetryWait
 						}
 						if obj.Debug {
 							obj.Logf("event received in retry")
 						}
+						state.setDirty() // on receive, see the main select
 						// TODO: does this get added in properly?
 						limiter.ReserveN(time.Now(), 1) // one event
+
+					// this pause/resume block is the same as the upper main one
+					case _, ok := <-state.pauseSignal:
+						if !ok {
+							state.pauseSignal = nil
+							break RetryWait
+						}
+						select {
+						case _, ok := <-state.resumeSignal: // channel closes
+							if !ok {
+								closed = true
+							}
+							// resumed!
+						}
 					}
 				}
 				timer.Stop() // it's nice to cleanup
 				delay = 0    // reset
-				obj.state[vertex].init.Logf("the CheckApply delay expired!")
+				state.init.Logf("the CheckApply delay expired!")
 			}
-			if failed { // don't Process anymore if we've already failed...
+
+			// Without a retry delay the satellite select above
+			// doesn't run at all, so a retry loop would spin
+			// through Process without ever returning to a select
+			// which reads the pause signal, and a Pause which
+			// arrives while we retry would block until the retries
+			// ran out. With Meta:retry set to -1 that is never.
+			// Since Pause blocks on an unbuffered send, this
+			// non-blocking receive catches one which is already
+			// waiting for us, and costs nothing when there isn't
+			// one. Between two Process runs is the only place
+			// where a pause is allowed to land anyway, which is
+			// exactly what the delay case above does too.
+			select {
+			case _, ok := <-state.pauseSignal:
+				if !ok {
+					// not a new pause
+					state.pauseSignal = nil
+					break // break out of our select
+				}
+				// we are paused now, and waiting for resume...
+				select {
+				case _, ok := <-state.resumeSignal: // channel closes
+					if !ok {
+						closed = true
+					}
+					// resumed!
+				}
+
+			default:
+				// nobody is waiting on us, so carry on...
+			}
+
+			// don't Process anymore if we've already failed or shutdown...
+			if failed || closed {
+				continue Loop
+			}
+			if !started { // a restarting Watch withdrew our readiness...
 				continue Loop
 			}
 
 			if obj.Debug {
 				obj.Logf("Process(%s)", vertex)
 			}
-			err = obj.Process(vertex)
-			if obj.Debug {
-				obj.Logf("Process(%s): Return(%+v)", vertex, err)
+			backPoke := false
+			// Run with a cancellable context, and register it, so
+			// that a failing Watch can interrupt us to restart.
+			// An async CheckApply is detached from doneCtx, so that
+			// a graph swap which removes us waits for it to finish
+			// instead of cancelling it. Only cancelProcess reaches
+			// it, from a Watch restart or from a user interrupt.
+			parent := state.doneCtx
+			if state.async {
+				parent = context.Background()
+			}
+			processCtx, pCancel := context.WithCancel(parent)
+			state.registerProcessCancel(pCancel)
+			err = obj.Process(processCtx, vertex)
+			state.registerProcessCancel(nil)
+			// For an async resource, only cancelProcess can end the
+			// context, and that is always an interrupt.
+			interrupted := processCtx.Err() != nil && (state.async || state.doneCtx.Err() == nil)
+			pCancel() // cleanup the context
+			if err == engine.ErrBackPoke {
+				backPoke = true
+				err = nil // for future code safety
 			}
 			if err == nil {
+				// Either that work is done, or it's blocked on
+				// a prerequisite, which we backpoked. Either
+				// way, a graph swap has nothing more to wait
+				// for from us.
+				state.setRealized() // see waitRealized in the engine
+			}
+			if obj.Debug && backPoke {
+				obj.Logf("Process(%s): BackPoke!", vertex)
+			}
+			if obj.Debug && !backPoke {
+				obj.Logf("Process(%s): Return(%s)", vertex, engineUtil.CleanError(err))
+			}
+			if err == nil && !backPoke && res.MetaParams().RetryReset { // reset it on success!
+				metas.CheckApplyRetry = res.MetaParams().Retry // lookup the retry value
+			}
+			if err == nil || backPoke {
+				break RetryLoop
+			}
+			if interrupted {
+				// Either a restarting Watch interrupted this
+				// Process, or the user asked us to stop waiting
+				// on it. Neither is a CheckApply failure, so it
+				// must not count against the retry limit. In
+				// the first case the initial event from the
+				// replacement Watch re-runs it, and in the
+				// second we're on our way out anyway.
+				state.init.Logf("process interrupted")
 				break RetryLoop
 			}
 			// we've got an error...
 			delay = res.MetaParams().Delay
 
-			if retry < 0 { // infinite retries
+			if metas.CheckApplyRetry < 0 { // infinite retries
 				continue
 			}
-			if retry > 0 { // don't decrement past 0
-				retry--
-				obj.state[vertex].init.Logf("retrying CheckApply after %.4f seconds (%d left)", float64(delay)/1000, retry)
+			if metas.CheckApplyRetry > 0 { // don't decrement past 0
+				metas.CheckApplyRetry--
+				state.init.Logf(
+					"retrying CheckApply after %.4f seconds (%d left)",
+					float64(delay)/1000,
+					metas.CheckApplyRetry,
+				)
 				continue
 			}
-			//if retry == 0 { // optional
+			//if metas.CheckApplyRetry == 0 { // optional
 			//	err = errwrap.Wrapf(err, "permanent process error")
 			//}
 
@@ -545,7 +998,7 @@ Loop:
 			// this dies. If Process fails permanently, we ask it
 			// to exit right here... (It happens when we loop...)
 			failed = true
-			close(obj.state[vertex].processDone) // causes doneChan to close
+			close(state.processDone)             // causes doneCtx to cancel
 			reterr = errwrap.Append(reterr, err) // permanent failure
 			continue
 
@@ -560,4 +1013,104 @@ Loop:
 	} // process loop
 
 	//return nil // unreachable
+}
+
+// asyncCheckApply runs the CheckApply of an async resource. It runs it in a
+// goroutine, and while it awaits the result it also listens for a pause, which
+// it acknowledges so that a graph swap can proceed while the CheckApply keeps
+// running. After a pause it waits to be resumed, or removed, before it collects
+// the result, because the rest of Process touches the graph, and that must not
+// overlap with a Commit. When we're the one being removed, the Commit is what
+// blocks on us, and the graph isn't modified until every removal returns, so it
+// is safe to carry on at once. This always waits for the goroutine, so nothing
+// outlives Process, and a second CheckApply can never overlap with the first.
+func (obj *Engine) asyncCheckApply(ctx context.Context, state *State, res engine.Res, apply bool) (bool, error) {
+	type result struct {
+		checkOK bool
+		err     error
+	}
+	resultChan := make(chan result, 1) // buffered, so the goroutine never blocks
+	go func() {
+		checkOK, err := safeCheckApply(ctx, res, apply)
+		resultChan <- result{checkOK: checkOK, err: err}
+	}()
+
+	for {
+		select {
+		case r := <-resultChan:
+			return r.checkOK, r.err // we only return here
+
+		case _, ok := <-state.pauseSignal:
+			if !ok {
+				state.pauseSignal = nil
+				continue
+			}
+			// Acked, so graph swap can continue while we run async.
+			select {
+			case _, ok := <-state.resumeSignal: // channel closes
+				if !ok {
+					continue
+				}
+				// resumed!
+			}
+		}
+	}
+}
+
+// safeCheckApply wraps a call to res.CheckApply with a panic recovery so that a
+// buggy resource or upstream library doesn't bring down the entire engine.
+func safeCheckApply(ctx context.Context, res engine.Res, apply bool) (checkOK bool, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			checkOK = false
+			err = fmt.Errorf("panic in CheckApply: %+v", r)
+		}
+	}()
+
+	timeout := res.MetaParams().Timeout
+	if timeout == 0 {
+		return res.CheckApply(ctx, apply)
+	}
+
+	//nolint:gosec // G115: timeout is trusted operator config in ms; only wraps above 2^63
+	duration := time.Duration(timeout) * time.Millisecond
+	checkApplyCtx, cancel := context.WithTimeout(ctx, duration)
+	defer cancel()
+
+	// NOTE: We always pass through the same checkOK value below, because if
+	// a resource made a mistake and returned (true, err) and we didn't pass
+	// through the `true`, we'd be silently suppressing that resource bug...
+	checkOK, err = res.CheckApply(checkApplyCtx, apply)
+	if checkApplyCtx.Err() != context.DeadlineExceeded {
+		return checkOK, err // return normally (err may even be nil)
+	}
+	// Timeout expired, resource returned, but we didn't return
+	// DeadlineExceeded. This may be because the resource had a bug and
+	// didn't properly propagate the error by returning ctx.Err() or it may
+	// be because the last `<-ctx.Done()` check was earlier in the code and
+	// the resource passed it. This is not a bug as long as workloads aren't
+	// blocking for more than approximately 1,000ms.
+	if err == nil {
+		return checkOK, nil
+	}
+	if err == context.DeadlineExceeded { // It returned correctly! Nice...
+		return checkOK, fmt.Errorf("timeout after %.3f seconds", duration.Seconds())
+	}
+
+	// This resource timed out, but returned an error. We're not sure
+	// whether the timeout caused the error, or if it errored and happened
+	// to timeout as well. Good resources return context.DeadlineExceeded,
+	// when that is the root cause. Patch those if that's not the case.
+	return checkOK, errwrap.Wrapf(err, "timeout after %.3f seconds", duration.Seconds())
+}
+
+// safeWatch wraps a call to res.Watch with a panic recovery so that a buggy
+// resource or upstream library doesn't bring down the entire engine.
+func safeWatch(ctx context.Context, res engine.Res) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic in Watch: %+v", r)
+		}
+	}()
+	return res.Watch(ctx)
 }

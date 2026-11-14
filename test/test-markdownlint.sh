@@ -1,9 +1,19 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # check for any markdown files that aren't in an ideal format
+
+# XXX: mdl versions after 0.15.0 break the standard markdown parsing rules, see:
+# https://github.com/markdownlint/markdownlint/issues/576 and:
+# https://github.com/markdownlint/markdownlint/issues/573
+#
+# install with: `gem install mdl -v 0.15.0 --no-document`
+#
+# If it doesn't show the correct version when you do `mdl --version` try:
+# `gem uninstall mdl -v 0.17.0 || gem uninstall mdl -v 0.16.0` since gem may try
+# to always run the latest version that's installed.
 
 echo running "$0 $*"
 set -o errexit
-set -o nounset
+#set -o nounset
 set -o pipefail
 
 #ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && cd .. && pwd )"	# dir!
@@ -21,7 +31,9 @@ STYLE=$($mktemp)
 cat << 'EOF' > "$STYLE"
 all
 exclude_rule 'MD010'	# Hard tabs
+exclude_rule 'MD028'	# Blank line inside blockquote
 exclude_rule 'MD032'	# Lists should be surrounded by blank lines
+exclude_rule 'MD034'	# Bare URL used
 exclude_rule 'MD040'	# Fenced code blocks should have a language specified
 exclude_rule 'MD026'	# Trailing punctuation in header
 exclude_rule 'MD024'	# Multiple headers with the same content
@@ -36,16 +48,30 @@ exclude_rule 'MD029'	# Ordered list item prefix
 exclude_rule 'MD039'	# Spaces inside link text
 
 # Line length
-rule 'MD013', :line_length => 80, :code_blocks => false, :tables => false
+# FIXME: Note this doesn't prevent a long word from being over 80, it only stops
+# new words from starting after you've already passed the 80 char limit.
+rule 'MD013', :line_length => 80, :ignore_code_blocks => true, :tables => false
 EOF
 
 #STYLE="test/mdl.style"	# style file
 
+CHECK_LINKS=false
+if [ "$1" = "--check-links" ]; then
+	shift # pop the $1 arg
+	CHECK_LINKS=true
+	LYCHEE=$(command -v lychee 2>/dev/null) || true
+	if [ -z "$LYCHEE" ]; then
+		fail_test "The 'lychee' utility can't be found.
+		Installation guide:
+		https://github.com/lycheeverse/lychee/blob/master/README.md#installation"
+	fi
+fi
+
 find_files() {
-	git ls-files | grep '\.md$'
+	repo_files | grep '\.md$'
 }
 
-F=${1:-}	# only check this file from $1 is specified
+F=${1:-}	# only check this file from $1 if specified
 
 bad_files=$(
 	for i in $(find_files); do
@@ -62,6 +88,13 @@ bad_files=$(
 		# check the markdown format with the linter
 		if ! "$MDL" --style "$STYLE" "$i" 1>&2; then
 			echo "$i"
+		fi
+
+		# check links in docs
+		if $CHECK_LINKS; then
+			if ! "$LYCHEE" --root-dir . --accept 200..300,302,429 --timeout 120 --max-retries 2 -n -v "$i" 1>&2; then
+				echo "$i"
+			fi
 		fi
 	done
 )

@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,20 +13,34 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package resources
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,9 +52,11 @@ import (
 	"github.com/purpleidea/mgmt/lang/funcs/vars"
 	"github.com/purpleidea/mgmt/lang/interfaces"
 	"github.com/purpleidea/mgmt/lang/types"
-	"github.com/purpleidea/mgmt/recwatch"
 	"github.com/purpleidea/mgmt/util"
 	"github.com/purpleidea/mgmt/util/errwrap"
+	"github.com/purpleidea/mgmt/util/recwatch"
+
+	"golang.org/x/sys/unix"
 )
 
 func init() {
@@ -69,6 +85,8 @@ func init() {
 		},
 	})
 }
+
+var _ engine.EdgeableRes = &FileRes{} // compile time check
 
 const (
 	// KindFile is the kind string used to identify this resource.
@@ -107,25 +125,32 @@ type FileRes struct {
 	// Path, which defaults to the name if not specified, represents the
 	// destination path for the file or directory being managed. It must be
 	// an absolute path, and as a result must start with a slash.
-	Path     string `lang:"path" yaml:"path"`
-	Dirname  string `lang:"dirname" yaml:"dirname"`   // override the path dirname
-	Basename string `lang:"basename" yaml:"basename"` // override the path basename
+	Path string `lang:"path" yaml:"path"`
+
+	// Dirname is used to override the path dirname. (The directory
+	// portion.)
+	Dirname string `lang:"dirname" yaml:"dirname"`
+
+	// Basename is used to override the path basename. (The file portion.)
+	Basename string `lang:"basename" yaml:"basename"`
 
 	// State specifies the desired state of the file. It can be either
 	// `exists` or `absent`. If you do not specify this, we will not be able
-	// to create or remove a file if it might be logical for another
-	// param to require that. Instead it will error. This means that this
-	// field is not implied by specifying some content or a mode.
+	// to create or remove a file if it might be logical for another param
+	// to require that. Instead it will error. This means that this field is
+	// not implied by specifying some content or a mode. This is also used
+	// when determining how we manage a symlink.
 	State string `lang:"state" yaml:"state"`
 
 	// Content specifies the file contents to use. If this is nil, they are
 	// left undefined. It cannot be combined with the Source or Fragments
 	// parameters.
 	Content *string `lang:"content" yaml:"content"`
+
 	// Source specifies the source contents for the file resource. It cannot
 	// be combined with the Content or Fragments parameters. It must be an
 	// absolute path, and it can point to a file or a directory. If it
-	// points to a file, then that will will be copied throuh directly. If
+	// points to a file, then that will will be copied through directly. If
 	// it points to a directory, then it will copy the directory "rsync
 	// style" onto the file destination. As a result, if this is a file,
 	// then the main file res must be a file, and if it is a directory, then
@@ -136,8 +161,10 @@ type FileRes struct {
 	// Force parameter. If source is undefined and the file path is a
 	// directory, then a directory will be created. If left undefined, and
 	// combined with the Purge option too, then any unmanaged file in this
-	// dir will be removed.
+	// dir will be removed. Lastly, if the Symlink parameter is true, then
+	// this specifies the source that the symbolic symlink points to.
 	Source string `lang:"source" yaml:"source"`
+
 	// Fragments specifies that the file is built from a list of individual
 	// files. If one of the files is a directory, then the list of files in
 	// that directory are the fragments to combine. Multiple of these can be
@@ -155,19 +182,42 @@ type FileRes struct {
 	// Owner specifies the file owner. You can specify either the string
 	// name, or a string representation of the owner integer uid.
 	Owner string `lang:"owner" yaml:"owner"`
+
 	// Group specifies the file group. You can specify either the string
 	// name, or a string representation of the group integer gid.
 	Group string `lang:"group" yaml:"group"`
+
 	// Mode is the mode of the file as a string representation of the octal
 	// form or symbolic form.
-	Mode    string `lang:"mode" yaml:"mode"`
-	Recurse bool   `lang:"recurse" yaml:"recurse"`
-	Force   bool   `lang:"force" yaml:"force"`
+	Mode string `lang:"mode" yaml:"mode"`
+
+	// Recurse specifies if you want to work recursively on the resource. It
+	// is used when copying a source directory, or to determine if a watch
+	// should be recursive or not. When making a directory, this is required
+	// if you'd need the parent directories to be made as well. (Analogous
+	// to the `mkdir -p` option.)
+	// FIXME: There are some unimplemented cases where we should look at it.
+	Recurse bool `lang:"recurse" yaml:"recurse"`
+
+	// Force must be set if we want to perform an unusual operation, such as
+	// changing a file into a directory or vice-versa. This is also required
+	// when changing a file or directory into a symlink or vice-versa.
+	Force bool `lang:"force" yaml:"force"`
+
 	// Purge specifies that when true, any unmanaged file in this file
 	// directory will be removed. As a result, this file resource must be a
 	// directory. This isn't particularly meaningful if you don't also set
 	// Recurse to true. This doesn't work with Content or Fragments.
 	Purge bool `lang:"purge" yaml:"purge"`
+
+	// Symlink specifies that the file should be a symbolic link to the
+	// source contents. Those do not have to point to an actual file or
+	// directory. The source in that case can be either an absolute or
+	// relative path.
+	Symlink bool `lang:"symlink" yaml:"symlink"`
+
+	// SELinux specifies the SELinux security context for the file.
+	SELinux *string `lang:"selinux" yaml:"selinux"`
 
 	sha256sum string
 }
@@ -205,23 +255,38 @@ func (obj *FileRes) isDir() bool {
 // the case where the mode is not specified. The caller should check obj.Mode is
 // not empty.
 func (obj *FileRes) mode() (os.FileMode, error) {
-	if n, err := strconv.ParseInt(obj.Mode, 8, 32); err == nil {
-		return os.FileMode(n), nil
+	// First check if this is an octal number.
+	if n, err := strconv.ParseUint(obj.Mode, 8, 32); err == nil {
+		// The traditional unix setuid/setgid/sticky bits (04000, 02000,
+		// 01000) are not the same bits that os.FileMode uses to store
+		// them, so translate them or they'd be silently ignored by both
+		// the comparison and os.Chmod.
+		m := os.FileMode(n) & os.ModePerm
+		if n&0o4000 != 0 {
+			m |= os.ModeSetuid
+		}
+		if n&0o2000 != 0 {
+			m |= os.ModeSetgid
+		}
+		if n&0o1000 != 0 {
+			m |= os.ModeSticky
+		}
+		return m, nil
 	}
 
 	// Try parsing symbolically by first getting the files current mode.
-	stat, err := os.Stat(obj.getPath())
-	if err != nil {
-		return os.FileMode(0), errwrap.Wrapf(err, "failed to get the current file mode")
+	from := os.FileMode(0) // default
+	if stat, err := os.Stat(obj.getPath()); err == nil {
+		from = stat.Mode()
 	}
 
 	modes := strings.Split(obj.Mode, ",")
-	m, err := engineUtil.ParseSymbolicModes(modes, stat.Mode(), FileModeAllowAssign)
+	m, err := engineUtil.ParseSymbolicModes(modes, from, FileModeAllowAssign)
 	if err != nil {
 		return os.FileMode(0), errwrap.Wrapf(err, "mode should be an octal number or symbolic mode (%s)", obj.Mode)
 	}
 
-	return os.FileMode(m), nil
+	return m, nil
 }
 
 // Default returns some sensible defaults for this resource.
@@ -260,18 +325,26 @@ func (obj *FileRes) Validate() error {
 		return fmt.Errorf("can only specify one of Content, Source, and Fragments")
 	}
 
+	if obj.Symlink && !isSrc && obj.State == FileStateExists {
+		return fmt.Errorf("can't use Symlink with an empty Source")
+	}
+
 	if obj.State == FileStateAbsent && (isContent || isSrc || isFrag) {
 		return fmt.Errorf("can't specify file Content, Source, or Fragments when State is %s", FileStateAbsent)
 	}
 
+	if obj.State == FileStateAbsent && obj.SELinux != nil {
+		return fmt.Errorf("can't specify SELinux when State is %s", FileStateAbsent)
+	}
+
 	// The path and Source must either both be dirs or both not be.
 	srcIsDir := strings.HasSuffix(obj.Source, "/")
-	if isSrc && (obj.isDir() != srcIsDir) {
+	if isSrc && (obj.isDir() != srcIsDir) && !obj.Symlink {
 		return fmt.Errorf("the path and Source must either both be dirs or both not be")
 	}
 
-	if obj.isDir() && (isContent || isFrag) { // makes no sense
-		return fmt.Errorf("can't specify Content or Fragments when creating a Dir")
+	if obj.isDir() && (isContent || isFrag || obj.Symlink) { // makes no sense
+		return fmt.Errorf("can't specify Content or Fragments or Symlink when creating a Dir")
 	}
 
 	// TODO: is this really a requirement that we want to enforce?
@@ -283,7 +356,7 @@ func (obj *FileRes) Validate() error {
 		return fmt.Errorf("you'll want to Recurse when you have a Purge to do")
 	}
 
-	if isSrc && !obj.isDir() && !srcIsDir && obj.Recurse {
+	if isSrc && !obj.isDir() && !srcIsDir && obj.Recurse && !obj.Symlink {
 		return fmt.Errorf("you can't recurse when copying a single file")
 	}
 
@@ -291,6 +364,13 @@ func (obj *FileRes) Validate() error {
 		// absolute paths begin with a slash
 		if !strings.HasPrefix(frag, "/") {
 			return fmt.Errorf("the frag (`%s`) isn't an absolute path", frag)
+		}
+		// If the file is inside one of our fragment dirs, then this
+		// would make an infinite loop mess. We can't prevent this
+		// happening in other ways with multiple dirs doing this for
+		// each other, but we can at least catch the common case.
+		if util.HasPathPrefix(obj.getPath(), frag) {
+			return fmt.Errorf("inside a frag (`%s`)", frag)
 		}
 	}
 
@@ -319,13 +399,6 @@ func (obj *FileRes) Validate() error {
 			return fmt.Errorf("can't set Owner or Group on this platform")
 		}
 	}
-	if _, err := engineUtil.GetUID(obj.Owner); obj.Owner != "" && err != nil {
-		return err
-	}
-
-	if _, err := engineUtil.GetGID(obj.Group); obj.Group != "" && err != nil {
-		return err
-	}
 
 	// TODO: should we silently ignore this error or include it?
 	//if obj.State == FileStateAbsent && obj.Mode != "" {
@@ -335,6 +408,13 @@ func (obj *FileRes) Validate() error {
 		if _, err := obj.mode(); err != nil {
 			return err
 		}
+	}
+
+	if obj.Symlink && (isContent || isFrag) {
+		return fmt.Errorf("can't specify Content or Fragments with Symlink")
+	}
+	if obj.Symlink && (obj.Recurse || obj.Purge) {
+		return fmt.Errorf("can't specify Recurse or Purge with Symlink")
 	}
 
 	return nil
@@ -349,8 +429,8 @@ func (obj *FileRes) Init(init *engine.Init) error {
 	return nil
 }
 
-// Close is run by the engine to clean up after the resource is done.
-func (obj *FileRes) Close() error {
+// Cleanup is run by the engine to clean up after the resource is done.
+func (obj *FileRes) Cleanup() error {
 	return nil
 }
 
@@ -359,52 +439,50 @@ func (obj *FileRes) Close() error {
 // probably important to write some test cases first! If the Watch returns an
 // error, it means that something has gone wrong, and it must be restarted. On a
 // clean exit it returns nil.
-func (obj *FileRes) Watch() error {
-	// TODO: chan *recwatch.Event instead?
-	inputEvents := make(chan recwatch.Event)
+func (obj *FileRes) Watch(ctx context.Context) error {
+	inputEvents := make(chan *recwatch.Event)
 	defer close(inputEvents)
 
 	wg := &sync.WaitGroup{}
 	defer wg.Wait()
 
-	exit := make(chan struct{})
-	// TODO: should this be after (later in the file) than the `defer recWatcher.Close()` ?
-	// TODO: should this be after (later in the file) the `defer recWatcher.Close()` ?
-	defer close(exit)
+	ctx, cancel := context.WithCancel(ctx)
+	// Cancel on every return, before waiting for the forwarding goroutines.
+	defer cancel()
 
-	recWatcher, err := recwatch.NewRecWatcher(obj.getPath(), obj.Recurse)
+	recurse := obj.Recurse && obj.isDir() // we can't recurse into a file
+	recWatcher, err := recwatch.NewRecWatcher(ctx, obj.getPath(), recurse)
 	if err != nil {
 		return err
 	}
-	defer recWatcher.Close()
+	defer recWatcher.Cleanup()
 
 	// watch the various inputs to this file resource too!
 	if obj.Source != "" {
 		// This block is virtually identical to the below one.
 		recurse := strings.HasSuffix(obj.Source, "/") // isDir
-		rw, err := recwatch.NewRecWatcher(obj.Source, recurse)
+		rw, err := recwatch.NewRecWatcher(ctx, obj.Source, recurse)
 		if err != nil {
 			return err
 		}
-		defer rw.Close()
+		defer rw.Cleanup()
 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for {
-				// TODO: *recwatch.Event instead?
-				var event recwatch.Event
+				var event *recwatch.Event
 				var ok bool
 				var shutdown bool
 				select {
 				case event, ok = <-rw.Events(): // recv
-				case <-exit: // unblock
+				case <-ctx.Done(): // unblock
 					return
 				}
 
 				if !ok {
 					err := fmt.Errorf("channel shutdown")
-					event = recwatch.Event{Error: err}
+					event = &recwatch.Event{Error: err}
 					shutdown = true
 				}
 
@@ -413,7 +491,7 @@ func (obj *FileRes) Watch() error {
 					if shutdown { // optimization to free early
 						return
 					}
-				case <-exit: // unblock
+				case <-ctx.Done(): // unblock
 					return
 				}
 			}
@@ -423,29 +501,28 @@ func (obj *FileRes) Watch() error {
 		// This block is virtually identical to the above one.
 		recurse := false // TODO: is it okay for depth==1 dirs?
 		//recurse := strings.HasSuffix(frag, "/") // isDir
-		rw, err := recwatch.NewRecWatcher(frag, recurse)
+		rw, err := recwatch.NewRecWatcher(ctx, frag, recurse)
 		if err != nil {
 			return err
 		}
-		defer rw.Close()
+		defer rw.Cleanup()
 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for {
-				// TODO: *recwatch.Event instead?
-				var event recwatch.Event
+				var event *recwatch.Event
 				var ok bool
 				var shutdown bool
 				select {
 				case event, ok = <-rw.Events(): // recv
-				case <-exit: // unblock
+				case <-ctx.Done(): // unblock
 					return
 				}
 
 				if !ok {
 					err := fmt.Errorf("channel shutdown")
-					event = recwatch.Event{Error: err}
+					event = &recwatch.Event{Error: err}
 					shutdown = true
 				}
 
@@ -454,16 +531,17 @@ func (obj *FileRes) Watch() error {
 					if shutdown { // optimization to free early
 						return
 					}
-				case <-exit: // unblock
+				case <-ctx.Done(): // unblock
 					return
 				}
 			}
 		}()
 	}
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
-	var send = false // send event?
 	for {
 		if obj.init.Debug {
 			obj.init.Logf("watching: %s", obj.getPath()) // attempting to watch...
@@ -471,40 +549,47 @@ func (obj *FileRes) Watch() error {
 
 		select {
 		case event, ok := <-recWatcher.Events():
+			if err := ctx.Err(); err != nil {
+				return err // engine is shutting us down
+			}
 			if !ok { // channel shutdown
-				// TODO: Should this be an error? Previously it
-				// was a `return nil`, and i'm not sure why...
-				//return nil
 				return fmt.Errorf("unexpected close")
 			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
+			}
 			if err := event.Error; err != nil {
-				return errwrap.Wrapf(err, "unknown %s watcher error", obj)
+				return err
 			}
 			if obj.init.Debug { // don't access event.Body if event.Error isn't nil
 				obj.init.Logf("event(%s): %v", event.Body.Name, event.Body.Op)
 			}
-			send = true
 
 		case event, ok := <-inputEvents:
+			if err := ctx.Err(); err != nil {
+				return err // engine is shutting us down
+			}
 			if !ok {
 				return fmt.Errorf("unexpected close")
 			}
+			if event == nil {
+				// programming error
+				return fmt.Errorf("unexpected nil recwatch event")
+			}
 			if err := event.Error; err != nil {
-				return errwrap.Wrapf(err, "unknown %s input watcher error", obj)
+				return err
 			}
 			if obj.init.Debug { // don't access event.Body if event.Error isn't nil
 				obj.init.Logf("input event(%s): %v", event.Body.Name, event.Body.Op)
 			}
-			send = true
 
-		case <-obj.init.Done: // closed by the engine to signal shutdown
-			return nil
+		case <-ctx.Done(): // closed by the engine to signal shutdown
+			return ctx.Err()
 		}
 
-		// do all our event sending all together to avoid duplicate msgs
-		if send {
-			send = false
-			obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
 		}
 	}
 }
@@ -515,17 +600,22 @@ func (obj *FileRes) Watch() error {
 // of computing the source data hash, and it returns the computed value if this
 // function reaches that stage. As usual, it respects the apply action variable,
 // and has some symmetry with the main CheckApply function.
-func (obj *FileRes) fileCheckApply(apply bool, src io.ReadSeeker, dst string, sha256sum string) (string, bool, error) {
+func (obj *FileRes) fileCheckApply(ctx context.Context, apply bool, src io.ReadSeeker, dst string, sha256sum string) (string, bool, error) {
 	// TODO: does it make sense to switch dst to an io.Writer ?
 	// TODO: use obj.Force when dealing with symlinks and other file types!
 	if obj.init.Debug {
 		obj.init.Logf("fileCheckApply: %v -> %s", src, dst)
 	}
 
+	length := int64(-1)
+
 	srcFile, isFile := src.(*os.File)
-	_, isBytes := src.(*bytes.Reader) // supports seeking!
+	srcReader, isBytes := src.(*bytes.Reader) // supports seeking!
 	if !isFile && !isBytes {
 		return "", false, fmt.Errorf("can't open src as either file or buffer")
+	}
+	if isBytes {
+		length = int64(srcReader.Len())
 	}
 
 	var srcStat os.FileInfo
@@ -539,6 +629,8 @@ func (obj *FileRes) fileCheckApply(apply bool, src io.ReadSeeker, dst string, sh
 		if !srcStat.Mode().IsRegular() { // can't copy non-regular files or dirs
 			return "", false, fmt.Errorf("non-regular src file: %s (%q)", srcStat.Name(), srcStat.Mode())
 		}
+
+		length = srcStat.Size()
 	}
 
 	dstFile, err := os.Open(dst)
@@ -577,7 +669,7 @@ func (obj *FileRes) fileCheckApply(apply bool, src io.ReadSeeker, dst string, sh
 		}
 		// FIXME: respect obj.Recurse here...
 		// there is a dir here, where we want a file...
-		obj.init.Logf("fileCheckApply: removing (force): %s", cleanDst)
+		obj.init.Logf("removing (force): %s", cleanDst)
 		if err := os.RemoveAll(cleanDst); err != nil { // dangerous ;)
 			return "", false, err
 		}
@@ -597,11 +689,11 @@ func (obj *FileRes) fileCheckApply(apply bool, src io.ReadSeeker, dst string, sh
 		if sha256sum == "" { // cache is invalid
 			hash := sha256.New()
 			// TODO: file existence test?
-			if _, err := io.Copy(hash, src); err != nil {
+			if _, err := util.CopyContext(ctx, hash, src); err != nil {
 				return "", false, err
 			}
 			sha256sum = hex.EncodeToString(hash.Sum(nil))
-			// since we re-use this src handler below, it is
+			// since we reuse this src handler below, it is
 			// *critical* to seek to 0, or we'll copy nothing!
 			if n, err := src.Seek(0, 0); err != nil || n != 0 {
 				return sha256sum, false, err
@@ -610,7 +702,7 @@ func (obj *FileRes) fileCheckApply(apply bool, src io.ReadSeeker, dst string, sh
 
 		// dst hash
 		hash := sha256.New()
-		if _, err := io.Copy(hash, dstFile); err != nil {
+		if _, err := util.CopyContext(ctx, hash, dstFile); err != nil {
 			return "", false, err
 		}
 		if h := hex.EncodeToString(hash.Sum(nil)); h == sha256sum {
@@ -622,16 +714,19 @@ func (obj *FileRes) fileCheckApply(apply bool, src io.ReadSeeker, dst string, sh
 	if !apply {
 		return sha256sum, false, nil
 	}
+	if err := ctx.Err(); err != nil {
+		return sha256sum, false, err
+	}
 	if obj.init.Debug {
-		obj.init.Logf("fileCheckApply: apply: %v -> %s", src, dst)
+		obj.init.Logf("apply: %v -> %s", src, dst)
 	}
 
-	dstClose() // unlock file usage so we can write to it
+	_ = dstClose() // unlock file usage so we can write to it (may return os.ErrInvalid)
 	dstFile, err = os.Create(dst)
 	if err != nil {
 		return sha256sum, false, err
 	}
-	defer dstFile.Close() // TODO: is this redundant because of the earlier defered Close() ?
+	defer dstFile.Close() // TODO: is this redundant because of the earlier deferred Close() ?
 
 	if isFile { // set mode because it's a new file
 		if err := dstFile.Chmod(srcStat.Mode()); err != nil {
@@ -642,20 +737,22 @@ func (obj *FileRes) fileCheckApply(apply bool, src io.ReadSeeker, dst string, sh
 	// TODO: attempt to reflink with Splice() and int(file.Fd()) as input...
 	// syscall.Splice(rfd int, roff *int64, wfd int, woff *int64, len int, flags int) (n int64, err error)
 
-	// TODO: should we offer a way to cancel the copy on ^C ?
-	if obj.init.Debug {
-		obj.init.Logf("fileCheckApply: copy: %v -> %s", src, dst)
+	if isFile {
+		obj.init.Logf("copy %d bytes from: %v", length, src)
+	} else if isBytes {
+		obj.init.Logf("copy %d bytes", length)
 	}
-	if n, err := io.Copy(dstFile, src); err != nil {
+
+	if n, err := util.CopyContext(ctx, dstFile, src); err != nil {
 		return sha256sum, false, err
 	} else if obj.init.Debug {
-		obj.init.Logf("fileCheckApply: copied: %v", n)
+		obj.init.Logf("copied: %v", n)
 	}
 	return sha256sum, false, dstFile.Sync()
 }
 
 // dirCheckApply is the CheckApply operation for an empty directory.
-func (obj *FileRes) dirCheckApply(apply bool) (bool, error) {
+func (obj *FileRes) dirCheckApply(ctx context.Context, apply bool) (bool, error) {
 	// check if the path exists and is a directory
 	fileInfo, err := os.Stat(obj.getPath())
 	if err != nil && !os.IsNotExist(err) {
@@ -676,30 +773,35 @@ func (obj *FileRes) dirCheckApply(apply bool) (bool, error) {
 	// the path exists and is not a directory
 	// delete the file if force is given
 	if err == nil && !fileInfo.IsDir() {
-		obj.init.Logf("dirCheckApply: removing (force): %s", obj.getPath())
 		if err := os.Remove(obj.getPath()); err != nil {
 			return false, err
 		}
+		obj.init.Logf("force remove")
 	}
 
 	// create the empty directory
-	var mode os.FileMode
+	mode := os.ModePerm
 	if obj.Mode != "" {
-		mode, err = obj.mode()
-		if err != nil {
+		if mode, err = obj.mode(); err != nil {
 			return false, err
 		}
-	} else {
-		mode = os.ModePerm
 	}
 
-	if obj.Force {
-		// FIXME: respect obj.Recurse here...
+	if obj.Recurse {
 		// TODO: add recurse limit here
-		return false, os.MkdirAll(obj.getPath(), mode)
+		if err := os.MkdirAll(obj.getPath(), mode); err != nil {
+			return false, err
+		}
+		obj.init.Logf("mkdir -p -m %s", mode)
+		return false, nil
 	}
 
-	return false, os.Mkdir(obj.getPath(), mode)
+	if err := os.Mkdir(obj.getPath(), mode); err != nil {
+		return false, err
+	}
+	obj.init.Logf("mkdir -m %s", mode)
+
+	return false, nil
 }
 
 // syncCheckApply is the CheckApply operation for a source and destination dir.
@@ -707,9 +809,9 @@ func (obj *FileRes) dirCheckApply(apply bool) (bool, error) {
 // fileCheckApply method. It returns checkOK and error as is normally expected.
 // If excludes is specified, none of those files there will be deleted by this,
 // with the exception that a sync *can* convert a file to a dir, or vice-versa.
-func (obj *FileRes) syncCheckApply(apply bool, src, dst string, excludes []string) (bool, error) {
+func (obj *FileRes) syncCheckApply(ctx context.Context, apply bool, src, dst string, excludes []string) (bool, error) {
 	if obj.init.Debug {
-		obj.init.Logf("syncCheckApply: %s -> %s", src, dst)
+		obj.init.Logf("sync: %s -> %s", src, dst)
 	}
 	// an src of "" is now supported, if dst is a dir
 	if dst == "" {
@@ -731,19 +833,19 @@ func (obj *FileRes) syncCheckApply(apply bool, src, dst string, excludes []strin
 
 	if !srcIsDir && !dstIsDir && src != "" {
 		if obj.init.Debug {
-			obj.init.Logf("syncCheckApply: %s -> %s", src, dst)
+			obj.init.Logf("sync: %s -> %s", src, dst)
 		}
 		fin, err := os.Open(src)
 		if err != nil {
 			if obj.init.Debug && os.IsNotExist(err) { // if we get passed an empty src
-				obj.init.Logf("syncCheckApply: missing src: %s", src)
+				obj.init.Logf("missing src: %s", src)
 			}
 			return false, err
 		}
 
-		_, checkOK, err := obj.fileCheckApply(apply, fin, dst, "")
+		_, checkOK, err := obj.fileCheckApply(ctx, apply, fin, dst, "")
 		if err != nil {
-			fin.Close()
+			_ = fin.Close()
 			return false, err
 		}
 		return checkOK, fin.Close()
@@ -758,7 +860,9 @@ func (obj *FileRes) syncCheckApply(apply bool, src, dst string, excludes []strin
 			return false, err
 		}
 		smartSrc = mapPaths(srcFiles)
-		obj.init.Logf("syncCheckApply: srcFiles: %v", srcFiles)
+		if obj.init.Debug {
+			obj.init.Logf("srcFiles: %v", printFiles(smartSrc))
+		}
 	}
 
 	dstFiles, err := ReadDir(dst)
@@ -766,7 +870,9 @@ func (obj *FileRes) syncCheckApply(apply bool, src, dst string, excludes []strin
 		return false, err
 	}
 	smartDst := mapPaths(dstFiles)
-	obj.init.Logf("syncCheckApply: dstFiles: %v", dstFiles)
+	if obj.init.Debug {
+		obj.init.Logf("dstFiles: %v", printFiles(smartDst))
+	}
 
 	for relPath, fileInfo := range smartSrc {
 		absSrc := fileInfo.AbsPath // absolute path
@@ -790,7 +896,7 @@ func (obj *FileRes) syncCheckApply(apply bool, src, dst string, excludes []strin
 					if absCleanDst == "" || absCleanDst == "/" {
 						return false, fmt.Errorf("don't want to remove root") // safety
 					}
-					obj.init.Logf("syncCheckApply: removing (force): %s", absCleanDst)
+					obj.init.Logf("removing (force): %s", absCleanDst)
 					if err := os.Remove(absCleanDst); err != nil {
 						return false, err
 					}
@@ -798,7 +904,7 @@ func (obj *FileRes) syncCheckApply(apply bool, src, dst string, excludes []strin
 				}
 
 				if obj.init.Debug {
-					obj.init.Logf("syncCheckApply: mkdir -m %s '%s'", fileInfo.Mode(), absDst)
+					obj.init.Logf("mkdir -m %s '%s'", fileInfo.Mode(), absDst)
 				}
 				if err := os.Mkdir(absDst, fileInfo.Mode()); err != nil {
 					return false, err
@@ -809,11 +915,11 @@ func (obj *FileRes) syncCheckApply(apply bool, src, dst string, excludes []strin
 		}
 
 		if obj.init.Debug {
-			obj.init.Logf("syncCheckApply: recurse: %s -> %s", absSrc, absDst)
+			obj.init.Logf("recurse: %s -> %s", absSrc, absDst)
 		}
 		if obj.Recurse {
-			if c, err := obj.syncCheckApply(apply, absSrc, absDst, excludes); err != nil { // recurse
-				return false, errwrap.Wrapf(err, "syncCheckApply: recurse failed")
+			if c, err := obj.syncCheckApply(ctx, apply, absSrc, absDst, excludes); err != nil { // recurse
+				return false, errwrap.Wrapf(err, "recurse failed")
 			} else if !c { // don't let subsequent passes make this true
 				checkOK = false
 			}
@@ -858,7 +964,7 @@ func (obj *FileRes) syncCheckApply(apply bool, src, dst string, excludes []strin
 			if isExcluded(absDst) { // skip removing excluded files
 				continue
 			}
-			obj.init.Logf("syncCheckApply: removing: %s", absCleanDst)
+			obj.init.Logf("removing: %s", absCleanDst)
 			if apply {
 				if err := os.RemoveAll(absCleanDst); err != nil { // dangerous ;)
 					return false, err
@@ -868,16 +974,16 @@ func (obj *FileRes) syncCheckApply(apply bool, src, dst string, excludes []strin
 			continue
 		}
 		_ = absSrc
-		//obj.init.Logf("syncCheckApply: recurse rm: %s -> %s", absSrc, absDst)
-		//if c, err := obj.syncCheckApply(apply, absSrc, absDst, excludes); err != nil {
-		//	return false, errwrap.Wrapf(err, "syncCheckApply: recurse rm failed")
+		//obj.init.Logf("recurse rm: %s -> %s", absSrc, absDst)
+		//if c, err := obj.syncCheckApply(ctx, apply, absSrc, absDst, excludes); err != nil {
+		//	return false, errwrap.Wrapf(err, "recurse rm failed")
 		//} else if !c { // don't let subsequent passes make this true
 		//	checkOK = false
 		//}
 		//if isExcluded(absDst) { // skip removing excluded files
 		//	continue
 		//}
-		//obj.init.Logf("syncCheckApply: removing: %s", absCleanDst)
+		//obj.init.Logf("removing: %s", absCleanDst)
 		//if apply { // safety
 		//	if err := os.Remove(absCleanDst); err != nil {
 		//		return false, err
@@ -891,7 +997,11 @@ func (obj *FileRes) syncCheckApply(apply bool, src, dst string, excludes []strin
 
 // stateCheckApply performs a CheckApply of the file state to create or remove
 // an empty file or directory.
-func (obj *FileRes) stateCheckApply(apply bool) (bool, error) {
+func (obj *FileRes) stateCheckApply(ctx context.Context, apply bool) (bool, error) {
+	if obj.Symlink {
+		return true, nil // delegate all of this work to symlinkCheckApply
+	}
+
 	if obj.State == FileStateUndefined { // state is not specified
 		return true, nil
 	}
@@ -924,17 +1034,18 @@ func (obj *FileRes) stateCheckApply(apply bool) (bool, error) {
 		if p == "/" {
 			return false, fmt.Errorf("don't want to remove root") // safety
 		}
-		obj.init.Logf("stateCheckApply: removing: %s", p)
-		// FIXME: respect obj.Recurse here...
+		obj.init.Logf("removing: %s", p)
 		// TODO: add recurse limit here
-		err := os.RemoveAll(p) // dangerous ;)
-		return false, err      // either nil or not
+		if obj.Recurse {
+			return false, os.RemoveAll(p) // dangerous ;)
+		}
+		return false, os.Remove(p)
 	}
 
 	// we need to make a file or a directory now
 
 	if obj.isDir() {
-		return obj.dirCheckApply(apply)
+		return obj.dirCheckApply(ctx, apply)
 	}
 
 	// Optimization: we shouldn't even look at obj.Content here, but we can
@@ -948,6 +1059,7 @@ func (obj *FileRes) stateCheckApply(apply bool) (bool, error) {
 	// one is magically created right after our exists test. The chmod used
 	// is what is used by the os.Create function.
 	// TODO: is using O_EXCL okay?
+	//nolint:gosec // G302: mimics os.Create (0666); the Mode param sets the real mode
 	f, err := os.OpenFile(obj.getPath(), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0666)
 	if err != nil {
 		return false, errwrap.Wrapf(err, "problem creating empty file")
@@ -955,13 +1067,16 @@ func (obj *FileRes) stateCheckApply(apply bool) (bool, error) {
 	if err := f.Close(); err != nil {
 		return false, errwrap.Wrapf(err, "problem closing empty file")
 	}
+	obj.init.Logf("created")
 
 	return false, nil // defer the Content != nil work to later...
 }
 
 // contentCheckApply performs a CheckApply for the file content.
-func (obj *FileRes) contentCheckApply(apply bool) (bool, error) {
-	obj.init.Logf("contentCheckApply(%t)", apply)
+func (obj *FileRes) contentCheckApply(ctx context.Context, apply bool) (bool, error) {
+	if obj.init.Debug {
+		obj.init.Logf("contentCheckApply(%t)", apply)
+	}
 
 	// content is not defined, leave it alone...
 	if obj.Content == nil {
@@ -970,7 +1085,7 @@ func (obj *FileRes) contentCheckApply(apply bool) (bool, error) {
 
 	// Actually write the file. This is similar to fragmentsCheckApply.
 	bufferSrc := bytes.NewReader([]byte(*obj.Content))
-	sha256sum, checkOK, err := obj.fileCheckApply(apply, bufferSrc, obj.getPath(), obj.sha256sum)
+	sha256sum, checkOK, err := obj.fileCheckApply(ctx, apply, bufferSrc, obj.getPath(), obj.sha256sum)
 	if sha256sum != "" { // empty values mean errored or didn't hash
 		// this can be valid even when the whole function errors
 		obj.sha256sum = sha256sum // cache value
@@ -983,8 +1098,14 @@ func (obj *FileRes) contentCheckApply(apply bool) (bool, error) {
 }
 
 // sourceCheckApply performs a CheckApply for the file source.
-func (obj *FileRes) sourceCheckApply(apply bool) (bool, error) {
-	obj.init.Logf("sourceCheckApply(%t)", apply)
+func (obj *FileRes) sourceCheckApply(ctx context.Context, apply bool) (bool, error) {
+	if obj.Symlink { // delegate
+		return obj.symlinkCheckApply(ctx, apply)
+	}
+
+	if obj.init.Debug {
+		obj.init.Logf("sourceCheckApply(%t)", apply)
+	}
 
 	// source is not defined, leave it alone...
 	if obj.Source == "" && !obj.Purge {
@@ -1024,13 +1145,13 @@ func (obj *FileRes) sourceCheckApply(apply bool) (bool, error) {
 		}
 	}
 	if obj.init.Debug {
-		obj.init.Logf("syncCheckApply: excludes: %+v", excludes)
+		obj.init.Logf("excludes: %+v", excludes)
 	}
 
 	// XXX: should this work with obj.Purge && obj.Source != "" or not?
-	checkOK, err := obj.syncCheckApply(apply, obj.Source, obj.getPath(), excludes)
+	checkOK, err := obj.syncCheckApply(ctx, apply, obj.Source, obj.getPath(), excludes)
 	if err != nil {
-		obj.init.Logf("syncCheckApply: error: %v", err)
+		obj.init.Logf("error: %v", err)
 		return false, err
 	}
 
@@ -1038,8 +1159,10 @@ func (obj *FileRes) sourceCheckApply(apply bool) (bool, error) {
 }
 
 // fragmentsCheckApply performs a CheckApply for the file fragments.
-func (obj *FileRes) fragmentsCheckApply(apply bool) (bool, error) {
-	obj.init.Logf("fragmentsCheckApply(%t)", apply)
+func (obj *FileRes) fragmentsCheckApply(ctx context.Context, apply bool) (bool, error) {
+	if obj.init.Debug {
+		obj.init.Logf("fragmentsCheckApply(%t)", apply)
+	}
 
 	// fragments is not defined, leave it alone...
 	if len(obj.Fragments) == 0 {
@@ -1052,7 +1175,7 @@ func (obj *FileRes) fragmentsCheckApply(apply bool) (bool, error) {
 	for _, frag := range obj.Fragments {
 		// It's a single file. Add it to what we're building...
 		if isDir := strings.HasSuffix(frag, "/"); !isDir {
-			out, err := ioutil.ReadFile(frag)
+			out, err := os.ReadFile(frag)
 			if err != nil {
 				return false, errwrap.Wrapf(err, "could not read file fragment")
 			}
@@ -1061,7 +1184,7 @@ func (obj *FileRes) fragmentsCheckApply(apply bool) (bool, error) {
 		}
 
 		// We're a dir, peer inside...
-		files, err := ioutil.ReadDir(frag)
+		files, err := os.ReadDir(frag)
 		if err != nil {
 			return false, errwrap.Wrapf(err, "could not read fragment directory")
 		}
@@ -1072,7 +1195,7 @@ func (obj *FileRes) fragmentsCheckApply(apply bool) (bool, error) {
 				continue
 			}
 			f := path.Join(frag, file.Name())
-			out, err := ioutil.ReadFile(f)
+			out, err := os.ReadFile(f)
 			if err != nil {
 				return false, errwrap.Wrapf(err, "could not read directory file fragment")
 			}
@@ -1085,7 +1208,7 @@ func (obj *FileRes) fragmentsCheckApply(apply bool) (bool, error) {
 	// NOTE: We pass in an invalidated sha256sum cache since we don't cache
 	// all the individual files, and it could all change without us knowing.
 	// TODO: Is the sha256sum caching even having an effect at all here ???
-	sha256sum, checkOK, err := obj.fileCheckApply(apply, bufferSrc, obj.getPath(), "")
+	sha256sum, checkOK, err := obj.fileCheckApply(ctx, apply, bufferSrc, obj.getPath(), "")
 	if sha256sum != "" { // empty values mean errored or didn't hash
 		// this can be valid even when the whole function errors
 		obj.sha256sum = sha256sum // cache value
@@ -1098,15 +1221,22 @@ func (obj *FileRes) fragmentsCheckApply(apply bool) (bool, error) {
 }
 
 // chownCheckApply performs a CheckApply for the file ownership.
-func (obj *FileRes) chownCheckApply(apply bool) (bool, error) {
-	obj.init.Logf("chownCheckApply(%t)", apply)
+func (obj *FileRes) chownCheckApply(ctx context.Context, apply bool) (bool, error) {
+	if obj.init.Debug {
+		obj.init.Logf("chownCheckApply(%t)", apply)
+	}
 
 	if obj.Owner == "" && obj.Group == "" {
 		// no owner or group specified, everything is ok
 		return true, nil
 	}
 
-	fileInfo, err := os.Stat(obj.getPath())
+	// XXX: Is this the correct usage of Stat for Symlinks and regular files?
+	stat := os.Stat
+	if obj.Symlink {
+		stat = os.Lstat
+	}
+	fileInfo, err := stat(obj.getPath())
 	// TODO: is this a sane behaviour that we want to preserve?
 	// If the file does not exist and we are in noop mode, do not throw an
 	// error.
@@ -1154,12 +1284,15 @@ func (obj *FileRes) chownCheckApply(apply bool) (bool, error) {
 		return false, nil
 	}
 
+	obj.init.Logf("chown %s:%s", obj.Owner, obj.Group)
 	return false, os.Chown(obj.getPath(), expectedUID, expectedGID)
 }
 
 // chmodCheckApply performs a CheckApply for the file permissions.
-func (obj *FileRes) chmodCheckApply(apply bool) (bool, error) {
-	obj.init.Logf("chmodCheckApply(%t)", apply)
+func (obj *FileRes) chmodCheckApply(ctx context.Context, apply bool) (bool, error) {
+	if obj.init.Debug {
+		obj.init.Logf("chmodCheckApply(%t)", apply)
+	}
 
 	if obj.Mode == "" {
 		// no mode specified, everything is ok
@@ -1171,13 +1304,21 @@ func (obj *FileRes) chmodCheckApply(apply bool) (bool, error) {
 		return false, err
 	}
 
-	fileInfo, err := os.Stat(obj.getPath())
+	// XXX: Is this the correct usage of Stat for Symlinks and regular files?
+	stat := os.Stat
+	if obj.Symlink {
+		stat = os.Lstat
+	}
+	fileInfo, err := stat(obj.getPath())
 	if err != nil { // if the file does not exist, it's correct to error!
 		return false, err
 	}
 
-	// nothing to do
-	if fileInfo.Mode() == mode {
+	// NOTE: We must mask off the file type bits (eg: os.ModeDir) since
+	// fileInfo.Mode() carries them but an octal mode like "755" does not!
+	// This never compare equal for a dir and cause an infinite loop!
+	if fileInfo.Mode()&^os.ModeType == mode&^os.ModeType {
+		// nothing to do
 		return true, nil
 	}
 
@@ -1186,55 +1327,192 @@ func (obj *FileRes) chmodCheckApply(apply bool) (bool, error) {
 		return false, nil
 	}
 
+	obj.init.Logf("chmod %s", obj.Mode)
 	return false, os.Chmod(obj.getPath(), mode)
+}
+
+// symlinkCheckApply performs a CheckApply for the symlink parameter.
+func (obj *FileRes) symlinkCheckApply(ctx context.Context, apply bool) (bool, error) {
+	if !obj.Symlink {
+		return true, nil
+	}
+
+	if obj.init.Debug {
+		obj.init.Logf("symlinkCheckApply(%t)", apply)
+	}
+
+	if obj.State == FileStateUndefined { // state is not specified
+		return true, nil
+	}
+
+	p := obj.getPath()
+	dest, err := os.Readlink(p)
+	isNotExist := os.IsNotExist(err)
+	isInvalidSymlink := isInvalidSymlink(err)
+
+	if err != nil && !isNotExist && !isInvalidSymlink {
+		return false, err // some unknown error
+	}
+
+	if obj.State == FileStateAbsent && isNotExist {
+		return true, nil
+	}
+	if obj.State == FileStateExists && err == nil && dest == obj.Source {
+		return true, nil
+	}
+
+	// state is not okay, no work done, exit, but without error
+	if !apply {
+		return false, nil
+	}
+
+	if obj.State == FileStateAbsent && isInvalidSymlink && !obj.Force {
+		return false, fmt.Errorf("can't remove non-symlink without Force")
+	}
+
+	if obj.State == FileStateAbsent {
+		obj.init.Logf("removing: %s", p)
+		// TODO: not sure we ever want to recurse with symlinks
+		//if obj.Recurse {
+		//	return false, os.RemoveAll(p) // dangerous ;)
+		//}
+		return false, os.Remove(p)
+	}
+
+	//if obj.State == FileStateExists ...
+
+	// want to change to a symlink but can't
+	if isInvalidSymlink && !obj.Force {
+		return false, fmt.Errorf("can't mutate to symlink without Force")
+	}
+
+	// remove old file/dir or wrong symlink before making new symlink
+	if isInvalidSymlink || err == nil {
+		obj.init.Logf("removing: %s", p)
+		if err := os.Remove(p); err != nil {
+			return false, err
+		}
+		// now make the symlink...
+	}
+
+	// make the symlink
+	obj.init.Logf("symlink %s %s", obj.Source, p)
+	return false, os.Symlink(obj.Source, p)
+}
+
+// selinuxCheckApply checks the file SELinux security context.
+func (obj *FileRes) selinuxCheckApply(ctx context.Context, apply bool) (bool, error) {
+	if obj.init.Debug {
+		obj.init.Logf("selinuxCheckApply(%t)", apply)
+	}
+
+	if obj.SELinux == nil { // nothing specified, we're done
+		return true, nil
+	}
+
+	// TODO: use https://github.com/opencontainers/selinux instead?
+	// use Lgetxattr for symlinks...
+	buf := make([]byte, 4096) // should be plenty for context
+	size, err := unix.Lgetxattr(obj.getPath(), "security.selinux", buf)
+	if err != nil && err != unix.ENODATA && err != unix.EOPNOTSUPP && err != unix.ENOTSUP {
+		return false, err
+	}
+
+	currentContext := ""
+	hasContext := false
+	if err == nil {
+		// SELinux contexts can be null terminated on disk
+		currentContext = string(bytes.Trim(buf[:size], "\x00"))
+		hasContext = true
+	}
+
+	if hasContext && *obj.SELinux == currentContext {
+		return true, nil
+	}
+	if !hasContext && *obj.SELinux == "" {
+		return true, nil
+	}
+
+	if !apply {
+		return false, nil
+	}
+
+	if *obj.SELinux == "" {
+		obj.init.Logf("removing selinux context")
+		err = unix.Lremovexattr(obj.getPath(), "security.selinux")
+	} else {
+		obj.init.Logf("selinux chcon: %s", *obj.SELinux)
+		// use Lsetxattr for symlinks...
+		err = unix.Lsetxattr(obj.getPath(), "security.selinux", []byte(*obj.SELinux), 0)
+	}
+
+	if err == unix.EOPNOTSUPP || err == unix.ENOTSUP {
+		return false, fmt.Errorf("setting SELinux context not supported on this filesystem")
+	}
+	if err != nil {
+		return false, err
+	}
+
+	return false, nil
 }
 
 // CheckApply checks the resource state and applies the resource if the bool
 // input is true. It returns error info and if the state check passed or not.
-func (obj *FileRes) CheckApply(apply bool) (bool, error) {
+func (obj *FileRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 	// NOTE: all send/recv change notifications *must* be processed before
 	// there is a possibility of failure in CheckApply. This is because if
 	// we fail (and possibly run again) the subsequent send->recv transfer
 	// might not have a new value to copy, and therefore we won't see this
 	// notification of change. Therefore, it is important to process these
 	// promptly, if they must not be lost, such as for cache invalidation.
-	if val, exists := obj.init.Recv()["Content"]; exists && val.Changed {
+	// NOTE: Modern send/recv doesn't really have this limitation anymore.
+	if val, exists := obj.init.Recv()["content"]; exists && val.Changed {
 		// if we received on Content, and it changed, invalidate the cache!
-		obj.init.Logf("contentCheckApply: invalidating sha256sum of `Content`")
+		obj.init.Logf("contentCheckApply: invalidating sha256sum of `content`")
 		obj.sha256sum = "" // invalidate!!
+	}
+
+	if err := ctx.Err(); err != nil {
+		return false, err
 	}
 
 	checkOK := true
 
 	// Run stateCheckApply before contentCheckApply, sourceCheckApply, and
 	// fragmentsCheckApply.
-	if c, err := obj.stateCheckApply(apply); err != nil {
+	if c, err := obj.stateCheckApply(ctx, apply); err != nil {
 		return false, err
 	} else if !c {
 		checkOK = false
 	}
-	if c, err := obj.contentCheckApply(apply); err != nil {
+	if c, err := obj.contentCheckApply(ctx, apply); err != nil {
 		return false, err
 	} else if !c {
 		checkOK = false
 	}
-	if c, err := obj.sourceCheckApply(apply); err != nil {
+	// sourceCheckApply runs symlinkCheckApply
+	if c, err := obj.sourceCheckApply(ctx, apply); err != nil {
 		return false, err
 	} else if !c {
 		checkOK = false
 	}
-	if c, err := obj.fragmentsCheckApply(apply); err != nil {
+	if c, err := obj.fragmentsCheckApply(ctx, apply); err != nil {
 		return false, err
 	} else if !c {
 		checkOK = false
 	}
 
-	if c, err := obj.chownCheckApply(apply); err != nil {
+	if c, err := obj.chownCheckApply(ctx, apply); err != nil {
 		return false, err
 	} else if !c {
 		checkOK = false
 	}
-	if c, err := obj.chmodCheckApply(apply); err != nil {
+	if c, err := obj.chmodCheckApply(ctx, apply); err != nil {
+		return false, err
+	} else if !c {
+		checkOK = false
+	}
+	if c, err := obj.selinuxCheckApply(ctx, apply); err != nil {
 		return false, err
 	} else if !c {
 		checkOK = false
@@ -1302,6 +1580,18 @@ func (obj *FileRes) Cmp(r engine.Res) error {
 	if obj.Purge != res.Purge {
 		return fmt.Errorf("the Purge option differs")
 	}
+	if obj.Symlink != res.Symlink {
+		return fmt.Errorf("the Symlink option differs")
+	}
+
+	if (obj.SELinux == nil) != (res.SELinux == nil) { // xor
+		return fmt.Errorf("the SELinux option differs")
+	}
+	if obj.SELinux != nil && res.SELinux != nil {
+		if *obj.SELinux != *res.SELinux {
+			return fmt.Errorf("the contents of SELinux differ")
+		}
+	}
 
 	return nil
 }
@@ -1319,6 +1609,15 @@ func (obj *FileUID) IFF(uid engine.ResUID) bool {
 		return false
 	}
 	return obj.path == res.path
+}
+
+// UIDHash returns the matching identity of this UID. Since IFF is a pure path
+// equality comparison, this satisfies the engine.ResUIDHashable contract, and
+// lets the autoedge matching find file candidates with a map lookup. This is
+// the UID type which shows up in large numbers, since every file resource also
+// asks about each of its parent directories when seeking automatic edges.
+func (obj *FileUID) UIDHash() string {
+	return obj.path
 }
 
 // FileResAutoEdges holds the state of the auto edge generator.
@@ -1381,7 +1680,7 @@ func (obj *FileResAutoEdges) Test(input []bool) bool {
 
 // AutoEdges generates a simple linear sequence of each parent directory from
 // the bottom up!
-func (obj *FileRes) AutoEdges() (engine.AutoEdge, error) {
+func (obj *FileRes) AutoEdges(ctx context.Context) (engine.AutoEdge, error) {
 	var data []engine.ResUID // store linear result chain here...
 	// don't use any memoization run in Init (this gets called before Init)
 	values := util.PathSplitFullReversed(obj.getPath())
@@ -1442,12 +1741,6 @@ func (obj *FileRes) UIDs() []engine.ResUID {
 //	return fmt.Errorf("not possible at the moment")
 //}
 
-// CollectPattern applies the pattern for collection resources.
-func (obj *FileRes) CollectPattern(pattern string) {
-	// XXX: currently the pattern for files can only override the Dirname variable :P
-	obj.Dirname = pattern // XXX: simplistic for now
-}
-
 // UnmarshalYAML is the custom unmarshal handler for this struct. It is
 // primarily useful for setting the defaults.
 func (obj *FileRes) UnmarshalYAML(unmarshal func(interface{}) error) error {
@@ -1480,7 +1773,7 @@ func (obj *FileRes) Copy() engine.CopyableRes {
 	for _, frag := range obj.Fragments {
 		fragments = append(fragments, frag)
 	}
-	return &FileRes{
+	res := &FileRes{
 		Path:      obj.Path,
 		Dirname:   obj.Dirname,
 		Basename:  obj.Basename,
@@ -1494,12 +1787,19 @@ func (obj *FileRes) Copy() engine.CopyableRes {
 		Recurse:   obj.Recurse,
 		Force:     obj.Force,
 		Purge:     obj.Purge,
+		Symlink:   obj.Symlink,
+		SELinux:   obj.SELinux,
 	}
+	if obj.SELinux != nil {
+		s := *obj.SELinux
+		res.SELinux = &s
+	}
+	return res
 }
 
 // Reversed returns the "reverse" or "reciprocal" resource. This is used to
 // "clean" up after a previously defined resource has been removed.
-func (obj *FileRes) Reversed() (engine.ReversibleRes, error) {
+func (obj *FileRes) Reversed(ctx context.Context) (engine.ReversibleRes, error) {
 	// NOTE: Previously, we did some more complicated management of reversed
 	// properties. For example, we could add mode and state even when they
 	// weren't originally specified. This code has now been simplified to
@@ -1543,7 +1843,7 @@ func (obj *FileRes) Reversed() (engine.ReversibleRes, error) {
 	// We do this whether we specified content with Content or w/ Fragments.
 	// The `res.State != FileStateAbsent` check is an optional optimization.
 	if ((obj.Content != nil || len(obj.Fragments) > 0) || obj.State == FileStateAbsent) && res.State != FileStateAbsent {
-		content, err := ioutil.ReadFile(obj.getPath())
+		content, err := os.ReadFile(obj.getPath())
 		if err != nil && !os.IsNotExist(err) {
 			return nil, errwrap.Wrapf(err, "could not read file for reversal storage")
 		}
@@ -1570,8 +1870,8 @@ func (obj *FileRes) Reversed() (engine.ReversibleRes, error) {
 	}
 
 	// There is a race if the operating system is adding/changing/removing
-	// the file between the ioutil.Readfile at the top and here. If there is
-	// a discrepancy between the two, then you might get an unexpected
+	// the file between the os.ReadFile at the top and here. If there is a
+	// discrepancy between the two, then you might get an unexpected
 	// reverse, but in reality, your perspective is pretty absurd. This is a
 	// user error, and not an issue we actually care about, afaict.
 	fileInfo, err := os.Stat(obj.getPath())
@@ -1581,6 +1881,7 @@ func (obj *FileRes) Reversed() (engine.ReversibleRes, error) {
 	res.Owner = ""
 	res.Group = ""
 	res.Mode = ""
+	res.SELinux = nil
 	if err == nil {
 		stUnix, ok := fileInfo.Sys().(*syscall.Stat_t)
 		// XXX: add a !ok error scenario or some alternative?
@@ -1596,6 +1897,20 @@ func (obj *FileRes) Reversed() (engine.ReversibleRes, error) {
 		// TODO: use Mode().String() when we support full rwx style mode specs!
 		if obj.Mode != "" {
 			res.Mode = fmt.Sprintf("%#o", fileInfo.Mode().Perm()) // 0400, 0777, etc.
+		}
+
+		if obj.SELinux != nil { // XXX: test this scenario
+			// use Lgetxattr for symlinks...
+			buf := make([]byte, 4096) // should be plenty for context
+			size, err := unix.Lgetxattr(obj.getPath(), "security.selinux", buf)
+			if err != nil && err != unix.ENODATA && err != unix.EOPNOTSUPP && err != unix.ENOTSUP {
+				return nil, errwrap.Wrapf(err, "could not get selinux context for reversal")
+			}
+			res.SELinux = new(string) // default to empty string if missing
+			if err == nil {
+				// SELinux contexts can be null terminated on disk
+				*res.SELinux = string(bytes.Trim(buf[:size], "\x00"))
+			}
 		}
 	}
 
@@ -1619,9 +1934,9 @@ func (obj *FileRes) GraphQueryAllowed(opts ...engine.GraphQueryableOption) error
 }
 
 // smartPath adds a trailing slash to the path if it is a directory.
-func smartPath(fileInfo os.FileInfo) string {
-	smartPath := fileInfo.Name() // absolute path
-	if fileInfo.IsDir() {
+func smartPath(dirEntry fs.DirEntry) string {
+	smartPath := dirEntry.Name() // absolute path
+	if dirEntry.IsDir() {
 		smartPath += "/" // add a trailing slash for dirs
 	}
 	return smartPath
@@ -1637,29 +1952,40 @@ type FileInfo struct {
 }
 
 // ReadDir reads a directory path, and returns a list of enhanced FileInfo's.
-func ReadDir(path string) ([]FileInfo, error) {
-	if !strings.HasSuffix(path, "/") { // dirs have trailing slashes
+func ReadDir(p string) ([]FileInfo, error) {
+	if !strings.HasSuffix(p, "/") { // dirs have trailing slashes
 		return nil, fmt.Errorf("path must be a directory")
 	}
-	output := []FileInfo{} // my file info
-	fileInfos, err := ioutil.ReadDir(path)
+	output := []FileInfo{}                  // my file info
+	files, err := os.ReadDir(path.Clean(p)) // clean for prettier errors
 	if os.IsNotExist(err) {
 		return output, err // return empty list
 	}
 	if err != nil {
 		return nil, err
 	}
-	for _, fi := range fileInfos {
-		abs := path + smartPath(fi)
-		rel, err := filepath.Rel(path, abs) // NOTE: calls Clean()
-		if err != nil {                     // shouldn't happen
+	for _, file := range files {
+		abs := p + smartPath(file)
+		rel, err := filepath.Rel(p, abs) // NOTE: calls Clean()
+		if err != nil {                  // shouldn't happen
 			return nil, errwrap.Wrapf(err, "unhandled error in ReadDir")
 		}
-		if fi.IsDir() {
+		if file.IsDir() {
 			rel += "/" // add a trailing slash for dirs
 		}
+
+		fileInfo, err := file.Info()
+		if os.IsNotExist(err) {
+			// File vanished before we could run Info() on it. This
+			// can happen if someone deletes a file in a directory
+			// while we're in the middle of running this. So skip...
+			continue
+		} else if err != nil {
+			return nil, errwrap.Wrapf(err, "unhandled error in FileInfo")
+		}
+
 		x := FileInfo{
-			FileInfo: fi,
+			FileInfo: fileInfo,
 			AbsPath:  abs,
 			RelPath:  rel,
 		}
@@ -1677,4 +2003,31 @@ func mapPaths(fileInfos []FileInfo) map[string]FileInfo {
 		paths[fileInfo.RelPath] = fileInfo
 	}
 	return paths
+}
+
+// printFiles is a pretty print function to make log messages less ugly.
+func printFiles(fileInfos map[string]FileInfo) string {
+	s := ""
+	keys := []string{}
+	for k := range fileInfos {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for i, k := range keys {
+		s += fileInfos[k].RelPath
+		if i < len(keys)-1 {
+			s += ", "
+		}
+	}
+	return s
+}
+
+// isInvalidSymlink is a helper which returns true if the error from os.Readlink
+// is the "invalid argument" error which happens if we try and read a normal
+// file. The comparison against os.ErrInvalid and errors.Is checks don't work.
+func isInvalidSymlink(err error) bool {
+	if perr, ok := err.(*os.PathError); ok {
+		return perr.Err == unix.EINVAL
+	}
+	return false
 }

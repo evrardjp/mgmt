@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,19 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 // Package fs implements a very simple and limited file system on top of etcd.
 package fs
@@ -47,8 +59,9 @@ func init() {
 }
 
 const (
-	// EtcdTimeout is the timeout to wait before erroring.
-	EtcdTimeout = 5 * time.Second // FIXME: chosen arbitrarily
+	// Scheme is the unique name for this filesystem type.
+	Scheme = "etcdfs"
+
 	// DefaultDataPrefix is the default path for data storage in etcd.
 	DefaultDataPrefix = "/_etcdfs/data"
 	// DefaultHash is the default hashing algorithm to use.
@@ -61,7 +74,8 @@ const (
 var (
 	IsPathSeparator = os.IsPathSeparator
 
-	// ErrNotImplemented is returned when something is not implemented by design.
+	// ErrNotImplemented is returned when something is not implemented by
+	// design.
 	ErrNotImplemented = errors.New("not implemented")
 
 	// ErrExist is returned when requested path already exists.
@@ -70,9 +84,10 @@ var (
 	// ErrNotExist is returned when we can't find the requested path.
 	ErrNotExist = os.ErrNotExist
 
-	ErrFileClosed   = errors.New("file is closed")
-	ErrFileReadOnly = errors.New("file handle is read only")
-	ErrOutOfRange   = errors.New("out of range")
+	ErrFileClosed    = errors.New("file is closed")
+	ErrFileReadOnly  = errors.New("file handle is read only")
+	ErrFileWriteOnly = errors.New("file handle is write only")
+	ErrOutOfRange    = errors.New("out of range")
 )
 
 // Fs is a specialized afero.Fs implementation for etcd. It implements a small
@@ -98,11 +113,24 @@ type Fs struct {
 	DataPrefix string // prefix of data storage (no trailing slashes)
 	Hash       string // eg: sha256
 
+	// Ctx is the context to use for all etcd operations. If this is nil,
+	// then context.Background() will be used as a fallback.
+	Ctx context.Context
+
 	Debug bool
 	Logf  func(format string, v ...interface{})
 
-	sb      *superBlock
-	mounted bool
+	// DeferMetadata, when true, makes sync() of the superblock a no-op that
+	// simply marks the metadata as dirty. Callers who perform many
+	// sequential mutations (e.g. a deploy that copyies a tree of files) can
+	// set this and call Flush() once at the end to collapse what would
+	// otherwise be one full superblock upload per operation into a single
+	// etcd round-trip.
+	DeferMetadata bool
+
+	sb        *superBlock
+	mounted   bool
+	metaDirty bool // superblock changed since last write to etcd
 }
 
 // superBlock is the metadata structure of everything stored outside of the data
@@ -123,11 +151,18 @@ func NewEtcdFs(client interfaces.Client, metadata string) afero.Fs {
 	}
 }
 
+// context returns the context to use for etcd operations. If Ctx is nil, it
+// falls back to context.Background().
+func (obj *Fs) context() context.Context {
+	if obj.Ctx != nil {
+		return obj.Ctx
+	}
+	return context.Background()
+}
+
 // get a number of values from etcd.
 func (obj *Fs) get(path string, opts ...etcd.OpOption) (map[string][]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), EtcdTimeout)
-	resp, err := obj.Client.Get(ctx, path, opts...)
-	cancel()
+	resp, err := obj.Client.Get(obj.context(), path, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -146,9 +181,7 @@ func (obj *Fs) get(path string, opts ...etcd.OpOption) (map[string][]byte, error
 
 // put a value into etcd.
 func (obj *Fs) set(path string, data []byte, opts ...etcd.OpOption) error {
-	ctx, cancel := context.WithTimeout(context.Background(), EtcdTimeout)
-	err := obj.Client.Set(ctx, path, string(data), opts...)
-	cancel()
+	err := obj.Client.Set(obj.context(), path, string(data), opts...)
 	if err != nil {
 		switch err {
 		case context.Canceled:
@@ -166,10 +199,7 @@ func (obj *Fs) set(path string, data []byte, opts ...etcd.OpOption) error {
 
 // txn runs a txn in etcd.
 func (obj *Fs) txn(ifcmps []etcd.Cmp, thenops, elseops []etcd.Op) (*etcd.TxnResponse, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), EtcdTimeout)
-	resp, err := obj.Client.Txn(ctx, ifcmps, thenops, elseops)
-	cancel()
-	return resp, err
+	return obj.Client.Txn(obj.context(), ifcmps, thenops, elseops)
 }
 
 // hash is a small helper that does the hashing for us.
@@ -189,16 +219,40 @@ func (obj *Fs) hash(input []byte) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// sync overwrites the superblock with whatever version we have stored.
+// sync overwrites the superblock with whatever version we have stored, unless
+// DeferMetadata is set. If that's true, the actual etcd write is deferred and
+// the caller is expected to call Flush() at the end of all the mutations.
 func (obj *Fs) sync() error {
+	if obj.DeferMetadata {
+		obj.metaDirty = true
+		return nil
+	}
+	return obj.writeSuperblock()
+}
+
+// writeSuperblock serializes and pushes the in-memory superblock to etcd.
+func (obj *Fs) writeSuperblock() error {
 	b := bytes.Buffer{}
 	e := gob.NewEncoder(&b)
-	err := e.Encode(&obj.sb) // pass with &
-	if err != nil {
+	if err := e.Encode(&obj.sb); err != nil { // pass with &
 		return errwrap.Wrapf(err, "gob failed to encode")
 	}
 	//base64.StdEncoding.EncodeToString(b.Bytes())
-	return obj.set(obj.Metadata, b.Bytes())
+	if err := obj.set(obj.Metadata, b.Bytes()); err != nil {
+		return err
+	}
+	obj.metaDirty = false
+	return nil
+}
+
+// Flush writes any pending metadata changes to etcd. It is meant to be called
+// at the end of a batch of mutations made with DeferMetadata set. If no
+// metadata is dirty, Flush is a no-op.
+func (obj *Fs) Flush() error {
+	if !obj.mounted || !obj.metaDirty {
+		return nil
+	}
+	return obj.writeSuperblock()
 }
 
 // mount downloads the initial cache of metadata, including the *file tree.
@@ -331,7 +385,7 @@ func (obj *Fs) find(absPath string) (*File, error) { // TODO: function naming?
 }
 
 // Name returns the name of this filesystem.
-func (obj *Fs) Name() string { return "etcdfs" }
+func (obj *Fs) Name() string { return Scheme }
 
 // URI returns a URI representing this particular filesystem.
 func (obj *Fs) URI() string {
@@ -390,8 +444,7 @@ func (obj *Fs) Mkdir(name string, perm os.FileMode) error {
 	f := &File{
 		fs:   obj,
 		Path: dirPath,
-		Mode: os.ModeDir,
-		// TODO: add perm to struct or let chmod below do it
+		Mode: os.ModeDir | perm, // add perm instead of Chmod below!
 	}
 
 	node, err := obj.find(parentPath)
@@ -415,12 +468,8 @@ func (obj *Fs) Mkdir(name string, perm os.FileMode) error {
 	// add to parent
 	node.Children = append(node.Children, f)
 
-	// push new file up if not on server, and then push up the metadata
-	if err := f.Sync(); err != nil {
-		return err
-	}
-
-	return obj.Chmod(name, perm)
+	return f.Sync()
+	//return obj.Chmod(name, perm) // not needed anymore
 }
 
 // MkdirAll creates a directory named path, along with any necessary parents,
@@ -498,17 +547,23 @@ func (obj *Fs) OpenFile(name string, flag int, perm os.FileMode) (afero.File, er
 	if err != nil {
 		return nil, err
 	}
-	f.readOnly = (flag == os.O_RDONLY)
+	if flag&os.O_CREATE > 0 && flag&os.O_EXCL > 0 && !chmod {
+		_ = f.Close()
+		return nil, &os.PathError{Op: "open", Path: name, Err: ErrExist}
+	}
+	f.readOnly = flag&(os.O_WRONLY|os.O_RDWR) == os.O_RDONLY
+	f.writeOnly = flag&(os.O_WRONLY|os.O_RDWR) == os.O_WRONLY
+	f.append = flag&os.O_APPEND > 0
 
 	if flag&os.O_APPEND > 0 {
 		if _, err := f.Seek(0, os.SEEK_END); err != nil {
-			f.Close()
+			_ = f.Close()
 			return nil, err
 		}
 	}
 	if flag&os.O_TRUNC > 0 && flag&(os.O_RDWR|os.O_WRONLY) > 0 {
 		if err := f.Truncate(0); err != nil {
-			f.Close()
+			_ = f.Close()
 			return nil, err
 		}
 	}
@@ -642,7 +697,7 @@ func (obj *Fs) RemoveAll(path string) error {
 	}
 
 	// Close directory, because windows won't remove opened directory.
-	fd.Close()
+	_ = fd.Close()
 
 	// Remove directory.
 	err1 := obj.Remove(path)
@@ -680,6 +735,9 @@ func (obj *Fs) Rename(oldname, newname string) error {
 	// remove possible trailing slashes
 	srcCleanPath := path.Clean(oldname)
 	dstCleanPath := path.Clean(newname)
+	if srcCleanPath == "/" {
+		return &os.LinkError{Op: "rename", Old: oldname, New: newname, Err: syscall.EINVAL}
+	}
 
 	src, err := obj.find(srcCleanPath) // get the file
 	if err != nil {
@@ -689,6 +747,9 @@ func (obj *Fs) Rename(oldname, newname string) error {
 	srcInfo, err := src.Stat()
 	if err != nil {
 		return err
+	}
+	if srcInfo.IsDir() && strings.HasPrefix(dstCleanPath, srcCleanPath+"/") {
+		return &os.LinkError{Op: "rename", Old: oldname, New: newname, Err: syscall.EINVAL}
 	}
 
 	srcParentPath, srcName := path.Split(srcCleanPath) // looking for this
@@ -800,8 +861,9 @@ func (obj *Fs) Chmod(name string, mode os.FileMode) error {
 		return err
 	}
 
-	f.Mode = f.Mode | mode // XXX: what is the correct way to do this?
-	return f.Sync()        // push up the changed metadata
+	f.Mode = f.Mode&os.ModeType | mode
+	// XXX: f.Sync() instead?
+	return obj.sync() // push up the changed metadata
 }
 
 // Chtimes changes the access and modification times of the named file, similar
@@ -825,7 +887,8 @@ func (obj *Fs) Chtimes(name string, atime time.Time, mtime time.Time) error {
 
 	f.ModTime = mtime
 	// TODO: add atime
-	return f.Sync() // push up the changed metadata
+	// XXX: f.Sync() instead?
+	return obj.sync() // push up the changed metadata
 }
 
 // PathSplit splits a path into an array of tokens excluding any trailing empty

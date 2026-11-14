@@ -1,0 +1,1437 @@
+// Mgmt
+// Copyright (C) James Shubin and the project contributors
+// Written by James Shubin <james@shubin.ca> and the project contributors
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
+
+// Package dage implements a DAG function engine.
+// TODO: can we rename this to something more interesting?
+package dage
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/purpleidea/mgmt/engine"
+	"github.com/purpleidea/mgmt/engine/local"
+	"github.com/purpleidea/mgmt/lang/funcs/ref"
+	"github.com/purpleidea/mgmt/lang/funcs/txn"
+	"github.com/purpleidea/mgmt/lang/interfaces"
+	"github.com/purpleidea/mgmt/lang/types"
+	"github.com/purpleidea/mgmt/pgraph"
+	"github.com/purpleidea/mgmt/util"
+	"github.com/purpleidea/mgmt/util/errwrap"
+)
+
+const (
+	// LogCatchableErrors determines whether catchable (sentinel) errors get
+	// logged (with a source position highlight) when they occur. Such an
+	// error might get caught downstream by the except operator, in which
+	// case the log message is arguably just noise, since providing the
+	// fallback value is the expected and healthy code path there. Set this
+	// to false to keep those errors silent. An uncaught error which arrives
+	// at a sink is fatal, and is always part of the final engine error,
+	// independent of this setting. Either way, we only log a failure when
+	// its error message changes, not on every event, since a failed
+	// function is called again whenever new input values arrive for it.
+	LogCatchableErrors = false // useful for debugging but normally confuses
+
+	// eventQueueWarnLimit is the queued event count above which we start
+	// warning that the engine can't keep up with the incoming events. The
+	// event queue is unbounded, so this turns silent memory growth into a
+	// diagnosable log message. We warn again on every doubling of the size.
+	eventQueueWarnLimit = 1024
+)
+
+// Engine implements a dag engine which lets us "run" a dag of functions, but
+// also allows us to modify it while we are running. The functions we support
+// can take one of two forms.
+//
+// 1) A function that supports the normal interfaces.Func API. It has Call() in
+// particular. Most functions are done with only this API.
+//
+// 2) A function which adds Stream() to support the StreamableFunc API. Some
+// functions use this along with Event() to notify of a new value.
+//
+// 3) A third *possible* (but not currently implemented API) would be one that
+// has Stream() but takes an Input and Output channel of values instead. This is
+// similar to what we previously had. Of note, every input must generate one
+// output value. (And more spontaneous output values are allowed as well.)
+//
+// Of note, functions that support Call() Can also cause an interrupt to happen.
+// It's not clear if this (3) option would be allowed to have a Call() method or
+// not, and if it would send interrupts on the Output channel.
+//
+// Of additional note, some functions also require the "GraphFunc" API to work
+// correctly. Use of this is rare.
+//
+// XXX: If this engine continuously receives function events at a higher speed
+// than it can process, then it will bog down and consume memory infinitely. We
+// now warn when the event queue exceeds a certain size, but we should consider
+// whether we'd ever want to turn that into a hard error.
+//
+// XXX: It's likely that this engine could be made even more efficient by more
+// cleverly traversing through the graph. Instead of a topological sort, we
+// could have some fancy map that determines what's remaining to go through, so
+// that when we "interrupt" we don't needlessly repeatedly visit nodes again and
+// trigger the "epoch skip" situations. We could also do the incremental
+// toposort so that we don't properly re-run the whole algorithm over and over
+// if we're always just computing changes.
+//
+// XXX: We could consider grouping multiple incoming events into a single
+// descent into the DAG. It's not clear if this kind of de-duplication would
+// break some "glitch-free" aspects or not. It would probably improve
+// performance but we'd have to be careful about how we did it.
+//
+// XXX: Respect the info().Pure and info().Memo fields somewhere...
+type Engine struct {
+	// Name is the name used for the instance of the engine and in the graph
+	// that is held within it.
+	Name string
+
+	Hostname string
+	Local    *local.API
+	World    engine.World
+
+	Debug bool
+	Logf  func(format string, v ...interface{})
+
+	// graph is the internal graph. It is only changed during interrupt.
+	graph *pgraph.Graph
+
+	// refCount keeps track of vertex and edge references across the entire
+	// graph.
+	refCount *ref.Count
+
+	// state stores some per-vertex (function) state
+	state map[interfaces.Func]*state
+
+	// wg counts every concurrent process here.
+	wg *sync.WaitGroup
+
+	// ag is the aggregation channel, which receives events from any of the
+	// StreamableFunc's that are running.
+	ag *util.InfiniteChan[*state]
+	//ag chan *state
+
+	// agWarned is the (atomic) queue size at which the next "event queue
+	// too big" warning fires. It doubles after each warning.
+	agWarned int64
+
+	// cancel can be called to shutdown Run() after it's started of course.
+	cancel func()
+
+	// streamChan is used to send the stream of tables to the outside world.
+	streamChan chan interfaces.Table
+
+	// lastTable stores the last table that was sent to streamChan.
+	lastTable interfaces.Table
+
+	// interrupt specifies that a txn "commit" just happened.
+	interrupt bool
+
+	// topoSort is the last topological sort we ran. It contains cached data
+	// about each vertex and is rebuild during interrupt.
+	topoSort []pgraph.Vertex
+
+	// ops is a list of operations to run during interrupt. This is usually
+	// a delete vertex, but others are possible.
+	ops []ops
+
+	// err contains the last error after a shutdown occurs.
+	err      error
+	errMutex *sync.Mutex // guards err
+
+	// graphvizCount keeps a running tally of how many graphs we've
+	// generated. This is useful for displaying a sequence (timeline) of
+	// graphs in a linear order.
+	graphvizCount int64
+
+	// graphvizDirectory stores the generated path for outputting graphviz
+	// files if one is not specified at runtime.
+	graphvizDirectory string
+}
+
+// Setup sets up the internal datastructures needed for this engine. We use this
+// earlier step before Run() because it's usually not called concurrently, which
+// makes it easier to catch the obvious errors before Run() runs in a goroutine.
+func (obj *Engine) Setup() error {
+	var err error
+	obj.graph, err = pgraph.NewGraph(obj.Name)
+	if err != nil {
+		return err
+	}
+	obj.state = make(map[interfaces.Func]*state)
+
+	obj.refCount = (&ref.Count{}).Init()
+
+	obj.wg = &sync.WaitGroup{}
+	obj.errMutex = &sync.Mutex{}
+
+	//obj.ag = make(chan *state, 1) // for group events
+	//obj.ag = make(chan *state) // normal no buffer, we can't drop any
+	obj.ag = util.NewInfiniteChan[*state]() // lock-free but unbounded
+	obj.agWarned = eventQueueWarnLimit
+
+	obj.streamChan = make(chan interfaces.Table)
+
+	obj.ops = []ops{}
+
+	return nil
+}
+
+// Run kicks off the function engine. You must add the initial graph via Txn
+// *before* you run this function.
+// XXX: try and fix the engine so you can run either Txn or Run first.
+func (obj *Engine) Run(ctx context.Context) error {
+	if obj.refCount == nil { // any arbitrary flag would be fine here
+		return fmt.Errorf("you must run Setup before first use")
+	}
+
+	//obj.wg = &sync.WaitGroup{} // in Setup
+	defer obj.wg.Wait()
+
+	// cancel to allow someone to shut everything down...
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	obj.cancel = cancel
+
+	//obj.streamChan = make(chan Table) // in Setup
+	defer close(obj.streamChan)
+
+	err := obj.process(ctx, 1) // start like this for now
+	obj.errAppend(err)
+	return err
+}
+
+// process could be combined with Run, but it is left separate in case we try to
+// build a recursive process operation that runs on a subgraph. It would need an
+// incoming graph argument as well, I would expect.
+func (obj *Engine) process(ctx context.Context, epoch int64) error {
+
+	start := 0
+	table := make(interfaces.Table) // map[interfaces.Func]types.Value
+
+Start:
+	for {
+		// If it's our first time, we want to interrupt, because we may
+		// not ever get any events otherwise, and we'd block at select
+		// waiting on obj.ag forever. Remember that the effect() of Txn
+		// causes an interrupt when we add the first graph in. This
+		// means we need to do the initial Txn before we startup here!
+		if obj.interrupt {
+			if obj.Debug {
+				obj.Logf("interrupt!")
+			}
+
+			// Handle delete (and other ops) first. We keep checking
+			// until this is empty, because a Cleanup operation
+			// running inside this loop could cause more vertices
+			// to be added, and so on.
+			for len(obj.ops) > 0 {
+				op := obj.ops[0]      // run in same order added
+				obj.ops = obj.ops[1:] // queue
+
+				if err := op.apply(ctx, table); err != nil {
+					return err
+				}
+			}
+
+			// Interrupt should only happen if we changed the graph
+			// shape, so recompute the topological sort right here.
+
+			// XXX: Can we efficiently edit the old topoSort by
+			// knowing the add/del? If the graph is shrinking, just
+			// remove those vertices from our current toposort. If
+			// the graph is growing, can we topo sort the subset and
+			// put them at the beginning of our old toposort? Is it
+			// guaranteed that "spawned nodes" will have earlier
+			// precedence than existing stuff? Can we be clever? Can
+			// we "float" anything upwards that's needed for the
+			// "toposort" by seeing what we're connected to, and
+			// sort all of that?
+			var err error
+			obj.topoSort, err = obj.graph.TopologicalSort()
+			if err != nil {
+				// programming error
+				return err
+			}
+
+			// Here we now rebuild the per-vertex cache so that the
+			// iterate loop avoids the repeated O(n) graph queries
+			// that would previously run on every event.
+			obj.cache()
+
+			// This interrupt must be set *after* the above deletes
+			// happen, because those can cause transactions to run,
+			// and those transactions run obj.effect() which resets
+			// this interrupt value back to true!
+			obj.interrupt = false // reset
+			start = 0             // restart the loop
+			//obj.lastTable = nil // XXX: structural change, always send?
+
+			goto PreIterate // skip waiting for a new event
+		}
+
+		if n := obj.graph.NumVertices(); n == 0 {
+			// If we're here, then the engine is done, because we'd
+			// block forever.
+			return nil
+		}
+		if obj.Debug {
+			obj.Logf("waiting for event...")
+		}
+		select {
+		case node, ok := <-obj.ag.Out:
+			if obj.Debug {
+				obj.Logf("got event: %v", node)
+			}
+			if !ok {
+				// TODO: If we don't have events, maybe shutdown?
+				panic("unexpected event channel shutdown")
+			}
+			if got, exists := obj.state[node.Func]; !exists || got != node {
+				// The vertex was deleted, but its Stream (which
+				// gets cancelled asynchronously) had an event
+				// already queued up. Skip the stale event.
+				if obj.Debug {
+					obj.Logf("stale event: %v", node)
+				}
+				continue
+			}
+			// topoIndex is 0 for a node that wasn't cached yet
+			start = node.topoIndex // get the node to start from...
+			// XXX: Should we ACK() here so that Stream can "make"
+			// the new value available to it's Call() starting now?
+
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
+		// We have at least one event now!
+
+	PreIterate:
+		valid := true // assume table is valid for this iteration
+
+	Iterate:
+		// Iterate down through the graph...
+		for i := start; i < len(obj.topoSort); i++ { // formerly: for _, v := range obj.topoSort
+			start = i // set for subsequent runs
+			v := obj.topoSort[i]
+			f, ok := v.(interfaces.Func)
+			if !ok {
+				panic("not a Func")
+			}
+			if obj.Debug {
+				obj.Logf("topo(%d): %p %+v", i, f, f)
+			}
+
+			node, exists := obj.state[f]
+			if !exists {
+				panic(fmt.Sprintf("node state missing: %s", f))
+			}
+
+			streamableFunc, isStreamable := f.(interfaces.StreamableFunc)
+			if isStreamable && !node.started { // don't start twice
+				// Each Stream gets its own child ctx, so that
+				// we can shut down a single function (eg: when
+				// its vertex is deleted) without taking down
+				// the whole engine along with it!
+				streamCtx, streamCancel := context.WithCancel(ctx)
+				node.streamCancel = streamCancel
+				streamDone := make(chan struct{})
+				node.streamDone = streamDone
+				obj.wg.Add(1)
+				go func() {
+					defer obj.wg.Done()
+					defer close(streamDone) // Stream has returned
+					defer streamCancel()    // it's safe to call this twice
+					// If Stream ever errors, then the whole
+					// function engine shuts down. This is
+					// different from Call, which can return
+					// a catchable (sentinel) error: those
+					// propagate down the graph in place of
+					// values, and can get caught by the
+					// except operator. If a new event comes
+					// in, the failed Call runs again, and
+					// it can revive itself. Any other Call
+					// error is permanent and fatal. Of
+					// course if Stream shuts down, we're
+					// nuked, so maybe we might want to
+					// retry... Maybe a resource could tweak
+					// the retry params for such a function?
+					// Or maybe a #pragma kind of directive
+					// thing above each function??? TBD...
+					err := streamableFunc.Stream(streamCtx)
+					if err == nil {
+						return
+					}
+					// Only this node was cancelled (it was
+					// deleted from the graph) but the rest
+					// of the engine lives on. That's a
+					// deliberate, healthy shutdown of this
+					// one function, so discard its error.
+					if streamCtx.Err() == context.Canceled && ctx.Err() == nil {
+						return
+					}
+					if isShutdown(ctx, err) { // engine exit
+						return
+					}
+					obj.errAppend(interfaces.HighlightHelper(f, obj.Logf, err))
+					obj.cancel() // error
+				}()
+				node.started = true
+			}
+
+			if node.epoch >= epoch { // we already did this one
+				if obj.Debug {
+					obj.Logf("epoch skip: %p %v", f, f)
+				}
+				continue
+			}
+
+			//incoming := obj.graph.IncomingGraphVertices(f) // []pgraph.Vertex
+			incoming := node.incoming // memoized!
+			sig := node.sig
+
+			// Is this vertex a catch-point for propagating upstream
+			// errors? Almost no function are: errors slide past the
+			// normal ones (we don't even run Call) and it's only
+			// the rare catch-point (the except operator) which can
+			// receive them as *types.ErrValue args, in its normal
+			// Call.
+			_, isExceptable := f.(interfaces.ExceptableFunc)
+
+			// Not all of the incoming edges have been added yet.
+			// We start by doing the "easy" count, and if it fails,
+			// we fall back on the slightly more expensive, and
+			// accurate count. This is because logical edges can be
+			// combined into a single physical edge. This happens if
+			// we have the same arg (a, b) passed to the same func.
+			// Previously: realEdgeCount(obj.graph.IncomingGraphEdges(f))
+			if n := len(sig.Ord); n != len(incoming) && n != node.realEdgeCount {
+				// If one of the nodes that we pull from has
+				// already failed, then we're going to fail too,
+				// no matter what the missing edges send us,
+				// unless we're a catch-point. So fail now, and
+				// don't skip. Otherwise the error would wait
+				// here until the missing edges get added, which
+				// might never happen. For example: the output
+				// of a func which builds a subgraph at runtime
+				// (eg: iter.map) only gets its value from that
+				// subgraph which never gets built if the input
+				// list fails, so the except operator which is
+				// downstream would never get to catch it.
+				for _, ff := range incoming {
+					fromNode, exists := obj.state[ff]
+					if !exists {
+						panic(fmt.Sprintf("missing node state: %s", ff))
+					}
+					if isExceptable || fromNode.failed == nil {
+						continue
+					}
+					if err := obj.failFrom(node, fromNode, epoch, table); err != nil {
+						return err // fatal, nobody caught it
+					}
+					continue Iterate
+				}
+
+				if obj.Debug {
+					obj.Logf("edge skip: %p %v", f, f)
+				}
+
+				valid = false
+				// If we skip here, we also want to skip any of
+				// the vertices that depend on this one. This is
+				// because the toposort might offer our children
+				// before a non-dependent node which might be
+				// the node that causes the interrupt which adds
+				// the edge which is currently not added yet.
+				continue
+			}
+
+			// if no incoming edges, no incoming data, so this noop's
+
+			si := &types.Type{
+				// input to functions are structs
+				Kind: types.KindStruct,
+				Map:  sig.Map,
+				Ord:  sig.Ord,
+			}
+			st := &types.StructValue{ // not NewStruct, see below
+				T: si,
+				V: make(map[string]types.Value, len(sig.Ord)),
+			}
+			// The above builds a struct without any fields
+			// populated (NewStruct would make zero values that we'd
+			// just overwrite) so we need to very carefully check if
+			// every field is received before we can safely send it
+			// downstream to an edge.
+			need := make(map[string]struct{}, len(sig.Ord)) // keys we need
+			for _, k := range sig.Ord {
+				need[k] = struct{}{}
+			}
+
+			for _, vv := range incoming {
+				ff, ok := vv.(interfaces.Func)
+				if !ok {
+					panic("not a Func")
+				}
+
+				// XXX: do we need a lock around reading obj.state?
+				fromNode, exists := obj.state[ff]
+				if !exists {
+					panic(fmt.Sprintf("missing node state: %s", ff))
+				}
+
+				// Node we pull from should be newer epoch than us!
+				if node.epoch >= fromNode.epoch {
+					//if obj.Debug {
+					//	obj.Logf("inner epoch skip: %p %v", f, f)
+					//	//obj.Logf("inner epoch skip: NODE(%p is %d): %v FROM(%p is %d) %v", f, node.epoch, f, ff, fromNode.epoch, ff)
+					//}
+					// Don't set non-valid here because if
+					// we have *two* FuncValue's that both
+					// interrupt, the first one will happen,
+					// and then the reset of the graph can
+					// be updated to the current epoch, but
+					// when the full graph is ready here, we
+					// would skip because of this bool!
+					//valid = false // don't do this!
+
+					// The mistake in this check is that if
+					// *any* of the incoming edges are not
+					// ready, then we skip it all. But one
+					// may not even be built yet. So it's a
+					// mess. So at least for now, use the
+					// below "is nil" check instead.
+					//continue Iterate
+				}
+
+				// The node we pull from failed instead of
+				// making a value. If we're not a catch-point,
+				// then we fail too. See failFrom.
+				failed := fromNode.failed
+				if failed != nil && !isExceptable {
+					if err := obj.failFrom(node, fromNode, epoch, table); err != nil {
+						return err // fatal, nobody caught it
+					}
+					continue Iterate
+				}
+
+				value := fromNode.result
+				if value == nil && failed == nil {
+					//if valid { // must be a programming err!
+					//panic(fmt.Sprintf("unexpected nil node result from: %s", ff))
+					//}
+					// We're reading from a node which got
+					// skipped because it didn't have all of
+					// its edges yet. (or a programming bug)
+					continue Iterate
+					// The fromNode epoch check above should
+					// make this additional check redundant.
+				}
+
+				// set each arg, since one value
+				// could get used for multiple
+				// function inputs (shared edge)
+				// Previously:
+				//edge := obj.graph.Adjacency()[ff][f]
+				//if edge == nil {
+				//	panic(fmt.Sprintf("edge is nil from `%s` to `%s`", ff, f))
+				//}
+				//args := edge.(*interfaces.FuncEdge).Args
+				args := node.incomingArgs[ff] // cached
+
+				for _, arg := range args {
+					// Skip edge is unused at this time.
+					//if arg == "" { // XXX: special skip edge!
+					//	// XXX: we could maybe detect this at the incoming loop above instead
+					//	continue
+					//}
+					// We're a catch-point, so we receive
+					// the upstream error in place of the
+					// value it would have sent. The type is
+					// the one the real value would have had
+					// so that any type comparisons still
+					// work as expected.
+					if failed != nil {
+						value = &types.ErrValue{
+							Typ: sig.Map[arg],
+							Err: failed,
+						}
+					}
+					// populate struct
+					if err := st.Set(arg, value); err != nil {
+						//panic(fmt.Sprintf("struct set failure on `%s` from `%s`: %v", node, fromNode, err))
+						keys := []string{}
+						for k := range st.Struct() {
+							keys = append(keys, k)
+						}
+						panic(fmt.Sprintf("struct set failure on `%s` from `%s`: %v, has: %v", node, fromNode, err, keys))
+					}
+					if _, exists := need[arg]; !exists {
+						keys := []string{}
+						for k := range st.Struct() {
+							keys = append(keys, k)
+						}
+						// could be either a duplicate or an unwanted field (edge name)
+						panic(fmt.Sprintf("unexpected struct key `%s` on `%s` from `%s`, has(%d): %v", arg, node, fromNode, len(keys), keys))
+					}
+					delete(need, arg)
+				}
+			}
+			// We just looped through all the incoming edges.
+
+			// XXX: Can we do the above bits -> struct, and then the
+			// struct -> list here, all in one faster step for perf?
+			args, err := interfaces.StructToCallableArgs(st) // []types.Value, error)
+			if err != nil {
+				panic(fmt.Sprintf("struct to callable failure on `%s`: %v, has: %v", node, err, st))
+			}
+
+			// Call the function.
+			if obj.Debug {
+				obj.Logf("call: %v", f)
+			}
+			//node.result, err = f.Call(ctx, args)
+			node.result, err = obj.call(ctx, args, f) // recovers!
+
+			if isShutdown(ctx, err) { // healthy shutdown
+				// Don't wrap this with the below highlighter!
+				return ctx.Err()
+			}
+			if err == interfaces.ErrInterrupt {
+				// re-run topological sort... at the top!
+
+				obj.interrupt = true // should be set in obj.effect
+				continue Start
+			}
+			if obj.interrupt {
+				// We have a function which caused an interrupt,
+				// but which didn't return ErrInterrupt. This is
+				// a programming error by the function.
+				return fmt.Errorf("function didn't interrupt correctly: %s", node)
+			}
+			if err != nil && !interfaces.IsSentinelError(err) {
+				// Any error is permanent and instantly fatal,
+				// unless the function explicitly marked it as
+				// catchable by wrapping it as a SentinelError.
+				return interfaces.HighlightHelper(f, obj.Logf, err)
+			}
+			if err != nil {
+				// The function returned a catchable (sentinel)
+				// error. This is not (yet) fatal. We store the
+				// error and propagate it downstream in place of
+				// a real value, so that a downstream
+				// catch-point (the except operator) has a
+				// chance to catch it and provide a fallback
+				// value. If it arrives at a sink (no outgoing
+				// edges) then it's fatal since nobody was able
+				// to catch it.
+				if s := err.Error(); node.failed == nil || node.failedStr != s {
+					// Wrap it with the source position.
+					// This also logs, so only do it on a
+					// change to avoid spamming on every new
+					// event.
+					logf := obj.Logf
+					if !LogCatchableErrors { // silence it
+						logf = func(format string, v ...interface{}) {}
+					}
+					node.failed = interfaces.HighlightHelper(f, logf, err)
+					node.failedStr = s
+					node.failedSrc = f
+				}
+				node.result = nil
+				node.epoch = epoch         // nothing else to do this epoch
+				table[f] = node.errValue() // reset any stale value
+				if !node.hasOutgoing {
+					obj.logFatalFailure(node)
+					return node.failed // fatal, nobody caught it
+				}
+				continue
+			}
+			node.failed = nil // reset after a successful call
+			node.failedStr = ""
+			node.failedSrc = nil
+
+			// Previously: len(obj.graph.OutgoingGraphVertices(f)) > 0
+			if node.result == nil && node.hasOutgoing {
+				// XXX: this check may not work if we have our
+				// "empty" named edges added on here...
+				return fmt.Errorf("unexpected nil value from node: %s", node)
+			}
+			old := node.epoch
+			node.epoch = epoch // store it after a successful call
+			if obj.Debug {
+				obj.Logf("set epoch(%d) to %d: %p %v", old, epoch, f, f)
+			}
+
+			// XXX: Should we check here to see if we can shutdown?
+			// For a given node, if Stream is not running, and no
+			// incoming nodes are still open, and if we're Pure, and
+			// we can memoize, then why not shutdown this node and
+			// remove it from the graph? Run a graph interrupt to
+			// delete this vertex. This will run Cleanup. Is it safe
+			// to also delete the table entry? Is it needed or used?
+
+			if node.result == nil {
+				// got an end of line vertex that would normally
+				// send a dummy value... don't store in table...
+				continue
+			}
+			table[f] = node.result // build up our table of values
+
+		} // end of single graph traversal
+
+		// XXX: implement epoch rollover by relabelling all nodes
+		epoch++ // increment it after a successful traversal
+		if obj.Debug {
+			obj.Logf("epoch(%d) increment to %d", epoch-1, epoch)
+		}
+
+		if !valid { // don't send table yet, it's not complete
+			continue
+		}
+
+		// Send a table of the complete set of values, which should all
+		// have the same epoch, and send it as an event to the outside.
+		// We need a copy of the map since we'll keep modifying it now.
+		// The table must get cleaned up over time to be consistent. It
+		// currently happens in interrupt as a result of a node delete.
+
+		// NOTE: increment epoch above b/c it's needed for table skip!
+		if obj.lastTable != nil && obj.lastTable.Cmp(table) == nil {
+			if obj.Debug || true { // leave on for initial testing
+				obj.Logf("table skip")
+			}
+			continue
+		}
+		cp := table.Copy()
+		if obj.Debug {
+			obj.Logf("table:")
+			for k, v := range cp {
+				obj.Logf("table[%p %v]: %p %+v", k, k, v, v)
+			}
+		}
+
+		select {
+		case obj.streamChan <- cp:
+			obj.lastTable = cp // store new table
+
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
+	} // end big for loop
+}
+
+// failFrom makes this node fail with the error of a node that it pulls from,
+// without running Call, so that the error keeps propagating downstream in place
+// of a value. If it arrives at a sink (no outgoing edges) then nobody was able
+// to catch it, and it's fatal, so this returns it. Otherwise it returns nil.
+func (obj *Engine) failFrom(node, fromNode *state, epoch int64, table interfaces.Table) error {
+	node.failed = fromNode.failed
+	node.failedStr = fromNode.failedStr
+	node.failedSrc = fromNode.failedSrc
+	node.result = nil
+	node.epoch = epoch                 // nothing else to do this epoch
+	table[node.Func] = node.errValue() // reset any stale value
+	if !node.hasOutgoing {
+		obj.logFatalFailure(node)
+		return node.failed
+	}
+	return nil
+}
+
+// cache refreshes the computed state values from the current graph. This runs
+// during interrupt. It does a single O(n) pass over the adjacency map to build
+// a reverse-adjacency index, and then one O(n) pass to populate the node data.
+func (obj *Engine) cache() {
+	adjacency := obj.graph.Adjacency() // v1, v2 -> edge
+	// reverse-adjacency: v2 -> []{v1, edge}, in one O(n) pass
+	type rev struct {
+		v1   interfaces.Func
+		edge *interfaces.FuncEdge
+	}
+	incomingCache := make(map[pgraph.Vertex][]rev)
+	for v1, m := range adjacency {
+		f1, ok := v1.(interfaces.Func)
+		if !ok {
+			panic("not a Func")
+		}
+		for v2, edge := range m {
+			fe, ok := edge.(*interfaces.FuncEdge)
+			if !ok {
+				panic("edge is not a FuncEdge")
+			}
+			incomingCache[v2] = append(incomingCache[v2], rev{v1: f1, edge: fe})
+		}
+	}
+
+	for i, v := range obj.topoSort {
+		f, ok := v.(interfaces.Func)
+		if !ok {
+			panic("not a Func")
+		}
+		state, exists := obj.state[f]
+		if !exists {
+			panic(fmt.Sprintf("node state missing: %s", f))
+		}
+
+		state.topoIndex = i
+
+		state.incoming = make([]interfaces.Func, len(incomingCache[v]))
+		state.incomingArgs = make(map[interfaces.Func][]string) // map Func -> (*FuncEdge).Args
+
+		// Count the "logical" edges. We have shared edges which
+		// represent more than one value, when the same value is passed
+		// more than once to the same func, so each arg name in an edge
+		// counts as one logical edge. See realEdgeCount for reference.
+		total := 0
+		for i, xm := range incomingCache[v] {
+			state.incoming[i] = xm.v1
+			state.incomingArgs[xm.v1] = xm.edge.Args
+			total += len(xm.edge.Args)
+		}
+		state.realEdgeCount = total
+
+		state.hasOutgoing = len(adjacency[v]) > 0
+	}
+}
+
+// event is ultimately called from a function to trigger an event in the engine.
+// We'd like for this to never block, because that makes it much easier to
+// prevent deadlocks in some tricky functions. On the other side, we don't want
+// to necessarily merge events if we want to ensure each sent event gets seen in
+// order. A buffered channel would accomplish this, but then it would need a
+// fixed size, and if it reached the capacity we'd be in the deadlock situation
+// again. Instead, we use a buffered channel of size one, and a queue of data
+// which stores the event information.
+func (obj *Engine) event(ctx context.Context, state *state) error {
+	//f := state.Func // for reference, how to get the Vertex/Func pointer!
+
+	// The queue is unbounded, so if events arrive faster than we process
+	// them, we consume memory infinitely. Warn if it keeps on growing. This
+	// can run concurrently, hence the atomics. It's not exact (two senders
+	// can race past the same threshold) but it's only a warning.
+	if l := int64(obj.ag.Len()); l >= eventQueueWarnLimit {
+		if next := atomic.LoadInt64(&obj.agWarned); l >= next && atomic.CompareAndSwapInt64(&obj.agWarned, next, l*2) {
+			obj.Logf("engine event queue has %d pending events, %s is falling behind", l, obj.Name)
+		}
+	}
+
+	select {
+	case obj.ag.In <- state: // buffered to avoid blocking issues
+		// tell function engine who had an event... deal with it before
+		// we get to handle subsequent ones...
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	return nil
+}
+
+// effect runs at the end of the transaction, but before it returns.
+// XXX: we don't need delta ops if we can just plug into our implementations of
+// the addVertex and deleteVertex ...
+func (obj *Engine) effect( /*delta *DeltaOps*/ ) error {
+	obj.interrupt = true
+
+	// The toposort runs in interrupt. We could save `delta` if it's needed.
+	//var err error
+	//obj.topoSort, err = obj.graph.TopologicalSort()
+	//return err
+	return nil
+}
+
+// call is a helper to handle the recovering if needed from a function call.
+// NOTE: We moved f to be the last arg because golint complains ctx isn't first.
+func (obj *Engine) call(ctx context.Context, args []types.Value, f interfaces.Func) (result types.Value, reterr error) {
+	defer func() {
+		// catch programming errors
+		if r := recover(); r != nil {
+			obj.Logf("panic in process: %+v", r)
+			obj.Logf("panic function(%T): %+v", f, f)
+			obj.Logf("panic args(%d): %+v", len(args), args)
+			reterr = interfaces.HighlightHelper(f, obj.Logf, fmt.Errorf("panic in process: %+v", r))
+		}
+	}()
+
+	return f.Call(ctx, args)
+}
+
+// Stream returns a channel that you can follow to get aggregated graph events.
+// Do not block reading from this channel as you can hold up the entire engine.
+func (obj *Engine) Stream() <-chan interfaces.Table {
+	return obj.streamChan
+}
+
+// Err will contain the last error when Stream shuts down. It waits for all the
+// running processes to exit before it returns.
+func (obj *Engine) Err() error {
+	obj.wg.Wait()
+	return obj.err
+}
+
+// Txn returns a transaction that is suitable for adding and removing from the
+// graph. You must run Setup before this method is called.
+func (obj *Engine) Txn() interfaces.Txn {
+	if obj.refCount == nil {
+		panic("you must run Setup before first use")
+	}
+	// The very first initial Txn must have a wait group to make sure if we
+	// shutdown (in error) that we can Reverse things before the Lock/Unlock
+	// loop shutsdown.
+	//var free func()
+	//if !obj.firstTxn {
+	//	obj.firstTxn = true
+	//	obj.wgTxn.Add(1)
+	//	free = func() {
+	//		obj.wgTxn.Done()
+	//	}
+	//}
+	return (&txn.GraphTxn{
+		Post:     obj.effect,
+		Lock:     func() {}, // noop for now
+		Unlock:   func() {}, // noop for now
+		GraphAPI: obj,
+		RefCount: obj.refCount, // reference counting
+		//FreeFunc: free,
+	}).Init()
+}
+
+// addVertex is the lockless version of the AddVertex function. This is needed
+// so that AddEdge can add two vertices within the same lock.
+func (obj *Engine) addVertex(f interfaces.Func) error {
+	if _, exists := obj.state[f]; exists {
+		// don't err dupes, because it makes using the AddEdge API yucky
+		return nil
+	}
+
+	// add some extra checks for easier debugging
+	if f == nil {
+		return fmt.Errorf("missing func")
+	}
+	if f.Info() == nil {
+		return fmt.Errorf("missing func info for node: %s", f)
+	}
+	sig := f.Info().Sig
+	if sig == nil {
+		return fmt.Errorf("missing func sig for node: %s", f)
+	}
+	if sig.Kind != types.KindFunc {
+		return fmt.Errorf("kind is not func for node: %s", f)
+	}
+	if err := f.Validate(); err != nil {
+		return errwrap.Wrapf(err, "did not Validate node: %s", f)
+	}
+
+	txn := obj.Txn()
+
+	// This is one of the two places where we modify this map. To avoid
+	// concurrent writes, we only do this when we're locked! Anywhere that
+	// can read where we are locked must have a mutex around it or do the
+	// lookup when we're in an unlocked state.
+	node := &state{
+		Func: f,
+		name: f.String(), // cache a name to avoid locks
+
+		txn: txn,
+
+		//running: false,
+		//epoch: 0,
+
+		sig: sig, // cache for performance
+	}
+
+	init := &interfaces.Init{
+		Hostname: obj.Hostname,
+		Event: func(ctx context.Context) error {
+			return obj.event(ctx, node) // pass state to avoid search
+		},
+		Txn:   node.txn,
+		Local: obj.Local,
+		World: obj.World,
+		Debug: obj.Debug,
+		Logf: func(format string, v ...interface{}) {
+			// safe Logf in case f.String contains %? chars...
+			s := f.String() + ": " + fmt.Sprintf(format, v...)
+			obj.Logf("%s", s)
+		},
+	}
+
+	op := &addVertex{
+		f: f,
+		fn: func(ctx context.Context) error {
+			return f.Init(init) // TODO: should this take a ctx?
+		},
+	}
+	obj.ops = append(obj.ops, op) // mark for cleanup during interrupt
+
+	obj.state[f] = node // do this here b/c we rely on knowing it in real-time
+
+	obj.graph.AddVertex(f) // Txn relies on this happening now while it runs.
+	return nil
+}
+
+// AddVertex is the thread-safe way to add a vertex. You will need to call the
+// engine Lock method before using this and the Unlock method afterwards.
+func (obj *Engine) AddVertex(f interfaces.Func) error {
+	// No mutex needed here since this func runs in a non-concurrent Txn.
+
+	if obj.Debug {
+		obj.Logf("Engine:AddVertex: %p %s", f, f)
+	}
+
+	return obj.addVertex(f) // lockless version
+}
+
+// AddEdge is the thread-safe way to add an edge. You will need to call the
+// engine Lock method before using this and the Unlock method afterwards. This
+// will automatically run AddVertex on both input vertices if they are not
+// already part of the graph. You should only create DAG's as this function
+// engine cannot handle cycles and this method will error if you cause a cycle.
+func (obj *Engine) AddEdge(f1, f2 interfaces.Func, fe *interfaces.FuncEdge) error {
+	// No mutex needed here since this func runs in a non-concurrent Txn.
+
+	if obj.Debug {
+		obj.Logf("Engine:AddEdge %p %s: %p %s -> %p %s", fe, fe, f1, f1, f2, f2)
+	}
+
+	if obj.Debug { // not needed unless we have buggy graph building code
+		// safety check to avoid cycles
+		g := obj.graph.Copy()
+		//g.AddVertex(f1)
+		//g.AddVertex(f2)
+		g.AddEdge(f1, f2, fe)
+		if _, err := g.TopologicalSort(); err != nil {
+			return err // not a dag
+		}
+		// if we didn't cycle, we can modify the real graph safely...
+	}
+
+	// Does the graph already have these nodes in it?
+	//hasf1 := obj.graph.HasVertex(f1)
+	//hasf2 := obj.graph.HasVertex(f2)
+
+	if err := obj.addVertex(f1); err != nil { // lockless version
+		return err
+	}
+	if err := obj.addVertex(f2); err != nil {
+		// rollback f1 on error of f2
+		_ = obj.deleteVertex(f1) // ignore any error
+		return err
+	}
+
+	// If f1 doesn't exist, let f1 (or it's incoming nodes) get the notify.
+	// If f2 is new, then it should get a new notification unless f1 is new.
+	// But there's no guarantee we didn't AddVertex(f2); AddEdge(f1, f2, e),
+	// so resend if f1 already exists. Otherwise it's not a new notification.
+	// previously: `if hasf1 && !hasf2`
+	//if hasf1 {
+	//	//obj.resend[f2] = struct{}{} // resend notification to me
+	//}
+
+	obj.graph.AddEdge(f1, f2, fe) // replaces any existing edge here
+
+	// This shouldn't error, since the test graph didn't find a cycle. But
+	// we don't really need to do it, since the interrupt will run it too.
+	if obj.Debug { // not needed unless we have buggy graph building code
+		if _, err := obj.graph.TopologicalSort(); err != nil {
+			// programming error
+			panic(err) // not a dag
+		}
+	}
+
+	return nil
+}
+
+// deleteVertex is the lockless version of the DeleteVertex function. This is
+// needed so that AddEdge can add two vertices within the same lock. It needs
+// deleteVertex so it can rollback the first one if the second addVertex fails.
+func (obj *Engine) deleteVertex(f interfaces.Func) error {
+	node, exists := obj.state[f]
+	if !exists {
+		return fmt.Errorf("vertex %p %s doesn't exist", f, f)
+	}
+
+	// This is one of the two places where we modify this map. To avoid
+	// concurrent writes, we only do this when we're locked! Anywhere that
+	// can read where we are locked must have a mutex around it or do the
+	// lookup when we're in an unlocked state.
+
+	op := &deleteVertex{
+		f: f,
+		fn: func(ctx context.Context) error {
+			// Stop the running Stream (if any) first, so that the
+			// function is quiescent by the time Cleanup runs. The
+			// goroutine discards any error from this cancellation.
+			// We wait for it to return so that if an `if` branch
+			// gets swapped out and back in again, then this waits
+			// so that we don't run the new Init or Stream before
+			// the old Stream has finished running which would race!
+			if node.streamCancel != nil {
+				node.streamCancel()
+				node.streamCancel = nil
+				<-node.streamDone // wait for stream to return
+			}
+			// XXX: do we run f.Done() first ? Did it run elsewhere?
+			cleanableFunc, ok := f.(interfaces.CleanableFunc)
+			if !ok {
+				return nil
+			}
+			return cleanableFunc.Cleanup(ctx)
+		},
+	}
+	obj.ops = append(obj.ops, op) // mark for cleanup during interrupt
+
+	delete(obj.state, f) // do this here b/c we rely on knowing it in real-time
+
+	obj.graph.DeleteVertex(f) // Txn relies on this happening now while it runs.
+	return nil
+}
+
+// DeleteVertex is the thread-safe way to delete a vertex. You will need to call
+// the engine Lock method before using this and the Unlock method afterwards.
+func (obj *Engine) DeleteVertex(f interfaces.Func) error {
+	// No mutex needed here since this func runs in a non-concurrent Txn.
+
+	if obj.Debug {
+		obj.Logf("Engine:DeleteVertex: %p %s", f, f)
+	}
+
+	return obj.deleteVertex(f) // lockless version
+}
+
+// DeleteEdge is the thread-safe way to delete an edge. You will need to call
+// the engine Lock method before using this and the Unlock method afterwards.
+func (obj *Engine) DeleteEdge(fe *interfaces.FuncEdge) error {
+	// No mutex needed here since this func runs in a non-concurrent Txn.
+
+	if obj.Debug {
+		f1, f2, found := obj.graph.LookupEdge(fe)
+		if found {
+			obj.Logf("Engine:DeleteEdge: %p %s -> %p %s", f1, f1, f2, f2)
+		} else {
+			obj.Logf("Engine:DeleteEdge: not found %p %s", fe, fe)
+		}
+	}
+
+	// Don't bother checking if edge exists first and don't error if it
+	// doesn't because it might have gotten deleted when a vertex did, and
+	// so there's no need to complain for nothing.
+	obj.graph.DeleteEdge(fe)
+
+	return nil
+}
+
+// HasVertex is the thread-safe way to check if a vertex exists in the graph.
+// You will need to call the engine Lock method before using this and the Unlock
+// method afterwards.
+func (obj *Engine) HasVertex(f interfaces.Func) bool {
+	// No mutex needed here since this func runs in a non-concurrent Txn.
+
+	return obj.graph.HasVertex(f)
+}
+
+// LookupEdge is the thread-safe way to check which vertices (if any) exist
+// between an edge in the graph. You will need to call the engine Lock method
+// before using this and the Unlock method afterwards.
+func (obj *Engine) LookupEdge(fe *interfaces.FuncEdge) (interfaces.Func, interfaces.Func, bool) {
+	// No mutex needed here since this func runs in a non-concurrent Txn.
+
+	v1, v2, found := obj.graph.LookupEdge(fe)
+	if !found {
+		return nil, nil, found
+	}
+	f1, ok := v1.(interfaces.Func)
+	if !ok {
+		panic("not a Func")
+	}
+	f2, ok := v2.(interfaces.Func)
+	if !ok {
+		panic("not a Func")
+	}
+	return f1, f2, found
+}
+
+// FindEdge is the thread-safe way to check which edge (if any) exists between
+// two vertices in the graph. This is an important method in edge removal,
+// because it's what you really need to know for DeleteEdge to work. Requesting
+// a specific deletion isn't very sensical in this library when specified as the
+// edge pointer, since we might replace it with a new edge that has new arg
+// names. Instead, use this to look up what relationship you want, and then
+// DeleteEdge to remove it. You will need to call the engine Lock method before
+// using this and the Unlock method afterwards.
+func (obj *Engine) FindEdge(f1, f2 interfaces.Func) *interfaces.FuncEdge {
+	// No mutex needed here since this func runs in a non-concurrent Txn.
+
+	edge := obj.graph.FindEdge(f1, f2)
+	if edge == nil {
+		return nil
+	}
+	fe, ok := edge.(*interfaces.FuncEdge)
+	if !ok {
+		panic("edge is not a FuncEdge")
+	}
+
+	return fe
+}
+
+// Graph returns a copy of the contained graph.
+func (obj *Engine) Graph() *pgraph.Graph {
+	// No mutex needed here since this func runs in a non-concurrent Txn.
+
+	return obj.graph.Copy()
+}
+
+// ExecGraphviz writes out the diagram of a graph to be used for visualization
+// and debugging. You must not modify the graph (eg: during Lock) when calling
+// this method.
+func (obj *Engine) ExecGraphviz(ctx context.Context, dir string) error {
+	// No mutex needed here since this func runs in a non-concurrent Txn.
+
+	// No mutex is needed at this time because we only run this in txn's and
+	// it should only be run with debugging enabled. Bring your own mutex.
+	//obj.graphvizMutex.Lock()
+	//defer obj.graphvizMutex.Unlock()
+
+	obj.graphvizCount++ // increment
+
+	if dir == "" {
+		dir = obj.graphvizDirectory
+	}
+	if dir == "" { // XXX: hack for ergonomics
+		d := time.Now().UnixMilli()
+		dir = fmt.Sprintf("/tmp/dage-graphviz-%s-%d/", obj.Name, d)
+		obj.graphvizDirectory = dir
+	}
+	if !strings.HasSuffix(dir, "/") {
+		return fmt.Errorf("dir must end with a slash")
+	}
+
+	if err := os.MkdirAll(dir, 0750); err != nil {
+		return err
+	}
+
+	//dashedEdges, err := pgraph.NewGraph("dashedEdges")
+	//if err != nil {
+	//	return err
+	//}
+	//for _, v1 := range obj.graph.Vertices() {
+	//	// if it's a ChannelBasedSinkFunc...
+	//	if cb, ok := v1.(*structs.ChannelBasedSinkFunc); ok {
+	//		// ...then add a dashed edge to its output
+	//		dashedEdges.AddEdge(v1, cb.Target, &pgraph.SimpleEdge{
+	//			Name: "channel", // secret channel
+	//		})
+	//	}
+	//	// if it's a ChannelBasedSourceFunc...
+	//	if cb, ok := v1.(*structs.ChannelBasedSourceFunc); ok {
+	//		// ...then add a dashed edge from its input
+	//		dashedEdges.AddEdge(cb.Source, v1, &pgraph.SimpleEdge{
+	//			Name: "channel", // secret channel
+	//		})
+	//	}
+	//}
+
+	gv := &pgraph.Graphviz{
+		Name:     obj.graph.GetName(),
+		Filename: fmt.Sprintf("%s/%d.dot", dir, obj.graphvizCount),
+		Graphs: map[*pgraph.Graph]*pgraph.GraphvizOpts{
+			obj.graph: nil,
+			//dashedEdges: {
+			//	Style: "dashed",
+			//},
+		},
+	}
+
+	if err := gv.Exec(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+// errAppend is a simple helper function.
+func (obj *Engine) errAppend(err error) {
+	obj.errMutex.Lock()
+	obj.err = errwrap.Append(obj.err, err)
+	obj.errMutex.Unlock()
+}
+
+// logFatalFailure emits the original source highlight for an uncaught catchable
+// error. Caught errors stay silent when LogCatchableErrors is false.
+func (obj *Engine) logFatalFailure(node *state) {
+	if LogCatchableErrors {
+		return
+	}
+	if node.failedSrc == nil || node.failedStr == "" {
+		return
+	}
+
+	// The returned error is ignored because node.failed already contains
+	// the source byline that should be returned to callers.
+	_ = interfaces.HighlightHelper(node.failedSrc, obj.Logf, fmt.Errorf("%s", node.failedStr))
+}
+
+// state tracks some internal vertex-specific state information.
+type state struct {
+	Func interfaces.Func
+	name string // cache a name here for safer concurrency
+
+	txn interfaces.Txn // API of GraphTxn struct to pass to each function
+
+	// started is true if this is a StreamableFunc, and Stream was started.
+	started bool
+
+	// epoch represents the "iteration count" through the graph. All values
+	// in a returned table should be part of the same epoch. This guarantees
+	// that they're all consistent with respect to each other.
+	epoch int64 // if this rolls over, we've been running for too many years
+
+	// result is the latest output from calling this function.
+	result types.Value
+
+	// streamCancel cancels the per-node context that Stream was started
+	// with. It lets us shut down a single function (eg: when its vertex is
+	// deleted) without stopping the whole engine.
+	streamCancel func()
+
+	// streamDone is closed once the Stream goroutine has returned. This is
+	// what lets a vertex deletion wait for that Stream to actually finish.
+	streamDone chan struct{}
+
+	// failed is set when the last Call of this function returned an error
+	// which was explicitly marked as catchable (a SentinelError) or when an
+	// upstream error propagated through us. It travels downstream along the
+	// edges in place of a real value, until either a catch-point (the
+	// except operator) catches it, or it arrives at a sink (a vertex with
+	// no outgoing edges) where it is fatal. It's also fatal if a statement
+	// reads it from the table, see errValue. It contains position info. Any
+	// other (permanent) Call error shuts the engine down instantly instead.
+	failed error
+
+	// failedStr caches the raw error string of the last failure, so that we
+	// only log (and re-wrap) an error when it actually changes.
+	failedStr string
+
+	// failedSrc is the function that originally produced failed. This is
+	// used to log the correct source highlight if failed reaches a sink.
+	failedSrc interfaces.Func
+
+	// Cache everything the iterate loop needs for this vertex. These values
+	// are built once per interrupt (when the graph shape changes) and are
+	// reused on every subsequent event until the next interrupt.
+	sig           *types.Type
+	topoIndex     int
+	incoming      []interfaces.Func
+	incomingArgs  map[interfaces.Func][]string
+	realEdgeCount int
+	hasOutgoing   bool
+}
+
+// String implements the fmt.Stringer interface for pretty printing!
+func (obj *state) String() string {
+	if obj.name != "" {
+		return obj.name
+	}
+
+	return obj.Func.String()
+}
+
+// errValue returns the value which we store in the table in place of a real one
+// when we failed. Funcs never read the table, but the statements do, and one of
+// them might read us directly even though we're not a sink because some other
+// func that we feed caught the error. That statement didn't catch it, so this
+// lets it fail with the very same error instead of reading a missing value.
+func (obj *state) errValue() types.Value {
+	return &types.ErrValue{
+		Typ: obj.sig.Out,
+		Err: obj.failed,
+	}
+}
+
+// ops is either an addVertex or deleteVertex operation.
+type ops interface {
+	// apply runs this operation during an engine interrupt. It must also
+	// update the table of output values to match the change.
+	apply(ctx context.Context, table interfaces.Table) error
+}
+
+// addVertex is one of the "ops" that are possible.
+type addVertex struct {
+	f  interfaces.Func
+	fn func(context.Context) error
+}
+
+// apply adds a new vertex which joins the graph.
+func (obj *addVertex) apply(ctx context.Context, table interfaces.Table) error {
+	table[obj.f] = nil // for symmetry
+	return obj.fn(ctx) // Init!
+}
+
+// deleteVertex is one of the "ops" that are possible.
+type deleteVertex struct {
+	f  interfaces.Func
+	fn func(context.Context) error
+}
+
+// apply removes a Func (vertex) that was deleted in a txn.
+func (obj *deleteVertex) apply(ctx context.Context, table interfaces.Table) error {
+	delete(table, obj.f) // cleanup the table
+	return obj.fn(ctx)   // Cleanup!
+}
+
+// realEdgeCount tells us how many "logical" edges there are. We have shared
+// edges which represent more than one value, when the same value is passed more
+// than once. This takes those into account correctly. We now use the inline
+// version of this computation to speed things up. It's here for reference only.
+func realEdgeCount(edges []pgraph.Edge) int {
+	total := 0
+	for _, edge := range edges {
+		fe, ok := edge.(*interfaces.FuncEdge)
+		if !ok {
+			// unused i think
+			total++
+			continue
+		}
+		total += len(fe.Args) // these can represent more than one edge!
+	}
+	return total
+}
+
+// isShutdown returns true if this error only tells us that we're shutting down,
+// even if a func wrapped it. Any other error is real, even during a shutdown.
+func isShutdown(ctx context.Context, err error) bool {
+	return ctx.Err() != nil && errors.Is(err, context.Canceled)
+}

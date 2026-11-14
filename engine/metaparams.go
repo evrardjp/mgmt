@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,19 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package engine
 
@@ -30,15 +42,21 @@ import (
 // DefaultMetaParams are the defaults that are used for undefined metaparams.
 // Don't modify this variable. Use .Copy() if you'd like some for yourself.
 var DefaultMetaParams = &MetaParams{
-	Noop:  false,
-	Retry: 0,
-	Delay: 0,
-	Poll:  0,        // defaults to watching for events
-	Limit: rate.Inf, // defaults to no limit
-	Burst: 0,        // no burst needed on an infinite rate
+	Noop:    false,
+	Retry:   0,
+	Delay:   0,
+	Timeout: 0,        // defaults to no CheckApply timeout
+	Poll:    0,        // defaults to watching for events
+	Limit:   rate.Inf, // defaults to no limit
+	Burst:   0,        // no burst needed on an infinite rate
+	Reset:   false,
 	//Sema:  []string{},
-	Rewatch: true,
+	Rewatch: false,
+	Dollar:  false,
+	Hidden:  false,
+	Export:  []string{},
 	Realize: false, // true would be more awesome, but unexpected for users
+	Async:   nil,   // nil means use the resource default (traits.Async)
 }
 
 // MetaRes is the interface a resource must implement to support meta params.
@@ -64,13 +82,25 @@ type MetaParams struct {
 	// reason to want to do something differently for the Watch errors.
 
 	// Retry is the number of times to retry on error. Use -1 for infinite.
+	// This value is used for both Watch and CheckApply.
 	Retry int16 `yaml:"retry"`
 
-	// Delay is the number of milliseconds to wait between retries.
+	// RetryReset resets the retry count for CheckApply if it succeeds. This
+	// value is currently different from the count used for Watch.
+	// TODO: Consider resetting retry count for watch if it sends an event?
+	RetryReset bool `yaml:"retryreset"`
+
+	// Delay is the number of milliseconds to wait between retries. This
+	// value is used for both Watch and CheckApply.
 	Delay uint64 `yaml:"delay"`
 
+	// Timeout is the maximum number of milliseconds to allow CheckApply to
+	// run for. Use 0 for no timeout.
+	Timeout uint64 `yaml:"timeout"`
+
 	// Poll is the number of seconds between poll intervals. Use 0 to Watch.
-	Poll uint32 `yaml:"poll"`
+	// Use -1 to only run once.
+	Poll int32 `yaml:"poll"`
 
 	// Limit is the number of events per second to allow through.
 	Limit rate.Limit `yaml:"limit"`
@@ -78,29 +108,110 @@ type MetaParams struct {
 	// Burst is the number of events to allow in a burst.
 	Burst int `yaml:"burst"`
 
+	// Reset causes the meta param state to reset when the resource changes.
+	// What this means is if you have a resource of a specific kind and name
+	// and in the subsequent graph it changes because one of its params
+	// changed, normally the Retry, and other params will remember their
+	// state, and you'll not reset the retry counter, however if this is
+	// true, then it will get reset. Note that any normal reset mechanisms
+	// built into retry are not affected by this.
+	Reset bool `yaml:"reset"`
+
 	// Sema is a list of semaphore ids in the form `id` or `id:count`. If
 	// you don't specify a count, then 1 is assumed. The sema of `foo` which
 	// has a count equal to 1, is different from a sema named `foo:1` which
 	// also has a count equal to 1, but is a different semaphore.
 	Sema []string `yaml:"sema"`
 
-	// Rewatch specifies whether we re-run the Watch worker during a swap
-	// if it has errored. When doing a GraphCmp to swap the graphs, if this
-	// is true, and this particular worker has errored, then we'll remove it
+	// Rewatch specifies whether we re-run the Watch worker during a swap if
+	// it has errored. When doing a GraphCmp to swap the graphs, if this is
+	// true, and this particular worker has errored, then we'll remove it
 	// and add it back as a new vertex, thus causing it to run again. This
 	// is different from the Retry metaparam which applies during the normal
 	// execution. It is only when this is exhausted that we're in permanent
-	// worker failure, and only then can we rely on this metaparam.
+	// worker failure, and only then can we rely on this metaparam. This is
+	// false by default, as the frequency of graph changes makes it unlikely
+	// that you wanted this enabled on most resources.
 	Rewatch bool `yaml:"rewatch"`
 
-	// Realize ensures that the resource is guaranteed to converge at least
-	// once before a potential graph swap removes or changes it. This
-	// guarantee is useful for fast changing graphs, to ensure that the
-	// brief creation of a resource is seen. This guarantee does not prevent
-	// against the engine quitting normally, and it can't guarantee it if
-	// the resource is blocked because of a failed pre-requisite resource.
-	// XXX: Not implemented!
+	// Dollar allows you to name a resource to start with the dollar
+	// character. We don't allow this by default since it's probably not
+	// needed, and is more likely to be a typo where the user forgot to
+	// interpolate a variable name. In the rare case when it's needed, you
+	// can disable that check with this meta param.
+	Dollar bool `yaml:"dollar"`
+
+	// Hidden means that this resource will not get executed on the resource
+	// graph on which it is defined. This can be used as a simple boolean
+	// switch, or, more commonly in combination with the Export meta param
+	// which specifies that the resource params are exported into the shared
+	// database. When this is true, it does not prevent export. In fact, it
+	// is commonly used in combination with Export. Using this option will
+	// still include it in the resource graph, but it will exist there in a
+	// special "mode" where it will not conflict with any other identically
+	// named resources. It can even be used as part of an edge or via a
+	// send/recv receiver. It can NOT be a sending vertex. These properties
+	// differentiate the use of this instead of simply wrapping a resource
+	// in an "if" statement. If it is hidden, then it does not need to pass
+	// the resource Validate method step.
+	Hidden bool `yaml:"hidden"`
+
+	// Export is a list of hostnames (and/or the special "*" entry) which if
+	// set, will mark this resource data as intended for export to those
+	// hosts. This does not prevent any users of the shared data storage
+	// from reading these values, so if you want to guarantee secrecy, use
+	// the encryption primitives. This only labels the data accordingly, so
+	// that other hosts can know what data is available for them to collect.
+	// The (kind, name, host) export triple must be unique from any given
+	// exporter. In other words, you may not export two different instances
+	// of a kind+name to the same host, the exports must not conflict. On
+	// resource collect, this parameter is not preserved.
+	Export []string `yaml:"export"`
+
+	// Realize ensures that the resource is guaranteed to run at least once
+	// before a potential graph swap removes or changes it. A resource needs
+	// to run if it has never run, or if it received an event or a poke
+	// which it hasn't successfully acted on yet. A graph swap waits for
+	// such a resource, including through any retry or rate limit delay it
+	// is in. This guarantee is useful for fast changing graphs, to ensure
+	// that the brief creation of a resource is seen. This guarantee does
+	// not prevent against the engine quitting normally, or via an
+	// interrupt, and it can't guarantee it if the resource is blocked
+	// because of a failed pre-requisite resource.
+	//
+	// Because a resource can only run correctly once its prerequisites have
+	// run, it also makes a resource downstream of an async res hold up the
+	// swap until that async CheckApply finishes and it has run itself,
+	// since the async metaparam is otherwise never held up by what's below
+	// it. This also waits for the whole chain of prerequisites leading up
+	// to a realize resource, and pauses each of them only after it has run.
+	// This can decrease the expected asynchronous behaviour that was
+	// specified upstream, as well as increasing the cost of a graph swap,
+	// so it is rare that you will want to use this metaparam.
+	//
+	// This metaparam forces the async behaviour on any res to false since
+	// the two can't be combined.
 	Realize bool `yaml:"realize"`
+
+	// Async tells the engine that the CheckApply operation of this resource
+	// may continue running in the background, even while the rest of the
+	// engine pauses to perform a graph swap. This is useful for resources
+	// which have long-running CheckApply operations (such as building a
+	// virtual machine image) where you don't want to block the rest of the
+	// engine from applying a new version of the graph while that work is
+	// happening.
+	//
+	// If the resource is removed from the graph during a swap while its
+	// CheckApply is still running, then the swap blocks while the
+	// CheckApply operation finishes, in the same way it would if it wasn't
+	// async.
+	//
+	// The default behaviour depends on if the resource has the
+	// `traits.Async` property set or not. This metaparam can override it
+	// when set. If the override setting is incompatible with the resource
+	// (for example, a resource which may *not* run in an async way) then
+	// this can be caught during the res Validate.
+	Async *bool `yaml:"async"`
 }
 
 // Cmp compares two AutoGroupMeta structs and determines if they're equivalent.
@@ -111,7 +222,7 @@ func (obj *MetaParams) Cmp(meta *MetaParams) error {
 	// XXX: add a one way cmp like we used to have ?
 	//if obj.Noop != meta.Noop {
 	//	// obj is the existing res, res is the *new* resource
-	//	// if we go from no-noop -> noop, we can re-use the obj
+	//	// if we go from no-noop -> noop, we can reuse the obj
 	//	// if we go from noop -> no-noop, we need to regenerate
 	//	if obj.Noop { // asymmetrical
 	//		return fmt.Errorf("values for Noop are different") // going from noop to no-noop!
@@ -124,6 +235,9 @@ func (obj *MetaParams) Cmp(meta *MetaParams) error {
 	if obj.Delay != meta.Delay {
 		return fmt.Errorf("values for Delay are different")
 	}
+	if obj.Timeout != meta.Timeout {
+		return fmt.Errorf("values for Timeout are different")
+	}
 	if obj.Poll != meta.Poll {
 		return fmt.Errorf("values for Poll are different")
 	}
@@ -133,6 +247,9 @@ func (obj *MetaParams) Cmp(meta *MetaParams) error {
 	if obj.Burst != meta.Burst {
 		return fmt.Errorf("values for Burst are different")
 	}
+	if obj.Reset != meta.Reset {
+		return fmt.Errorf("values for Reset are different")
+	}
 
 	if err := util.SortedStrSliceCompare(obj.Sema, meta.Sema); err != nil {
 		return errwrap.Wrapf(err, "values for Sema are different")
@@ -141,8 +258,23 @@ func (obj *MetaParams) Cmp(meta *MetaParams) error {
 	if obj.Rewatch != meta.Rewatch {
 		return fmt.Errorf("values for Rewatch are different")
 	}
+	if obj.Dollar != meta.Dollar {
+		return fmt.Errorf("values for Dollar are different")
+	}
+	if obj.Hidden != meta.Hidden {
+		return fmt.Errorf("values for Hidden are different")
+	}
+	if err := util.SortedStrSliceCompare(obj.Export, meta.Export); err != nil {
+		return errwrap.Wrapf(err, "values for Export are different")
+	}
 	if obj.Realize != meta.Realize {
 		return fmt.Errorf("values for Realize are different")
+	}
+	if (obj.Async == nil) != (meta.Async == nil) {
+		return fmt.Errorf("values for Async are different")
+	}
+	if obj.Async != nil && meta.Async != nil && *obj.Async != *meta.Async {
+		return fmt.Errorf("values for Async are different")
 	}
 
 	return nil
@@ -163,6 +295,28 @@ func (obj *MetaParams) Validate() error {
 		}
 	}
 
+	for _, s := range obj.Export {
+		if s == "" {
+			return fmt.Errorf("export is empty")
+		}
+	}
+	// TODO: Should we validate the export patterns?
+
+	// If async is explicitly set true, it can't be combined with export or
+	// hidden. This doesn't block the traits.Async value, which is related,
+	// but that we don't need to validate or consider here.
+	if obj.Async != nil && *obj.Async {
+		if obj.Hidden {
+			return fmt.Errorf("the async param can't be combined with hidden")
+		}
+		if len(obj.Export) > 0 {
+			return fmt.Errorf("the async param can't be combined with export")
+		}
+		if obj.Realize {
+			return fmt.Errorf("the async param can't be combined with realize")
+		}
+	}
+
 	return nil
 }
 
@@ -173,16 +327,32 @@ func (obj *MetaParams) Copy() *MetaParams {
 		sema = make([]string, len(obj.Sema))
 		copy(sema, obj.Sema)
 	}
+	export := []string{}
+	if obj.Export != nil {
+		export = make([]string, len(obj.Export))
+		copy(export, obj.Export)
+	}
+	var async *bool
+	if obj.Async != nil {
+		b := *obj.Async
+		async = &b
+	}
 	return &MetaParams{
 		Noop:    obj.Noop,
 		Retry:   obj.Retry,
 		Delay:   obj.Delay,
+		Timeout: obj.Timeout,
 		Poll:    obj.Poll,
 		Limit:   obj.Limit, // FIXME: can we copy this type like this? test me!
 		Burst:   obj.Burst,
+		Reset:   obj.Reset,
 		Sema:    sema,
 		Rewatch: obj.Rewatch,
+		Dollar:  obj.Dollar,
+		Hidden:  obj.Hidden,
+		Export:  export,
 		Realize: obj.Realize,
+		Async:   async,
 	}
 }
 
@@ -199,4 +369,19 @@ func (obj *MetaParams) UnmarshalYAML(unmarshal func(interface{}) error) error {
 
 	*obj = MetaParams(raw) // restore from indirection with type conversion!
 	return nil
+}
+
+// MetaState is some local meta param state that is saved between resources of
+// the same kind+name unique ID. Even though the vertex/resource pointer might
+// change during a graph switch (because the params changed) we might be
+// logically referring to the same resource, and we might want to preserve some
+// data across that switch. The common example is the resource retry count. If a
+// resource failed three times, and we had a limit of five before it would be a
+// permanent failure, then we don't want to reset this counter just because we
+// changed a parameter (field) of the resource. This doesn't mean we don't want
+// to ever reset these counts. For that, flip on the reset meta param.
+type MetaState struct {
+
+	// CheckApplyRetry is the current retry count for CheckApply.
+	CheckApplyRetry int16
 }

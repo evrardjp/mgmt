@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,9 +13,21 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
-// +build !root
+//go:build !root
 
 package pgraph
 
@@ -30,8 +42,8 @@ type vertex struct {
 }
 
 // String is a required method of the Vertex interface that we must fulfill.
-func (v *vertex) String() string {
-	return v.name
+func (obj *vertex) String() string {
+	return obj.name
 }
 
 // NV is a helper function to make testing easier. It creates a new noop vertex.
@@ -45,8 +57,8 @@ type edge struct {
 }
 
 // String is a required method of the Edge interface that we must fulfill.
-func (e *edge) String() string {
-	return e.name
+func (obj *edge) String() string {
+	return obj.name
 }
 
 // NE is a helper function to make testing easier. It creates a new noop edge.
@@ -74,20 +86,20 @@ func runGraphCmp(t *testing.T, g1, g2 *Graph) string {
 		str := ""
 		str += fmt.Sprintf("  actual (g1): %v%s", g1, fullPrint(g1))
 		str += fmt.Sprintf("expected (g2): %v%s", g2, fullPrint(g2))
-		str += fmt.Sprintf("cmp error:")
-		str += fmt.Sprintf("%v", err)
+		str += "cmp error:"
+		str += err.Error()
 		return str
 	}
 	return ""
 }
 
-func fullPrint(g *Graph) (str string) {
+func fullPrint(obj *Graph) (str string) {
 	str += "\n"
-	for v := range g.Adjacency() {
+	for v := range obj.adjacency {
 		str += fmt.Sprintf("* v: %s\n", v)
 	}
-	for v1 := range g.Adjacency() {
-		for v2, e := range g.Adjacency()[v1] {
+	for v1 := range obj.adjacency {
+		for v2, e := range obj.adjacency[v1] {
 			str += fmt.Sprintf("* e: %s -> %s # %s\n", v1, v2, e)
 		}
 	}

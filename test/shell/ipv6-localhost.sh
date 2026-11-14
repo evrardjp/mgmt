@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 . "$(dirname "$0")/../util.sh"
 
@@ -10,7 +10,7 @@ if ! ifconfig lo | grep 'inet6 ::1' >/dev/null; then
 	exit 0
 fi
 
-if in_ci github; then
+if in_env github; then
 	# TODO: consider debugging this
 	echo "This is failing in github, skipping test!"
 	exit

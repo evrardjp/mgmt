@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,19 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 // Package interpolate contains the string interpolation parser and associated
 // structs and code.
@@ -24,6 +36,7 @@ import (
 
 	"github.com/purpleidea/mgmt/lang/ast"
 	"github.com/purpleidea/mgmt/lang/funcs"
+	"github.com/purpleidea/mgmt/lang/funcs/operators"
 	"github.com/purpleidea/mgmt/lang/interfaces"
 	"github.com/purpleidea/mgmt/util/errwrap"
 
@@ -36,26 +49,46 @@ const (
 	// This can't properly escape a $ in the standard way. It's here in case
 	// someone wants to play with it and examine how the AST stuff worked...
 	UseHilInterpolation = false
+
+	// UseOptimizedConcat uses a simpler to unify concat operator instead of
+	// the normal + operator which uses fancy polymorphic type unification.
+	UseOptimizedConcat = true
 )
 
-// InterpolateStr interpolates a string and returns the representative AST.
-func InterpolateStr(str string, pos *interfaces.Pos, data *interfaces.Data) (interfaces.Expr, error) {
+// StrInterpolate interpolates a string and returns the representative AST. If
+// there was nothing to interpolate, this returns (nil, nil).
+func StrInterpolate(str string, textarea *interfaces.Textarea, data *interfaces.Data) (interfaces.Expr, error) {
 	if data.Debug {
 		data.Logf("interpolating: %s", str)
 	}
 
 	if UseHilInterpolation {
-		return InterpolateHil(str, pos, data)
+		return HilInterpolate(str, textarea, data)
 	}
-	return InterpolateRagel(str, pos, data)
+	return RagelInterpolate(str, textarea, data)
 }
 
-// InterpolateRagel interpolates a string and returns the representative AST. It
-// uses the ragel parser to perform the string interpolation.
-func InterpolateRagel(str string, pos *interfaces.Pos, data *interfaces.Data) (interfaces.Expr, error) {
+// RagelInterpolate interpolates a string and returns the representative AST. It
+// uses the ragel parser to perform the string interpolation. If there was
+// nothing to interpolate, this returns (nil, nil).
+func RagelInterpolate(str string, textarea *interfaces.Textarea, data *interfaces.Data) (interfaces.Expr, error) {
 	sequence, err := Parse(str)
 	if err != nil {
-		return nil, errwrap.Wrapf(err, "parser failed")
+		err := errwrap.Wrapf(err, "parser failed")
+		// Point the error at the string literal in the source, since
+		// the interpolation parser has no position info of its own.
+		return nil, interfaces.HighlightHelper(textarea, data.Logf, err)
+	}
+
+	// If we didn't find anything of value, we got an empty string...
+	if len(sequence) == 0 && str == "" { // be doubly sure...
+		return nil, nil // pass through, nothing changed
+	}
+
+	if len(sequence) == 1 {
+		if x, ok := sequence[0].(Literal); ok && x.Value == str {
+			return nil, nil // pass through, nothing changed
+		}
 	}
 
 	exprs := []interfaces.Expr{}
@@ -64,26 +97,20 @@ func InterpolateRagel(str string, pos *interfaces.Pos, data *interfaces.Data) (i
 		switch t := term.(type) {
 		case Literal:
 			expr := &ast.ExprStr{
-				V: t.Value,
+				Textarea: *textarea, // XXX: until we re-calculate
+				V:        t.Value,
 			}
 			exprs = append(exprs, expr)
 
 		case Variable:
 			expr := &ast.ExprVar{
-				Name: t.Name,
+				Textarea: *textarea, // XXX: until we re-calculate
+				Name:     t.Name,
 			}
 			exprs = append(exprs, expr)
 		default:
 			return nil, fmt.Errorf("unknown term (%T): %+v", t, t)
 		}
-	}
-
-	// If we didn't find anything of value, we got an empty string...
-	if len(sequence) == 0 && str == "" { // be doubly sure...
-		expr := &ast.ExprStr{
-			V: "",
-		}
-		exprs = append(exprs, expr)
 	}
 
 	// The parser produces non-optimal results where two strings are next to
@@ -93,7 +120,7 @@ func InterpolateRagel(str string, pos *interfaces.Pos, data *interfaces.Data) (i
 		return nil, errwrap.Wrapf(err, "expr list simplify failed")
 	}
 
-	result, err := concatExprListIntoCall(simplified)
+	result, err := concatExprListIntoCall(simplified, textarea)
 	if err != nil {
 		return nil, errwrap.Wrapf(err, "concat expr list failed")
 	}
@@ -101,15 +128,16 @@ func InterpolateRagel(str string, pos *interfaces.Pos, data *interfaces.Data) (i
 	return result, errwrap.Wrapf(result.Init(data), "init failed")
 }
 
-// InterpolateHil interpolates a string and returns the representative AST. This
+// HilInterpolate interpolates a string and returns the representative AST. This
 // particular implementation uses the hashicorp hil library and syntax to do so.
-func InterpolateHil(str string, pos *interfaces.Pos, data *interfaces.Data) (interfaces.Expr, error) {
+func HilInterpolate(str string, textarea *interfaces.Textarea, data *interfaces.Data) (interfaces.Expr, error) {
 	var line, column int = -1, -1
 	var filename string
-	if pos != nil {
-		line = pos.Line
-		column = pos.Column
-		filename = pos.Filename
+	if textarea != nil {
+		startLine, startColumn := textarea.Pos() // zero based
+		line = startLine
+		column = startColumn
+		filename = textarea.Filename() // TODO: .Path() instead?
 	}
 	hilPos := hilast.Pos{
 		Line:     line,
@@ -185,7 +213,7 @@ func hilTransform(root hilast.Node, data *interfaces.Data) (interfaces.Expr, err
 
 		// XXX: i think we should be adding these args together, instead
 		// of grouping for example...
-		result, err := concatExprListIntoCall(args)
+		result, err := concatExprListIntoCall(args, nil)
 		if err != nil {
 			return nil, errwrap.Wrapf(err, "function grouping failed")
 		}
@@ -278,7 +306,7 @@ func hilTransform(root hilast.Node, data *interfaces.Data) (interfaces.Expr, err
 // concatExprListIntoCall takes a list of expressions, and combines them into an
 // expression which ultimately concatenates them all together with a + operator.
 // TODO: this assumes they're all strings, do we need to watch out for int's?
-func concatExprListIntoCall(exprs []interfaces.Expr) (interfaces.Expr, error) {
+func concatExprListIntoCall(exprs []interfaces.Expr, textarea *interfaces.Textarea) (interfaces.Expr, error) {
 	if len(exprs) == 0 {
 		return nil, fmt.Errorf("empty list")
 	}
@@ -296,7 +324,7 @@ func concatExprListIntoCall(exprs []interfaces.Expr) (interfaces.Expr, error) {
 	//		V: "", // empty str
 	//	}
 	//	return &ast.ExprCall{
-	//		Name: funcs.OperatorFuncName, // concatenate the two strings with + operator
+	//		Name: operators.OperatorFuncName, // concatenate the two strings with + operator
 	//		Args: []interfaces.Expr{
 	//			operator, // operator first
 	//			arg,      // string arg
@@ -307,20 +335,42 @@ func concatExprListIntoCall(exprs []interfaces.Expr) (interfaces.Expr, error) {
 
 	head, tail := exprs[0], exprs[1:]
 
-	grouped, err := concatExprListIntoCall(tail)
+	grouped, err := concatExprListIntoCall(tail, textarea)
 	if err != nil {
 		return nil, err
 	}
 
-	return &ast.ExprCall{
+	// Faster variant, but doesn't allow potential future more exotic string
+	// interpolation which would need a more expressive plus operator. I do
+	// not think we'll ever need that, but leave it in for now as a const.
+	if UseOptimizedConcat {
+		expr := &ast.ExprCall{
+			// NOTE: if we don't set the data field we need Init() called on it!
+			Name: funcs.ConcatFuncName, // concatenate the two strings with concat function
+			Args: []interfaces.Expr{
+				head,    // string arg
+				grouped, // nested function call which returns a string
+			},
+		}
+		if textarea != nil {
+			expr.Textarea = *textarea
+		}
+		return expr, nil
+	}
+
+	expr := &ast.ExprCall{
 		// NOTE: if we don't set the data field we need Init() called on it!
-		Name: funcs.OperatorFuncName, // concatenate the two strings with + operator
+		Name: operators.OperatorFuncName, // concatenate the two strings with + operator
 		Args: []interfaces.Expr{
 			operator, // operator first
 			head,     // string arg
 			grouped,  // nested function call which returns a string
 		},
-	}, nil
+	}
+	if textarea != nil {
+		expr.Textarea = *textarea
+	}
+	return expr, nil
 }
 
 // simplifyExprList takes a list of *ExprStr and *ExprVar and groups the

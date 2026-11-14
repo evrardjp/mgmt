@@ -1,0 +1,16 @@
+-- main.mcl --
+import "fmt"
+
+# this should be a function as a value, iow a lambda
+$answer = func() {
+	"the answer is 42"
+}
+
+$out1 = $answer()
+$out2 = $answer()
+
+$name = $out1 + $out2
+
+test "${name}" {}
+-- OUTPUT --
+Vertex: test[the answer is 42the answer is 42]

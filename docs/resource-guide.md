@@ -60,10 +60,7 @@ it is not specified, but others cannot, and some might poorly infer if the
 struct name is ambiguous.
 
 If you'd like your resource to be accessible by the `YAML` graph API (GAPI),
-then you'll need to include the appropriate YAML fields as shown below. This is
-used by the `Puppet` compiler as well, so make sure you include these struct
-tags if you want existing `Puppet` code to be able to run using the `mgmt`
-engine.
+then you'll need to include the appropriate YAML fields as shown below.
 
 #### Example
 
@@ -177,10 +174,10 @@ this. In other words, you should expect `Validate` to have run first, but you
 shouldn't allow `Init` to dangerously `rm -rf /$the_world` if your code only
 checks `$the_world` in `Validate`. Remember to always program safely!
 
-### Close
+### Cleanup
 
 ```golang
-Close() error
+Cleanup() error
 ```
 
 This is called to cleanup after the resource. It is usually not necessary, but
@@ -192,8 +189,8 @@ loop.
 #### Example
 
 ```golang
-// Close runs some cleanup code for this resource.
-func (obj *FooRes) Close() error {
+// Cleanup is run by the engine to clean up after the resource is done.
+func (obj *FooRes) Cleanup() error {
 	err := obj.conn.Close() // close some internal connection
 	obj.someMap = nil       // free up some large data structure from memory
 	return err
@@ -206,7 +203,7 @@ on an error if something went wrong.
 ### CheckApply
 
 ```golang
-CheckApply(apply bool) (checkOK bool, err error)
+CheckApply(ctx context.Context, apply bool) (checkOK bool, err error)
 ```
 
 `CheckApply` is where the real _work_ is done. Under normal circumstances, this
@@ -215,7 +212,8 @@ should return: `(true, nil)`. If the `apply` variable is set to `true`, then
 this means that we should then proceed to run the changes required to bring the
 resource into the correct state. If the `apply` variable is set to `false`, then
 the resource is operating in _noop_ mode and _no operational changes_ should be
-made!
+made! The ctx should be monitored in case a shutdown has been requested. This
+may be used if a timeout occurred, or if the user shutdown the engine.
 
 After having executed the necessary operations to bring the resource back into
 the desired state, or after having detected that the state was incorrect, but
@@ -234,7 +232,7 @@ to `CheckApply`.
 
 ```golang
 // CheckApply does the idempotent work of checking and applying resource state.
-func (obj *FooRes) CheckApply(apply bool) (bool, error) {
+func (obj *FooRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 	// check the state
 	if state_is_okay { return true, nil } // done early! :)
 
@@ -277,7 +275,7 @@ will likely find the state to now be correct.
 ### Watch
 
 ```golang
-Watch() error
+Watch(ctx context.Context) error
 ```
 
 `Watch` is a main loop that runs and sends messages when it detects that the
@@ -304,23 +302,25 @@ If the resource is activated in `polling` mode, the `Watch` method will not get
 executed. As a result, the resource must still work even if the main loop is not
 running.
 
+You must make sure to cleanup any running code or goroutines before Watch exits.
+
 #### Select
 
 The lifetime of most resources `Watch` method should be spent in an infinite
 loop that is bounded by a `select` call. The `select` call is the point where
 our method hands back control to the engine (and the kernel) so that we can
 sleep until something of interest wakes us up. In this loop we must wait until
-we get a shutdown event from the engine via the `<-obj.init.Done` channel, which
+we get a shutdown event from the engine via the `<-ctx.Done()` channel, which
 closes when we'd like to shut everything down. At this point you should cleanup,
 and let `Watch` close.
 
 #### Events
 
-If the  `<-obj.init.Done` channel closes, we should shutdown our resource. When
-When we want to send an event, we use the `Event` helper function. This
-automatically marks the resource state as `dirty`. If you're unsure, it's not
-harmful to send the event. This will ultimately cause `CheckApply` to run. This
-method can block if the resource is being paused.
+If the `<-ctx.Done()` channel closes, we should shutdown our resource. When we
+want to send an event, we use the `Event` helper function. This automatically
+marks the resource state as `dirty`. If you're unsure, it's not harmful to send
+the event. This will ultimately cause `CheckApply` to run. This method can block
+if the resource is being paused.
 
 #### Startup
 
@@ -329,7 +329,7 @@ to generate one event to notify the `mgmt` engine that we're now listening
 successfully, so that it can run an initial `CheckApply` to ensure we're safely
 tracking a healthy state and that we didn't miss anything when `Watch` was down
 or from before `mgmt` was running. You must do this by calling the
-`obj.init.Running` method.
+`obj.init.Event` method.
 
 #### Converged
 
@@ -347,7 +347,7 @@ sending out erroneous `Event` messages to keep things alive until it finishes.
 
 ```golang
 // Watch is the listener and main loop for this resource.
-func (obj *FooRes) Watch() error {
+func (obj *FooRes) Watch(ctx context.Context) error {
 	// setup the Foo resource
 	var err error
 	if err, obj.foo = OpenFoo(); err != nil {
@@ -356,30 +356,26 @@ func (obj *FooRes) Watch() error {
 	defer obj.whatever.CloseFoo() // shutdown our Foo
 
 	// notify engine that we're running
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil { return err }
 
-	var send = false // send event?
 	for {
 		select {
 		// the actual events!
 		case event := <-obj.foo.Events:
-			if is_an_event {
-				send = true
+			if !is_an_event {
+				continue // skip event
 			}
+			// send below...
 
 		// event errors
 		case err := <-obj.foo.Errors:
 			return err // will cause a retry or permanent failure
 
-		case <-obj.init.Done: // signal for shutdown request
+		case <-ctx.Done(): // signal for shutdown request
 			return nil
 		}
 
-		// do all our event sending all together to avoid duplicate msgs
-		if send {
-			send = false
-			obj.init.Event()
-		}
+		if err := obj.init.Event(ctx); err != nil { return err }
 	}
 }
 ```
@@ -490,7 +486,7 @@ if another resource can match a dependency to this one.
 #### AutoEdges
 
 ```golang
-AutoEdges() (engine.AutoEdge, error)
+AutoEdges(ctx context.Context) (engine.AutoEdge, error)
 ```
 
 This returns a struct that implements the `AutoEdge` interface. This struct
@@ -520,9 +516,10 @@ graph edges from another resource. These values are consumed during the
 any resource that has an appropriate value and that has the `Sendable` trait.
 You can read more about this in the Send/Recv section below.
 
-### Collectable
+### Exportable
 
-This is currently a stub and will be updated once the DSL is further along.
+Exportable allows a resource to tell the exporter what subset of its data it
+wishes to export when that occurs. It is rare that you will need to use this.
 
 ## Resource Initialization
 
@@ -553,11 +550,6 @@ ready to detect changes.
 Event sends an event notifying the engine of a possible state change. It is
 only called from within `Watch`.
 
-### Done
-
-Done is a channel that closes when the engine wants us to shutdown. It is only
-called from within `Watch`.
-
 ### Refresh
 
 Refresh returns whether the resource received a notification. This flag can be
@@ -582,15 +574,15 @@ It is only called from within `CheckApply`.
 World provides a connection to the outside world. This is most often used for
 communicating with the distributed database. It can be used in `Init`,
 `CheckApply` and `Watch`. Use with discretion and understanding of the internals
-if needed in `Close`.
+if needed in `Cleanup`.
 
 ### VarDir
 
 VarDir is a facility for local storage. It is used to return a path to a
 directory which may be used for temporary storage. It should be cleaned up on
-resource `Close` if the resource would like to delete the contents. The resource
-should not assume that the initial directory is empty, and it should be cleaned
-on `Init` if that is a requirement.
+resource `Cleanup` if the resource would like to delete the contents. The
+resource should not assume that the initial directory is empty, and it should be
+cleaned on `Init` if that is a requirement.
 
 ### Debug
 
@@ -624,8 +616,7 @@ func init() { // special golang method that runs once
 ### YAML Unmarshalling
 
 To support YAML unmarshalling for your resource, you must implement an
-additional method. It is recommended if you want to use your resource with the
-`Puppet` compiler.
+additional method.
 
 ```golang
 UnmarshalYAML(unmarshal func(interface{}) error) error // optional
@@ -680,17 +671,50 @@ receiving one. This can _only_ be done inside of the `CheckApply` function!
 
 ```golang
 // inside CheckApply, probably near the top
-if val, exists := obj.init.Recv()["SomeKey"]; exists {
-	obj.init.Logf("the SomeKey param was sent to us from: %s.%s", val.Res, val.Key)
+if val, exists := obj.init.Recv()["some_key"]; exists {
+	obj.init.Logf("the some_key param was sent to us from: %s.%s", val.Res, val.Key)
 	if val.Changed {
-		obj.init.Logf("the SomeKey param was just updated!")
+		obj.init.Logf("the some_key param was just updated!")
 		// you may want to invalidate some local cache
 	}
 }
 ```
 
-The specifics of resource sending are not currently documented. Please send a
-patch here!
+A resource can send a value during CheckApply by running the `obj.init.Send()`
+method. It must always send a value if (1) it's not erroring in CheckApply, and
+(2) if the `obj.SendActive()` method inside of CheckApply returns true. It is
+not harmful to run the Send method if CheckApply is going to error, or if
+`obj.SendActive()` returns false, just unnecessary. In the `!apply` case where
+we're running in "noop" mode, and where the state is not correct, then you
+should still attempt to send a value, but it is a bit ambiguous which value to
+send. This behaviour may be specified in the future, but at the moment it's
+mostly inconsequential. At the moment, `obj.SendActive()` is disabled at compile
+time, but can be enabled if you have a legitimate use-case for it.
+
+```golang
+// inside CheckApply, somewhere near the end usually
+if err := obj.init.Send(&ExecSends{ // send the special data structure
+	Output: obj.output,
+	Stdout: obj.stdout,
+	Stderr: obj.stderr,
+}); err != nil {
+	return false, err
+}
+```
+
+You must also implement the `Sends()` method which should return the above
+sending struct with all of the fields containing their default or values. Please
+note, that those fields must have their struct tags set appropriately.
+
+### Safety
+
+Lastly, please note that in order for a resource to send a useful value, even
+when its state is already correct (it may have run earlier for example) then it
+may require the implementation of CheckApply to cache a return value for later
+use. Keep in mind that you should store this securely should there be a chance
+that sensitive info is contained within, and that an untrusted user could put
+malicious data in the cache if you are not careful. It's best to make sure the
+users of your resource are aware of its implementation details here.
 
 ## Composite resources
 
@@ -718,7 +742,7 @@ Higher level resource collections will be possible once the `mgmt` DSL is ready.
 ### Why does the resource API have `CheckApply` instead of two separate methods?
 
 In an early version we actually had both "parts" as separate methods, namely:
-`StateOK` (Check) and `Apply`, but the [decision](58f41eddd9c06b183f889f15d7c97af81b0331cc)
+`StateOK` (Check) and `Apply`, but the [decision](https://github.com/purpleidea/mgmt/commit/58f41eddd9c06b183f889f15d7c97af81b0331cc)
 was made to merge the two into a single method. There are two reasons for this:
 
 1. Many situations would involve the engine running both `Check` and `Apply`. If
@@ -727,16 +751,16 @@ two calls, this is much more difficult. A common example is that a resource
 might want to open a connection to `dbus` or `http` to do resource state testing
 and applying. If the methods are combined, there's no need to open and close
 them twice. A counter argument might be that you could open the connection in
-`Init`, and close it in `Close`, however you might not want that open for the
+`Init`, and close it in `Cleanup`, however you might not want that open for the
 full lifetime of the resource if you only change state occasionally.
 2. Suppose you came up with a really good reason why you wanted the two methods
 to be separate. It turns out that the current `CheckApply` can wrap this easily.
 It would look approximately like this:
 
 ```golang
-func (obj *FooRes) CheckApply(apply bool) (bool, error) {
+func (obj *FooRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 	// my private split implementation of check and apply
-	if c, err := obj.check(); err != nil {
+	if c, err := obj.check(ctx); err != nil {
 		return false, err // we errored
 	} else if c {
 		return true, nil // state was good!
@@ -746,7 +770,7 @@ func (obj *FooRes) CheckApply(apply bool) (bool, error) {
 		return false, nil // state needs fixing, but apply is false
 	}
 
-	err := obj.apply() // errors if failure or unable to apply
+	err := obj.apply(ctx) // errors if failure or unable to apply
 
 	return false, err // always return false, with an optional error
 }

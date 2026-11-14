@@ -1,0 +1,14 @@
+-- main.mcl --
+$wat = $x
+$f = func($x) {
+	$wat
+}
+
+$name = $f("foo")
+test "${name}" {}
+-- OUTPUT --
+# err: errSetScope: var `$x` does not exist in this scope: /main.mcl @ 1:8-1:10
+var `$x` does not exist in this scope: /main.mcl @ 1:8-1:10
+
+$wat = $x
+       ^^

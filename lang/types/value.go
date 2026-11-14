@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,13 +13,28 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package types
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"math"
+	"net"
 	"reflect"
 	"sort"
 	"strconv"
@@ -31,18 +46,29 @@ import (
 var (
 	// ErrNilValue is returned when ValueOf() attempts to represent a nil
 	// pointer as an mcl value. This is not supported in mcl.
-	ErrNilValue = errors.New("cannot represent a nil Golang value in mcl")
+	ErrNilValue = errors.New("cannot represent a nil golang value in mcl")
 
 	// ErrInvalidValue is returned when ValueOf() is called on an invalid or
 	// zero reflect.Value.
 	ErrInvalidValue = errors.New("cannot represent invalid reflect.Value")
+
+	// ValueNil is a nil value in our system. Can be used where needed, must
+	// not be exposed to the end user in the mcl language.
+	//ValueNil, _ = ValueOfGolang(nil) // doesn't work how we expect atm
+	ValueNil = &NilValue{}
+
+	// ValueFalse is a false value in our system. Can be used where needed.
+	ValueFalse, _ = ValueOfGolang(false)
+
+	// ValueTrue is a true value in our system. Can be used where needed.
+	ValueTrue, _ = ValueOfGolang(true)
 )
 
 // Value represents an interface to get values out of each type. It is similar
 // to the reflection interfaces used in the golang standard library.
 type Value interface {
-	fmt.Stringer // String() string (for display purposes)
-	Type() *Type
+	fmt.Stringer     // String() string (for display purposes)
+	Type() *Type     // this may be shared, so it must not be modified
 	Less(Value) bool // to find the smaller of the two values (for sort)
 	Cmp(Value) error // error if the two values aren't the same
 	Copy() Value     // returns a copy of this value
@@ -54,7 +80,7 @@ type Value interface {
 	List() []Value
 	Map() map[Value]Value // keys must all have same type, same for values
 	Struct() map[string]Value
-	Func() func([]Value) (Value, error)
+	Func() interface{} // func(interfaces.Txn, []interfaces.Func) (interfaces.Func, error)
 }
 
 // ValueOfGolang is a helper that takes a golang value, and produces the mcl
@@ -62,6 +88,7 @@ type Value interface {
 // reminder that if you pass in a nil value, or something containing a nil
 // value, then you won't get what you want. See our documentation for ValueOf.
 func ValueOfGolang(i interface{}) (Value, error) {
+	// XXX: Should a nil return a &NilValue{} here?
 	return ValueOf(reflect.ValueOf(i))
 }
 
@@ -86,7 +113,7 @@ func ValueOf(v reflect.Value) (Value, error) {
 	value := v
 	typ := value.Type()
 	kind := typ.Kind()
-	for kind == reflect.Ptr {
+	for kind == reflect.Pointer {
 		// Prevent panic() if value is a nil pointer and return an error.
 		if value.IsNil() {
 			return nil, ErrNilValue
@@ -99,6 +126,14 @@ func ValueOf(v reflect.Value) (Value, error) {
 		value = value.Elem() // XXX: is this correct?
 	}
 
+	// Special cases:
+	if value.CanInterface() {
+		if v, ok := (value.Interface()).(net.HardwareAddr); ok {
+			return &StrValue{V: v.String()}, nil
+		}
+	}
+	// TODO: net/url.URL, time.Duration, etc. Note: avoid net/mail.Address
+
 	switch kind { // match on destination field kind
 	case reflect.Bool:
 		return &BoolValue{V: value.Bool()}, nil
@@ -110,13 +145,19 @@ func ValueOf(v reflect.Value) (Value, error) {
 		return &IntValue{V: value.Int()}, nil
 
 	case reflect.Uint, reflect.Uint64, reflect.Uint32, reflect.Uint16, reflect.Uint8:
-		return &IntValue{V: int64(value.Uint())}, nil
+		// mcl integers are int64, so an unsigned value above MaxInt64
+		// can't be represented without silently becoming negative.
+		u := value.Uint()
+		if u > math.MaxInt64 {
+			return nil, fmt.Errorf("unsigned value `%d` overflows the int64 mcl int", u)
+		}
+		return &IntValue{V: int64(u)}, nil
 
 	case reflect.Float64, reflect.Float32:
 		return &FloatValue{V: value.Float()}, nil
 
 	case reflect.Array, reflect.Slice:
-		values := []Value{}
+		values := make([]Value, 0, value.Len())
 		for i := 0; i < value.Len(); i++ {
 			x := value.Index(i)
 			v, err := ValueOf(x) // recurse
@@ -132,12 +173,25 @@ func ValueOf(v reflect.Value) (Value, error) {
 		}
 
 		return &ListValue{
-			T: NewType(fmt.Sprintf("[]%s", t.String())),
+			T: &Type{Kind: KindList, Val: t},
 			V: values,
 		}, nil
 
 	case reflect.Map:
-		m := make(map[Value]Value)
+		kt, err := TypeOf(value.Type().Key()) // type of key
+		if err != nil {
+			return nil, errwrap.Wrapf(err, "can't determine key type of %+v", value)
+		}
+		vt, err := TypeOf(value.Type().Elem()) // type of value
+		if err != nil {
+			return nil, errwrap.Wrapf(err, "can't determine value type of %+v", value)
+		}
+
+		// NewMap builds the lookup structures which a map needs.
+		m := NewMap(&Type{Kind: KindMap, Key: kt, Val: vt})
+		if m == nil {
+			return nil, fmt.Errorf("map key type %s is not hashable", kt)
+		}
 
 		// loop through the list of map keys in undefined order
 		for _, mk := range value.MapKeys() {
@@ -152,22 +206,12 @@ func ValueOf(v reflect.Value) (Value, error) {
 				return nil, err
 			}
 
-			m[k] = v
+			if err := m.Set(k, v); err != nil {
+				return nil, err
+			}
 		}
 
-		kt, err := TypeOf(value.Type().Key()) // type of key
-		if err != nil {
-			return nil, errwrap.Wrapf(err, "can't determine key type of %+v", value)
-		}
-		vt, err := TypeOf(value.Type().Elem()) // type of value
-		if err != nil {
-			return nil, errwrap.Wrapf(err, "can't determine value type of %+v", value)
-		}
-
-		return &MapValue{
-			T: NewType(fmt.Sprintf("map{%s: %s}", kt.String(), vt.String())),
-			V: m,
-		}, nil
+		return m, nil
 
 	case reflect.Struct:
 		// TODO: we could take this simpler "get the full type" approach
@@ -184,7 +228,7 @@ func ValueOf(v reflect.Value) (Value, error) {
 			return nil, fmt.Errorf("incompatible number of fields")
 		}
 
-		values := make(map[string]Value)
+		values := make(map[string]Value, l)
 		for i := 0; i < l; i++ {
 			x := value.Field(i)
 			v, err := ValueOf(x) // recurse
@@ -209,8 +253,8 @@ func ValueOf(v reflect.Value) (Value, error) {
 			return nil, fmt.Errorf("cannot only represent functions with one output value")
 		}
 
-		f := func(args []Value) (Value, error) {
-			in := []reflect.Value{}
+		f := func(ctx context.Context, args []Value) (Value, error) {
+			in := make([]reflect.Value, 0, len(args))
 			for _, x := range args {
 				// TODO: should we build this method instead?
 				//v := x.Reflect() // types.Value -> reflect.Value
@@ -218,6 +262,7 @@ func ValueOf(v reflect.Value) (Value, error) {
 				in = append(in, v)
 			}
 
+			// FIXME: can we pass in ctx ?
 			// FIXME: can we trap panic's ?
 			out := value.Call(in) // []reflect.Value
 			if len(out) != 1 {    // TODO: panic, b/c already checked in TypeOf?
@@ -232,8 +277,33 @@ func ValueOf(v reflect.Value) (Value, error) {
 			V: f,
 		}, nil
 
+	// TODO: should this return a variant value?
+	// TODO: add this into ConfigurableValueOf like ConfigurableTypeOf ?
+	case reflect.Interface:
+		opts := []TypeOfOption{
+			//StructTagOpt(StructTag),
+			//StrictStructTagOpt(false),
+			//SkipBadStructFieldsOpt(false),
+			AllowInterfaceTypeOpt(true),
+		}
+		t, err := ConfigurableTypeOf(value.Type(), opts...)
+		//t, err := TypeOf(value.Type())
+		if err != nil {
+			return nil, errwrap.Wrapf(err, "can't determine type of %+v", value)
+		}
+
+		v, err := ValueOf(value.Elem()) // recurse
+		if err != nil {
+			return nil, errwrap.Wrapf(err, "can't determine value of %+v", value)
+		}
+
+		return &VariantValue{
+			T: t,
+			V: v,
+		}, nil
+
 	default:
-		return nil, fmt.Errorf("unable to represent value of %+v", v)
+		return nil, fmt.Errorf("unable to represent value of %+v which has kind: %v", v, kind)
 	}
 }
 
@@ -252,7 +322,7 @@ func ValueOf(v reflect.Value) (Value, error) {
 func Into(v Value, rv reflect.Value) error {
 	typ := rv.Type()
 	kind := typ.Kind()
-	for kind == reflect.Ptr {
+	for kind == reflect.Pointer {
 		typ = typ.Elem() // un-nest one pointer
 		kind = typ.Kind()
 
@@ -262,6 +332,9 @@ func Into(v Value, rv reflect.Value) error {
 			rv.Set(reflect.New(typ))
 		}
 		rv = rv.Elem() // un-nest rv from pointer
+	}
+	if !rv.CanSet() {
+		return fmt.Errorf("can't set value, is it unexported?")
 	}
 
 	// capture rv and v in a closure that is static for the scope of this Into() call
@@ -275,6 +348,19 @@ func Into(v Value, rv reflect.Value) error {
 		}
 		// No matching kind found, must be an incompatible conversion
 		return fmt.Errorf("cannot Into() %+v of type %s into %s", v, v.Type(), typ)
+	}
+
+	if typ == nil {
+		return fmt.Errorf("cannot Into() %+v of type %s into a nil type", v, v.Type())
+	}
+	// This is used when we are setting a resource field which has type of
+	// interface{} instead of a string, bool, list, etc...
+	if isInterface := typ.Kind() == reflect.Interface; isInterface {
+		//x := reflect.ValueOf(v) // no!
+		// use the value with type interface{}, not types.Value
+		x := reflect.ValueOf(v.Value())
+		rv.Set(x)
+		return nil
 	}
 
 	switch v := v.(type) {
@@ -306,8 +392,15 @@ func Into(v Value, rv reflect.Value) error {
 			return nil
 
 		case reflect.Uint, reflect.Uint64, reflect.Uint32, reflect.Uint16, reflect.Uint8:
+			// A negative mcl int can't be stored in an unsigned field
+			// without wrapping around to a huge value, so reject it.
+			// This must come before the uint64 conversion below, which
+			// would otherwise turn a negative into a large positive.
+			if v.V < 0 {
+				return fmt.Errorf("can't store negative int `%d` into unsigned `%s` field", v.V, rv.Kind())
+			}
 			ff := reflect.Zero(typ)
-			if ff.OverflowUint(uint64(v.V)) { // TODO: is this correct?
+			if ff.OverflowUint(uint64(v.V)) {
 				return fmt.Errorf("%+v is an `%s`, and rv `%d` will overflow it", rv.Interface(), rv.Kind(), v.V)
 			}
 			rv.SetUint(uint64(v.V))
@@ -333,8 +426,11 @@ func Into(v Value, rv reflect.Value) error {
 
 		switch kind {
 		case reflect.Slice:
-			pow := nextPowerOfTwo(uint32(count))
-			nval := reflect.MakeSlice(rv.Type(), count, int(pow))
+			// NOTE: We formerly over-allocated the capacity to the
+			// next power of two, but the slice is only ever filled
+			// by index below, never appended to, so a capacity of
+			// count is enough? pow := nextPowerOfTwo(uint(count))
+			nval := reflect.MakeSlice(rv.Type(), count, count)
 			rv.Set(nval)
 
 		case reflect.Array:
@@ -389,7 +485,12 @@ func Into(v Value, rv reflect.Value) error {
 			return err
 		}
 
+		keys := make([]string, 0, len(v.T.Map))
 		for k := range v.T.Map {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys { // loop in deterministic order
 			mk := k
 			// map mcl field name -> go field name based on `lang:""` tag
 			if key, exists := mapping[k]; exists {
@@ -402,103 +503,103 @@ func Into(v Value, rv reflect.Value) error {
 		}
 		return nil
 
-	case *FuncValue:
-		if err := mustInto(reflect.Func); err != nil {
-			return err
-		}
-
-		// wrap our function with the translation that is necessary
-		fn := func(args []reflect.Value) (results []reflect.Value) { // build
-			innerArgs := []Value{}
-			for _, x := range args {
-				v, err := ValueOf(x) // reflect.Value -> Value
-				if err != nil {
-					panic(fmt.Errorf("can't determine value of %+v", x))
-				}
-				innerArgs = append(innerArgs, v)
-			}
-			result, err := v.V(innerArgs) // call it
-			if err != nil {
-				// when calling our function with the Call method, then
-				// we get the error output and have a chance to decide
-				// what to do with it, but when calling it from within
-				// a normal golang function call, the error represents
-				// that something went horribly wrong, aka a panic...
-				panic(fmt.Errorf("function panic: %+v", err))
-			}
-			out := reflect.New(rv.Type().Out(0))
-			// convert the lang result back to a Go value
-			if err := Into(result, out); err != nil {
-				panic(fmt.Errorf("function return conversion panic: %+v", err))
-			}
-			return []reflect.Value{out} // only one result
-		}
-		rv.Set(reflect.MakeFunc(rv.Type(), fn))
-		return nil
+	//case *FuncValue:
+	//	if err := mustInto(reflect.Func); err != nil {
+	//		return err
+	//	}
+	//
+	//	// wrap our function with the translation that is necessary
+	//	fn := func(args []reflect.Value) (results []reflect.Value) { // build
+	//		innerArgs := []Value{}
+	//		for _, x := range args {
+	//			v, err := ValueOf(x) // reflect.Value -> Value
+	//			if err != nil {
+	//				panic(fmt.Errorf("can't determine value of %+v", x))
+	//			}
+	//			innerArgs = append(innerArgs, v)
+	//		}
+	//		result, err := v.V(innerArgs) // call it
+	//		if err != nil {
+	//			// when calling our function with the Call method, then
+	//			// we get the error output and have a chance to decide
+	//			// what to do with it, but when calling it from within
+	//			// a normal golang function call, the error represents
+	//			// that something went horribly wrong, aka a panic...
+	//			panic(fmt.Errorf("function panic: %+v", err))
+	//		}
+	//		out := reflect.New(rv.Type().Out(0))
+	//		// convert the lang result back to a Go value
+	//		if err := Into(result, out); err != nil {
+	//			panic(fmt.Errorf("function return conversion panic: %+v", err))
+	//		}
+	//		return []reflect.Value{out} // only one result
+	//	}
+	//	rv.Set(reflect.MakeFunc(rv.Type(), fn))
+	//	return nil
 
 	case *VariantValue:
 		return Into(v.V, rv)
 
 	default:
-		return fmt.Errorf("cannot Into() %+v of type %s into %s", v, v.Type(), typ)
+		return fmt.Errorf("cannot Into() %+v of type (%T) %s into %s", v, v, v.Type(), typ)
 	}
 }
 
 // ValueSlice is a linear list of values. It is used for sorting purposes.
 type ValueSlice []Value
 
-func (vs ValueSlice) Len() int           { return len(vs) }
-func (vs ValueSlice) Swap(i, j int)      { vs[i], vs[j] = vs[j], vs[i] }
-func (vs ValueSlice) Less(i, j int) bool { return vs[i].Less(vs[j]) }
+func (obj ValueSlice) Len() int           { return len(obj) }
+func (obj ValueSlice) Swap(i, j int)      { obj[i], obj[j] = obj[j], obj[i] }
+func (obj ValueSlice) Less(i, j int) bool { return obj[i].Less(obj[j]) }
 
-// base implements the missing methods that all types need.
-type base struct{}
+// Base implements the missing methods that all types need.
+type Base struct{}
 
 // Bool represents the value of this type as a bool if it is one. If this is not
 // a bool, then this panics.
-func (obj *base) Bool() bool {
+func (obj *Base) Bool() bool {
 	panic("not a bool")
 }
 
 // Str represents the value of this type as a string if it is one. If this is
 // not a string, then this panics.
-func (obj *base) Str() string {
+func (obj *Base) Str() string {
 	panic("not an str") // yes, i think this is the correct grammar
 }
 
 // Int represents the value of this type as an integer if it is one. If this is
 // not an integer, then this panics.
-func (obj *base) Int() int64 {
+func (obj *Base) Int() int64 {
 	panic("not an int")
 }
 
 // Float represents the value of this type as a float if it is one. If this is
 // not a float, then this panics.
-func (obj *base) Float() float64 {
+func (obj *Base) Float() float64 {
 	panic("not a float")
 }
 
 // List represents the value of this type as a list if it is one. If this is not
 // a list, then this panics.
-func (obj *base) List() []Value {
+func (obj *Base) List() []Value {
 	panic("not a list")
 }
 
 // Map represents the value of this type as a dictionary if it is one. If this
 // is not a map, then this panics.
-func (obj *base) Map() map[Value]Value {
+func (obj *Base) Map() map[Value]Value {
 	panic("not a list")
 }
 
 // Struct represents the value of this type as a struct if it is one. If this is
 // not a struct, then this panics.
-func (obj *base) Struct() map[string]Value {
+func (obj *Base) Struct() map[string]Value {
 	panic("not a struct")
 }
 
 // Func represents the value of this type as a function if it is one. If this is
 // not a function, then this panics.
-func (obj *base) Func() func([]Value) (Value, error) {
+func (obj *Base) Func() interface{} {
 	panic("not a func")
 }
 
@@ -506,7 +607,7 @@ func (obj *base) Func() func([]Value) (Value, error) {
 // that this base implementation of the method be replaced in the specific type.
 // This *may* panic if the two types aren't the same.
 // NOTE: this can be used as an example template to write your own function.
-//func (obj *base) Less(v Value) bool {
+//func (obj *Base) Less(v Value) bool {
 //	// TODO: cheap less, be smarter in each type eg: int's should cmp as int
 //	return obj.String() < v.String()
 //}
@@ -515,7 +616,7 @@ func (obj *base) Func() func([]Value) (Value, error) {
 // implementation uses the base Less implementation and should be replaced. It
 // is always nice to implement this properly so that we get better error output.
 // NOTE: this can be used as an example template to write your own function.
-//func (obj *base) Cmp(v Value) error {
+//func (obj *Base) Cmp(v Value) error {
 //	// if they're both true or both false, then they must be the same,
 //	// because we expect that if x < & && y < x then x == y
 //	if obj.Less(v) != v.Less(obj) {
@@ -524,9 +625,53 @@ func (obj *base) Func() func([]Value) (Value, error) {
 //	return nil
 //}
 
+// NilValue represents a nil value. It should be used only in rare situations.
+type NilValue struct {
+	Base
+}
+
+// NewNil creates a new nil value.
+func NewNil() *NilValue { return &NilValue{} }
+
+// String returns a visual representation of this value.
+func (obj *NilValue) String() string {
+	return "nil"
+}
+
+// Type returns the type data structure that represents this type.
+func (obj *NilValue) Type() *Type { return TypeNil }
+
+// Less compares to value and returns true if we're smaller. This panics if the
+// two types aren't the same. This always returns false for nil.
+func (obj *NilValue) Less(v Value) bool {
+	return false // they're the same
+}
+
+// Cmp returns an error if this value isn't the same as the arg passed in.
+func (obj *NilValue) Cmp(val Value) error {
+	if obj == nil || val == nil {
+		return fmt.Errorf("cannot cmp to nil")
+	}
+	if err := obj.Type().Cmp(val.Type()); err != nil {
+		return errwrap.Wrapf(err, "cannot cmp types")
+	}
+
+	return nil
+}
+
+// Copy returns a copy of this value.
+func (obj *NilValue) Copy() Value {
+	return &NilValue{}
+}
+
+// Value returns the raw value of this type.
+func (obj *NilValue) Value() interface{} {
+	return nil
+}
+
 // BoolValue represents a boolean value.
 type BoolValue struct {
-	base
+	Base
 	V bool
 }
 
@@ -543,7 +688,7 @@ func (obj *BoolValue) String() string {
 }
 
 // Type returns the type data structure that represents this type.
-func (obj *BoolValue) Type() *Type { return NewType("bool") }
+func (obj *BoolValue) Type() *Type { return TypeBool }
 
 // Less compares to value and returns true if we're smaller. This panics if the
 // two types aren't the same.
@@ -581,6 +726,12 @@ func (obj *BoolValue) Value() interface{} {
 	return obj.V
 }
 
+// Hash hashes this value to provide a unique key for referencing this in a map.
+func (obj *BoolValue) Hash(seed Seed) Hash {
+	//return Comparable[bool](seed, obj.V)
+	return Comparable(seed, obj.V)
+}
+
 // Bool represents the value of this type as a bool if it is one. If this is not
 // a bool, then this panics.
 func (obj *BoolValue) Bool() bool {
@@ -589,7 +740,7 @@ func (obj *BoolValue) Bool() bool {
 
 // StrValue represents a string value.
 type StrValue struct {
-	base
+	Base
 	V string
 }
 
@@ -603,7 +754,7 @@ func (obj *StrValue) String() string {
 }
 
 // Type returns the type data structure that represents this type.
-func (obj *StrValue) Type() *Type { return NewType("str") }
+func (obj *StrValue) Type() *Type { return TypeStr }
 
 // Less compares to value and returns true if we're smaller. This panics if the
 // two types aren't the same.
@@ -636,6 +787,12 @@ func (obj *StrValue) Value() interface{} {
 	return obj.V
 }
 
+// Hash hashes this value to provide a unique key for referencing this in a map.
+func (obj *StrValue) Hash(seed Seed) Hash {
+	//return Comparable[string](seed, obj.V)
+	return Comparable(seed, obj.V)
+}
+
 // Str represents the value of this type as a string if it is one. If this is
 // not a string, then this panics.
 func (obj *StrValue) Str() string {
@@ -644,7 +801,7 @@ func (obj *StrValue) Str() string {
 
 // IntValue represents an integer value.
 type IntValue struct {
-	base
+	Base
 	V int64
 }
 
@@ -657,7 +814,7 @@ func (obj *IntValue) String() string {
 }
 
 // Type returns the type data structure that represents this type.
-func (obj *IntValue) Type() *Type { return NewType("int") }
+func (obj *IntValue) Type() *Type { return TypeInt }
 
 // Less compares to value and returns true if we're smaller. This panics if the
 // two types aren't the same.
@@ -690,6 +847,12 @@ func (obj *IntValue) Value() interface{} {
 	return obj.V
 }
 
+// Hash hashes this value to provide a unique key for referencing this in a map.
+func (obj *IntValue) Hash(seed Seed) Hash {
+	//return Comparable[int64](seed, obj.V)
+	return Comparable(seed, obj.V)
+}
+
 // Int represents the value of this type as an integer if it is one. If this is
 // not an integer, then this panics.
 func (obj *IntValue) Int() int64 {
@@ -698,7 +861,7 @@ func (obj *IntValue) Int() int64 {
 
 // FloatValue represents an integer value.
 type FloatValue struct {
-	base
+	Base
 	V float64
 }
 
@@ -713,7 +876,7 @@ func (obj *FloatValue) String() string {
 }
 
 // Type returns the type data structure that represents this type.
-func (obj *FloatValue) Type() *Type { return NewType("float") }
+func (obj *FloatValue) Type() *Type { return TypeFloat }
 
 // Less compares to value and returns true if we're smaller. This panics if the
 // two types aren't the same.
@@ -747,6 +910,12 @@ func (obj *FloatValue) Value() interface{} {
 	return obj.V
 }
 
+// Hash hashes this value to provide a unique key for referencing this in a map.
+func (obj *FloatValue) Hash(seed Seed) Hash {
+	//return Comparable[float64](seed, obj.V)
+	return Comparable(seed, obj.V)
+}
+
 // Float represents the value of this type as a float if it is one. If this is
 // not a float, then this panics.
 func (obj *FloatValue) Float() float64 {
@@ -755,7 +924,7 @@ func (obj *FloatValue) Float() float64 {
 
 // ListValue represents a list value.
 type ListValue struct {
-	base
+	Base
 	V []Value // all elements must have type T.Val
 	T *Type
 }
@@ -766,13 +935,14 @@ func NewList(t *Type) *ListValue {
 		return nil // sanity check
 	}
 	return &ListValue{
+		V: []Value{},
 		T: t,
 	}
 }
 
 // String returns a visual representation of this value.
 func (obj *ListValue) String() string {
-	var s []string
+	s := make([]string, 0, len(obj.V))
 	for _, x := range obj.V {
 		s = append(s, x.String())
 	}
@@ -809,7 +979,7 @@ func (obj *ListValue) Cmp(val Value) error {
 	cmp := val.(*ListValue)
 
 	if len(obj.V) != len(cmp.V) {
-		return fmt.Errorf("values have different lengths")
+		return fmt.Errorf("lists have different lengths")
 	}
 
 	for i := range obj.V {
@@ -823,7 +993,7 @@ func (obj *ListValue) Cmp(val Value) error {
 
 // Copy returns a copy of this value.
 func (obj *ListValue) Copy() Value {
-	v := []Value{}
+	v := make([]Value, 0, len(obj.V))
 	for _, x := range obj.V {
 		v = append(v, x.Copy())
 	}
@@ -849,6 +1019,11 @@ func (obj *ListValue) Value() interface{} {
 // a list, then this panics.
 func (obj *ListValue) List() []Value {
 	return obj.V
+}
+
+// Len returns the number of elements in this list.
+func (obj *ListValue) Len() int {
+	return len(obj.V)
 }
 
 // Add adds an element to this list. It errors if the type does not match.
@@ -881,34 +1056,60 @@ func (obj *ListValue) Contains(v Value) (index int, exists bool) {
 	return -1, false
 }
 
-// MapValue represents a dictionary value.
+// MapValue represents a dictionary value. The keys must all have the same type.
+// The values must all have the same type. The type of the keys must be one that
+// is hashable. At the moment this means that only bool, str, int, float are
+// supported. Structs with valid hashable keys are also allowed.
 type MapValue struct {
-	base
+	Base
 	// the types of all keys and values are represented inside of T
 	V map[Value]Value
 	T *Type
+
+	// m is a map from hash to a list of values being stored that hash to
+	// this. It's a list in case there are hash collisions. The stored value
+	// is the pointer to the key in the above map storing the actual value.
+	m map[Hash][]Value
+
+	// s is the stored seed for this map.
+	s Seed
+
+	// TODO: If we needed to order the keys deterministically, we could add
+	// each hash here. For multiple keys that hash to the same value, we
+	// order them based on the above list order.
+	//l []Hash // do we need to order the keys?
 }
 
-// NewMap creates a new map with the specified map type.
+// NewMap creates a new map with the specified map type. It's important to use
+// this when creating a map because it initializes the internal private
+// structures. If you attempt to make this with a key type that is not hashable,
+// then this will panic!
 func NewMap(t *Type) *MapValue {
 	if t.Kind != KindMap {
 		return nil // sanity check
 	}
+	if !IsHashableType(t.Key) {
+		// key is not hashable
+		return nil
+	}
+
 	return &MapValue{
 		V: make(map[Value]Value),
 		T: t,
+		m: make(map[Hash][]Value),
+		s: MakeSeed(),
 	}
 }
 
 // String returns a visual representation of this value.
 func (obj *MapValue) String() string {
-	keys := []Value{}
+	keys := make([]Value, 0, len(obj.V))
 	for k := range obj.V {
 		keys = append(keys, k)
 	}
 	sort.Sort(ValueSlice(keys)) // deterministic print order
 
-	var s []string
+	s := make([]string, 0, len(keys))
 	for _, k := range keys {
 		s = append(s, fmt.Sprintf("%s: %s", k.String(), obj.V[k].String()))
 	}
@@ -937,17 +1138,18 @@ func (obj *MapValue) Cmp(val Value) error {
 	cmp := val.(*MapValue)
 
 	if len(obj.V) != len(cmp.V) {
-		return fmt.Errorf("values have different lengths")
+		return fmt.Errorf("maps have different lengths")
 	}
 
-	for k := range obj.V {
-		v, exists := cmp.V[k]
+	for key := range obj.V {
+		//val, exists := cmp.V[key] // wrong!
+		val, exists := cmp.Lookup(key)
 		if !exists {
-			return fmt.Errorf("index %s does not exist", k)
+			return fmt.Errorf("key %s does not exist", key)
 		}
 
-		if err := obj.V[k].Cmp(v); err != nil {
-			return errwrap.Wrapf(err, "index %s did not cmp", k)
+		if err := obj.V[key].Cmp(val); err != nil {
+			return errwrap.Wrapf(err, "key %s did not cmp", key)
 		}
 	}
 
@@ -956,13 +1158,23 @@ func (obj *MapValue) Cmp(val Value) error {
 
 // Copy returns a copy of this value.
 func (obj *MapValue) Copy() Value {
-	m := map[Value]Value{}
-	for k, v := range obj.V {
-		m[k.Copy()] = v.Copy()
+	m := make(map[Value]Value, len(obj.V))
+	newM := make(map[Hash][]Value, len(obj.V))
+	seed := MakeSeed() // the copy must hash with the seed that it stores
+	for key, val := range obj.V {
+		newKey := key.Copy()
+		newVal := val.Copy()
+
+		hash := newKey.(Hashable).Hash(seed) // must not panic
+		newM[hash] = append(newM[hash], newKey)
+		m[newKey] = newVal
 	}
+
 	return &MapValue{
 		V: m,
 		T: obj.T.Copy(),
+		m: newM,
+		s: seed,
 	}
 }
 
@@ -978,45 +1190,161 @@ func (obj *MapValue) Value() interface{} {
 }
 
 // Map represents the value of this type as a dictionary if it is one. If this
-// is not a map, then this panics.
+// is not a map, then this panics. Remember that the keys of this map are the
+// pointers to the Value objects. You *cannot* use the standard _, exists := map
+// syntax to check if a key exists. Instead use the Lookup function!
 func (obj *MapValue) Map() map[Value]Value {
 	return obj.V
 }
 
-// Add adds an element to this map. It errors if the types do not match.
-func (obj *MapValue) Add(k, v Value) error { // TODO: change method name?
+// Len returns the number of elements in this map.
+func (obj *MapValue) Len() int {
+	return len(obj.V)
+}
 
+// Set adds an element to this map. It errors if the types do not match. If the
+// key already exists, this will overwrite it.
+func (obj *MapValue) Set(key, val Value) error { // TODO: change method name?
 	//if obj.T.Key.Kind != KindVariant {
-	if err := obj.T.Key.Cmp(k.Type()); err != nil {
+	if err := obj.T.Key.Cmp(key.Type()); err != nil {
 		return errwrap.Wrapf(err, "key does not match map key type")
 	}
 	//}
-
 	if obj.T.Val.Kind != KindVariant { // skip cmp if dest is a variant
-		if err := obj.T.Val.Cmp(v.Type()); err != nil {
+		if err := obj.T.Val.Cmp(val.Type()); err != nil {
 			return errwrap.Wrapf(err, "val does not match map val type")
 		}
 	}
 
-	obj.V[k] = v
+	if typ := key.Type(); !IsHashableType(typ) {
+		return fmt.Errorf("map key type %s is not hashable", typ)
+	}
+	hashable, ok := key.(Hashable)
+	if !ok {
+		return fmt.Errorf("map key type %s is not hashable", key.Type())
+	}
+
+	hash := hashable.Hash(obj.s)
+	index := -1
+	var found Value
+	for i, x := range obj.m[hash] { // []Value
+		if x.Cmp(key) != nil {
+			continue
+		}
+		index = i
+		found = x
+		break // assume datastructure doesn't have invalid dupes
+	}
+	if index == -1 {
+		// This might not be the only key with this hash, or the last
+		// one with this hash may have been deleted, so append to it.
+		obj.m[hash] = append(obj.m[hash], key)
+	} else {
+		delete(obj.V, found) // remove old key (we're overwriting)
+		obj.m[hash][index] = key
+	}
+	obj.V[key] = val // store!
+
 	return nil
 }
 
-// Lookup searches the map for a key. On success it also returns the Value.
+// Lookup searches the map for a key. On success it also returns the Value. If
+// the key is of the wrong type, this will return false as well.
 func (obj *MapValue) Lookup(key Value) (value Value, exists bool) {
 	//v, exists := obj.V[key] // not what we want!
-	for k, v := range obj.V {
-		if k.Cmp(key) == nil {
-			return v, true // found
-		}
+
+	//for k, v := range obj.V { // slow version
+	//	if k.Cmp(key) == nil {
+	//		return v, true // found
+	//	}
+	//}
+
+	//if obj.T.Key.Kind != KindVariant {
+	if err := obj.T.Key.Cmp(key.Type()); err != nil {
+		return nil, false
 	}
-	return nil, false
+	//}
+
+	hashable, ok := key.(Hashable)
+	if !ok {
+		//return fmt.Errorf("type %s is not hashable", k.Type())
+		return nil, false
+	}
+
+	hash := hashable.Hash(obj.s)
+	if _, exists := obj.m[hash]; !exists {
+		return nil, false // not found
+	}
+
+	for _, x := range obj.m[hash] { // []Value
+		if x.Cmp(key) != nil {
+			continue
+		}
+
+		val, exists := obj.V[x]
+		if !exists {
+			// programming error or someone poked at the struct
+			panic("inconsistent map structure")
+		}
+		return val, true // found!
+	}
+
+	return nil, false // not found
+}
+
+// Delete deletes the key from the map. It returns true if it existed, false
+// otherwise. If the key is of the wrong type, this will return false as well.
+func (obj *MapValue) Delete(key Value) (exists bool) {
+	//if obj.T.Key.Kind != KindVariant {
+	if err := obj.T.Key.Cmp(key.Type()); err != nil {
+		return false
+	}
+	//}
+
+	hashable, ok := key.(Hashable)
+	if !ok {
+		return false
+		//return fmt.Errorf("type %s is not hashable", key.Type())
+	}
+
+	hash := hashable.Hash(obj.s)
+	if _, exists := obj.m[hash]; !exists {
+		return false // not found
+	}
+	index := -1
+	var found Value
+	for i, x := range obj.m[hash] { // []Value
+		if x.Cmp(key) != nil {
+			continue
+		}
+		index = i
+		found = x
+		break // assume datastructure doesn't have invalid dupes
+	}
+	if index == -1 {
+		return false // not found
+	}
+
+	// nuke that element in our list, without keeping it alive
+	entries := obj.m[hash]
+	//entries = slices.Delete(entries, index, index+1) // same as these 3
+	copy(entries[index:], entries[index+1:])
+	entries[len(entries)-1] = nil // it's a duplicate now, or the old key
+	entries = entries[:len(entries)-1]
+	if len(entries) > 0 {
+		obj.m[hash] = entries
+	} else {
+		delete(obj.m, hash) // don't keep an empty entry around
+	}
+	delete(obj.V, found) // remove old key (we're overwriting)
+
+	return true // deleted
 }
 
 // StructValue represents a struct value. The keys are ordered.
 // TODO: if all functions require arg names to call, we don't need to order!
 type StructValue struct {
-	base
+	Base
 	V map[string]Value // each field can have a different type
 	T *Type            // contains ordered field types
 }
@@ -1026,7 +1354,7 @@ func NewStruct(t *Type) *StructValue {
 	if t.Kind != KindStruct {
 		return nil // sanity check
 	}
-	v := make(map[string]Value)
+	v := make(map[string]Value, len(t.Ord))
 	for _, k := range t.Ord {
 		v[k] = t.Map[k].New() // don't leave struct fields uninitialized
 	}
@@ -1038,7 +1366,7 @@ func NewStruct(t *Type) *StructValue {
 
 // String returns a visual representation of this value.
 func (obj *StructValue) String() string {
-	var s []string
+	s := make([]string, 0, len(obj.T.Ord))
 	for _, k := range obj.T.Ord {
 		s = append(s, fmt.Sprintf("%s: %s", k, obj.V[k].String()))
 	}
@@ -1078,7 +1406,7 @@ func (obj *StructValue) Cmp(val Value) error {
 
 // Copy returns a copy of this value.
 func (obj *StructValue) Copy() Value {
-	m := map[string]Value{}
+	m := make(map[string]Value, len(obj.V))
 	for k, v := range obj.V {
 		m[k] = v.Copy()
 	}
@@ -1093,10 +1421,33 @@ func (obj *StructValue) Value() interface{} {
 	typ := obj.T.Reflect()
 	val := reflect.New(typ).Elem() // New returns a PtrTo(typ)
 
-	for _, k := range obj.T.Ord {
-		val.FieldByName(k).Set(reflect.ValueOf(obj.V[k].Value())) // recurse
+	for i, k := range obj.T.Ord {
+		// Reflect() exports the field names, but preserves the field
+		// order, so set by index instead of by name.
+		val.Field(i).Set(reflect.ValueOf(obj.V[k].Value())) // recurse
 	}
 	return val.Interface()
+}
+
+// Hash hashes this value to provide a unique key for referencing this in a map.
+func (obj *StructValue) Hash(seed Seed) Hash {
+	if obj.V == nil {
+		panic("malformed struct")
+	}
+	if obj.T == nil {
+		panic("malformed struct type")
+	}
+	if len(obj.V) != len(obj.T.Ord) {
+		panic("malformed struct length")
+	}
+	if len(obj.T.Map) != len(obj.T.Ord) {
+		panic("malformed struct length")
+	}
+
+	h := NewHasher(seed) // *Hasher
+	return h.Hash(obj)
+	//return Comparable[?](seed, obj.V)
+	//return Comparable(seed, obj.V)
 }
 
 // Struct represents the value of this type as a struct if it is one. If this is
@@ -1128,23 +1479,33 @@ func (obj *StructValue) Lookup(k string) (value Value, exists bool) {
 	return v, exists
 }
 
-// FuncValue represents a function value. The defined function takes a list of
-// Value arguments and returns a Value. It can also return an error which could
-// represent that something went horribly wrong. (Think, an internal panic.)
+// FuncValue represents a function which takes a list of Value arguments and
+// returns a Value. It can also return an error which could represent that
+// something went horribly wrong. (Think, an internal panic.)
+//
+// This is not general enough to represent all functions in the language (see
+// the full.FuncValue), but it is a useful common case.
+//
+// FuncValue is not a Value, but it is a useful building block for implementing
+// Func nodes.
 type FuncValue struct {
-	base
-	V func([]Value) (Value, error)
+	Base
+	V func(context.Context, []Value) (Value, error)
 	T *Type // contains ordered field types, arg names are a bonus part
 }
 
-// NewFunc creates a new function with the specified type.
+// NewFunc creates a useless function which will get overwritten by something
+// more useful later.
 func NewFunc(t *Type) *FuncValue {
 	if t.Kind != KindFunc {
 		return nil // sanity check
 	}
-	v := func([]Value) (Value, error) {
-		return nil, fmt.Errorf("nil function") // TODO: is this correct?
+	v := func(context.Context, []Value) (Value, error) {
+		// You were not supposed to call the temporary function, you
+		// were supposed to replace it with a real implementation!
+		return nil, fmt.Errorf("nil function")
 	}
+	// return an empty interface{}
 	return &FuncValue{
 		V: v,
 		T: t,
@@ -1160,78 +1521,74 @@ func (obj *FuncValue) String() string {
 func (obj *FuncValue) Type() *Type { return obj.T }
 
 // Less compares to value and returns true if we're smaller. This panics if the
-// two types aren't the same.
+// two types aren't the same. In this situation, they can't be compared so we
+// panic.
 func (obj *FuncValue) Less(v Value) bool {
-	V := v.(*FuncValue)
-	return obj.String() < V.String() // FIXME: implement a proper less func
+	//V := v.(*FuncValue)
+	//return obj.String() < V.String() // FIXME: implement a proper less func
+	panic("you cannot compare functions")
 }
 
-// Cmp returns an error if this value isn't the same as the arg passed in.
+// Cmp returns an error if this value isn't the same as the arg passed in. In
+// this situation, they can't be compared so we panic.
 func (obj *FuncValue) Cmp(val Value) error {
-	if obj == nil || val == nil {
-		return fmt.Errorf("cannot cmp to nil")
-	}
-	if err := obj.Type().Cmp(val.Type()); err != nil {
-		return errwrap.Wrapf(err, "cannot cmp types")
-	}
-
-	return fmt.Errorf("cannot cmp funcs") // TODO: can we ?
+	//if obj == nil || val == nil {
+	//	return fmt.Errorf("cannot cmp to nil")
+	//}
+	//if err := obj.Type().Cmp(val.Type()); err != nil {
+	//	return errwrap.Wrapf(err, "cannot cmp types")
+	//}
+	//
+	//return fmt.Errorf("cannot cmp funcs") // TODO: can we ?
+	panic("you cannot compare functions")
 }
 
 // Copy returns a copy of this value.
 func (obj *FuncValue) Copy() Value {
 	return &FuncValue{
-		V: obj.V, // FIXME: can we copy the function, or do we need to?
+		V: obj.V,
 		T: obj.T.Copy(),
 	}
 }
 
 // Value returns the raw value of this type.
 func (obj *FuncValue) Value() interface{} {
-	typ := obj.T.Reflect()
-
-	// wrap our function with the translation that is necessary
-	fn := func(args []reflect.Value) (results []reflect.Value) { // build
-		innerArgs := []Value{}
-		for _, x := range args {
-			v, err := ValueOf(x) // reflect.Value -> Value
-			if err != nil {
-				panic(fmt.Sprintf("can't determine value of %+v", x))
-			}
-			innerArgs = append(innerArgs, v)
-		}
-		result, err := obj.V(innerArgs) // call it
-		if err != nil {
-			// when calling our function with the Call method, then
-			// we get the error output and have a chance to decide
-			// what to do with it, but when calling it from within
-			// a normal golang function call, the error represents
-			// that something went horribly wrong, aka a panic...
-			panic(fmt.Sprintf("function panic: %+v", err))
-		}
-		return []reflect.Value{reflect.ValueOf(result.Value())} // only one result
-	}
-	val := reflect.MakeFunc(typ, fn)
-	return val.Interface()
-}
-
-// Func represents the value of this type as a function if it is one. If this is
-// not a function, then this panics.
-func (obj *FuncValue) Func() func([]Value) (Value, error) {
+	//typ := obj.T.Reflect()
+	//
+	//// wrap our function with the translation that is necessary
+	//fn := func(args []reflect.Value) (results []reflect.Value) { // build
+	//	innerArgs := []Value{}
+	//	for _, x := range args {
+	//		v, err := ValueOf(x) // reflect.Value -> Value
+	//		if err != nil {
+	//			panic(fmt.Sprintf("can't determine value of %+v", x))
+	//		}
+	//		innerArgs = append(innerArgs, v)
+	//	}
+	//	result, err := obj.V(innerArgs) // call it
+	//	if err != nil {
+	//		// when calling our function with the Call method, then
+	//		// we get the error output and have a chance to decide
+	//		// what to do with it, but when calling it from within
+	//		// a normal golang function call, the error represents
+	//		// that something went horribly wrong, aka a panic...
+	//		panic(fmt.Sprintf("function panic: %+v", err))
+	//	}
+	//	return []reflect.Value{reflect.ValueOf(result.Value())} // only one result
+	//}
+	//val := reflect.MakeFunc(typ, fn)
+	//return val.Interface()
 	return obj.V
-}
-
-// Set sets the function value to be a new function.
-func (obj *FuncValue) Set(fn func([]Value) (Value, error)) error { // TODO: change method name?
-	obj.V = fn
-	return nil // TODO: can we do any sort of checking here?
 }
 
 // Call runs the function value and returns its result. It returns an error if
 // something goes wrong during execution, and panic's if you call this with
 // inappropriate input types, or if it returns an inappropriate output type.
-func (obj *FuncValue) Call(args []Value) (Value, error) {
+func (obj *FuncValue) Call(ctx context.Context, args []Value) (Value, error) {
 	// cmp input args type to obj.T
+	if obj.T == nil {
+		return nil, fmt.Errorf("the type is nil")
+	}
 	length := len(obj.T.Ord)
 	if length != len(args) {
 		return nil, fmt.Errorf("arg length of %d does not match expected of %d", len(args), length)
@@ -1242,12 +1599,13 @@ func (obj *FuncValue) Call(args []Value) (Value, error) {
 		}
 	}
 
-	result, err := obj.V(args) // call it
+	result, err := obj.V(ctx, args) // call it
 	if result == nil {
 		if err == nil {
+			// programming error?
 			return nil, fmt.Errorf("function returned nil result")
 		}
-		return nil, errwrap.Wrapf(err, "function returned nil result during error")
+		return nil, err
 	}
 	if err := result.Type().Cmp(obj.T.Out); err != nil {
 		return nil, errwrap.Wrapf(err, "cannot cmp return types")
@@ -1258,7 +1616,7 @@ func (obj *FuncValue) Call(args []Value) (Value, error) {
 
 // VariantValue represents a variant value.
 type VariantValue struct {
-	base
+	Base
 	V Value // formerly I experimented with using interface{} instead
 	T *Type
 }
@@ -1377,6 +1735,142 @@ func (obj *VariantValue) Struct() map[string]Value {
 
 // Func represents the value of this type as a function if it is one. If this is
 // not a function, then this panics.
-func (obj *VariantValue) Func() func([]Value) (Value, error) {
+func (obj *VariantValue) Func() interface{} {
 	return obj.V.Func()
+}
+
+// ErrValue represents an error that is passed around in place of a real value.
+// It is used by the function engine to propagate errors along the edges of the
+// function graph, so that a downstream vertex can catch them and provide a
+// fallback value if it knows how to. This is *not* a normal value, and it must
+// never be used or stored where a real value is expected. The type it carries
+// is the type of the value that would have been produced if the error had not
+// occurred. This is so that type comparison operations still work when this
+// value is passed around in place of a real one.
+type ErrValue struct {
+	Base
+
+	// Typ is the type of the value which would exist if it didn't error.
+	Typ *Type
+
+	// Err is the error that this value is carrying. It must not be nil.
+	Err error
+}
+
+// String returns a visual representation of this value.
+func (obj *ErrValue) String() string {
+	return fmt.Sprintf("err(%v)", obj.Err)
+}
+
+// Type returns the type data structure that represents this type.
+func (obj *ErrValue) Type() *Type { return obj.Typ }
+
+// Less compares to value and returns true if we're smaller. This panics for
+// this type because error values must not be sorted.
+func (obj *ErrValue) Less(v Value) bool {
+	panic("cannot compare error values")
+}
+
+// Cmp returns an error if this value isn't the same as the arg passed in.
+func (obj *ErrValue) Cmp(val Value) error {
+	if obj == nil || val == nil {
+		return fmt.Errorf("cannot cmp to nil")
+	}
+	if err := obj.Type().Cmp(val.Type()); err != nil {
+		return errwrap.Wrapf(err, "cannot cmp types")
+	}
+
+	cmp, ok := val.(*ErrValue)
+	if !ok {
+		return fmt.Errorf("values are not both error values")
+	}
+	if obj.Err.Error() != cmp.Err.Error() {
+		return fmt.Errorf("values are different")
+	}
+
+	return nil
+}
+
+// Copy returns a copy of this value.
+func (obj *ErrValue) Copy() Value {
+	return &ErrValue{
+		Typ: obj.Typ.Copy(),
+		Err: obj.Err,
+	}
+}
+
+// Value returns the raw value of this type.
+func (obj *ErrValue) Value() interface{} {
+	return obj.Err
+}
+
+// IsErr determines if a value is actually an error value in disguise. These are
+// usually passed around by the function engine, and are not expected to be
+// visible to most code.
+func IsErr(v Value) (error, bool) {
+	ev, ok := v.(*ErrValue)
+	if !ok {
+		return nil, false
+	}
+	return ev.Err, true
+}
+
+// OpaqueValue is a value with the nil type, which carries some private golang
+// data along with it. Some internal functions which produce no real value (eg:
+// the ones which build the statements of an if or a for loop at runtime) return
+// one of these, so that they can pass that data to whoever reads the table of
+// values, along with that table. That way the data always matches the table,
+// even after the function engine has moved on and built new data. This is *not*
+// a normal value, and mcl code must never be able to see it. Since the data
+// might not be comparable, two of these are only the same if they're the very
+// same pointer, so a function should return the same one until its data has
+// changed. For that same reason, Copy returns the very same pointer too.
+type OpaqueValue struct {
+	Base
+
+	// Data is the private data that this value carries.
+	Data interface{}
+}
+
+// String returns a visual representation of this value.
+func (obj *OpaqueValue) String() string {
+	return fmt.Sprintf("opaque(%p)", obj)
+}
+
+// Type returns the type data structure that represents this type.
+func (obj *OpaqueValue) Type() *Type { return TypeNil }
+
+// Less compares to value and returns true if we're smaller. This panics for
+// this type because opaque values must not be sorted.
+func (obj *OpaqueValue) Less(v Value) bool {
+	panic("cannot compare opaque values")
+}
+
+// Cmp returns an error if this value isn't the same as the arg passed in. Two
+// opaque values are only the same if they're the very same pointer.
+func (obj *OpaqueValue) Cmp(val Value) error {
+	if obj == nil || val == nil {
+		return fmt.Errorf("cannot cmp to nil")
+	}
+
+	cmp, ok := val.(*OpaqueValue)
+	if !ok {
+		return fmt.Errorf("values are not both opaque values")
+	}
+	if obj != cmp {
+		return fmt.Errorf("values are different")
+	}
+
+	return nil
+}
+
+// Copy returns the very same value, since it can't be modified, and since two
+// opaque values are only the same if they're the very same pointer.
+func (obj *OpaqueValue) Copy() Value {
+	return obj
+}
+
+// Value returns the raw value of this type.
+func (obj *OpaqueValue) Value() interface{} {
+	return obj.Data
 }

@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,18 +13,31 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
-// +build !root
+//go:build !root
 
 package resources
 
 import (
+	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/user"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,6 +46,7 @@ import (
 	"time"
 
 	"github.com/purpleidea/mgmt/engine"
+	engineUtil "github.com/purpleidea/mgmt/engine/util"
 	"github.com/purpleidea/mgmt/pgraph"
 	"github.com/purpleidea/mgmt/util"
 	"github.com/purpleidea/mgmt/util/errwrap"
@@ -84,7 +98,8 @@ type startupStep struct {
 
 func (obj *startupStep) Action() error {
 	select {
-	case <-obj.ch: // called by Running() in Watch
+	case <-obj.ch: // called by Event() in Watch
+	//nolint:gosec // G115: ms is a test-controlled value
 	case <-time.After(time.Duration(obj.ms) * time.Millisecond):
 		return fmt.Errorf("took too long to startup")
 	}
@@ -114,6 +129,7 @@ func (obj *changedStep) Action() error {
 		if checkOK != obj.expect {
 			return fmt.Errorf("got unexpected checkOK value of: %t", checkOK)
 		}
+	//nolint:gosec // G115: ms is a test-controlled value
 	case <-time.After(time.Duration(obj.ms) * time.Millisecond):
 		return fmt.Errorf("took too long to startup")
 	}
@@ -143,6 +159,7 @@ func (obj *clearChangedStep) Action() error {
 			if !ok {
 				return fmt.Errorf("channel closed unexpectedly")
 			}
+		//nolint:gosec // G115: ms is a test-controlled value
 		case <-time.After(time.Duration(obj.ms) * time.Millisecond):
 			return nil // done waiting
 		}
@@ -165,7 +182,7 @@ func FileExpect(p, s string) Step { // path & string
 	return &manualStep{
 		action: func() error { return nil },
 		expect: func() error {
-			content, err := ioutil.ReadFile(p)
+			content, err := os.ReadFile(p)
 			if err != nil {
 				return err
 			}
@@ -183,9 +200,13 @@ func FileOwnerExpect(p, o string) Step { // path & owner
 	return &manualStep{
 		action: func() error { return nil },
 		expect: func() error {
-			var stat syscall.Stat_t
-			if err := syscall.Stat(p, &stat); err != nil {
+			fileInfo, err := os.Stat(p)
+			if err != nil {
 				return err
+			}
+			stat, ok := fileInfo.Sys().(*syscall.Stat_t)
+			if !ok {
+				return fmt.Errorf("file stat type did not match in %s", p)
 			}
 			i, err := strconv.ParseUint(o, 10, 32)
 			if err != nil {
@@ -206,7 +227,7 @@ func FileWrite(p, s string) Step { // path & string
 		action: func() error {
 			// TODO: apparently using 0666 is equivalent to respecting the current umask
 			const umask = 0666
-			return ioutil.WriteFile(p, []byte(s), umask)
+			return os.WriteFile(p, []byte(s), umask)
 		},
 		expect: func() error { return nil },
 	}
@@ -220,9 +241,11 @@ func ErrIsNotExistOK(e error) error {
 	return errwrap.Wrapf(e, "unexpected error")
 }
 
-// GetUID returns the UID of the user running this test.
+// GetUID returns the UID of the user running this test. It consults the process
+// identity directly rather than $USER, which may be unset under some test
+// runners.
 func GetUID() (string, error) {
-	u, err := user.Lookup(os.Getenv("USER"))
+	u, err := user.Current()
 	if err != nil {
 		return "", err
 	}
@@ -248,6 +271,7 @@ func TestResources1(t *testing.T) {
 	sleep := func(ms uint) Step {
 		return &manualStep{
 			action: func() error {
+				//nolint:gosec // G115: ms is a test-controlled value
 				time.Sleep(time.Duration(ms) * time.Millisecond)
 				return nil
 			},
@@ -259,7 +283,7 @@ func TestResources1(t *testing.T) {
 	{
 		r := makeRes("file", "r1")
 		res := r.(*FileRes) // if this panics, the test will panic
-		p := "/tmp/whatever"
+		p := filepath.Join(t.TempDir(), "whatever")
 		s := "hello, world\n"
 		res.Path = p
 		res.State = FileStateExists
@@ -291,10 +315,10 @@ func TestResources1(t *testing.T) {
 		r := makeRes("exec", "x1")
 		res := r.(*ExecRes) // if this panics, the test will panic
 		s := "hello, world"
-		f := "/tmp/whatever"
+		f := filepath.Join(t.TempDir(), "whatever")
 		res.Cmd = fmt.Sprintf("echo '%s' > '%s'", s, f)
 		res.Shell = "/bin/bash"
-		res.IfCmd = "! diff <(cat /tmp/whatever) <(echo hello, world)"
+		res.IfCmd = fmt.Sprintf("! diff <(cat %q) <(echo hello, world)", f)
 		res.IfShell = "/bin/bash"
 		res.WatchCmd = fmt.Sprintf("/usr/bin/inotifywait -e modify -m %s", f)
 		//res.WatchShell = "/bin/bash"
@@ -317,7 +341,7 @@ func TestResources1(t *testing.T) {
 			timeline: timeline,
 			expect:   func() error { return nil },
 			// build file for inotifywait
-			startup: func() error { return ioutil.WriteFile(f, []byte("starting...\n"), 0666) },
+			startup: func() error { return os.WriteFile(f, []byte("starting...\n"), 0600) },
 			cleanup: func() error { return os.Remove(f) },
 		})
 	}
@@ -327,10 +351,10 @@ func TestResources1(t *testing.T) {
 		res.Env = map[string]string{
 			"boiling": "one hundred",
 		}
-		f := "/tmp/whatever"
-		res.Cmd = fmt.Sprintf("env | grep boiling > %s", f)
+		f := filepath.Join(t.TempDir(), "whatever")
+		res.Cmd = fmt.Sprintf("env | grep boiling > %q", f)
 		res.Shell = "/bin/bash"
-		res.IfCmd = "! diff <(cat /tmp/whatever) <(echo boiling=one hundred)"
+		res.IfCmd = fmt.Sprintf("! diff <(cat %q) <(echo boiling=one hundred)", f)
 		res.IfShell = "/bin/bash"
 		res.WatchCmd = fmt.Sprintf("/usr/bin/inotifywait -e modify -m %s", f)
 		res.WatchShell = "/bin/bash"
@@ -353,14 +377,14 @@ func TestResources1(t *testing.T) {
 			timeline: timeline,
 			expect:   func() error { return nil },
 			// build file for inotifywait
-			startup: func() error { return ioutil.WriteFile(f, []byte("starting...\n"), 0666) },
+			startup: func() error { return os.WriteFile(f, []byte("starting...\n"), 0600) },
 			cleanup: func() error { return os.Remove(f) },
 		})
 	}
 	{
 		r := makeRes("file", "r1")
 		res := r.(*FileRes) // if this panics, the test will panic
-		p := "/tmp/emptyfile"
+		p := filepath.Join(t.TempDir(), "emptyfile")
 		res.Path = p
 		res.State = FileStateExists
 
@@ -384,7 +408,7 @@ func TestResources1(t *testing.T) {
 	{
 		r := makeRes("file", "r1")
 		res := r.(*FileRes) // if this panics, the test will panic
-		p := "/tmp/existingfile"
+		p := filepath.Join(t.TempDir(), "existingfile")
 		res.Path = p
 		res.State = FileStateExists
 		content := "some existing text\n"
@@ -401,15 +425,18 @@ func TestResources1(t *testing.T) {
 			fail:     false,
 			timeline: timeline,
 			expect:   func() error { return nil },
-			startup:  func() error { return ioutil.WriteFile(p, []byte(content), 0666) },
+			startup:  func() error { return os.WriteFile(p, []byte(content), 0600) },
 			cleanup:  func() error { return os.Remove(p) },
 		})
 	}
 	{
 		r := makeRes("file", "r1")
 		res := r.(*FileRes) // if this panics, the test will panic
-		p := "/tmp/ownerfile"
-		uid, _ := GetUID()
+		p := filepath.Join(t.TempDir(), "ownerfile")
+		uid, err := GetUID()
+		if err != nil {
+			t.Fatalf("func GetUID: %v", err)
+		}
 		res.Path = p
 		res.State = FileStateExists
 		res.Owner = uid
@@ -428,7 +455,7 @@ func TestResources1(t *testing.T) {
 			fail:     false,
 			timeline: timeline,
 			expect:   func() error { return nil },
-			startup:  func() error { return ioutil.WriteFile(p, []byte(content), 0666) },
+			startup:  func() error { return os.WriteFile(p, []byte(content), 0600) },
 			cleanup:  func() error { return os.Remove(p) },
 		})
 	}
@@ -484,30 +511,35 @@ func TestResources1(t *testing.T) {
 
 			changedChan := make(chan bool, 1) // buffered!
 			readyChan := make(chan struct{})
+			readyOnce := &sync.Once{}
+			readyOnceFn := func() {
+				close(readyChan)
+			}
 			eventChan := make(chan struct{})
-			doneChan := make(chan struct{})
-			debug := testing.Verbose() // set via the -test.v flag to `go test`
+			tmpdir := fmt.Sprintf("%s/", t.TempDir()) // gets cleaned up at end, new dir for each call
+			debug := testing.Verbose()                // set via the -test.v flag to `go test`
 			logf := func(format string, v ...interface{}) {
 				t.Logf(fmt.Sprintf("test #%d: ", index)+format, v...)
 			}
 			init := &engine.Init{
-				Running: func() {
-					close(readyChan)
+				// Watch runs this to send a changed event.
+				Event: func(ctx context.Context) error {
+					readyOnce.Do(readyOnceFn) // only once!
+
 					select { // this always sends one!
 					case eventChan <- struct{}{}:
+						return nil
 
+					case <-ctx.Done():
+						return ctx.Err()
 					}
 				},
-				// Watch runs this to send a changed event.
-				Event: func() {
-					select {
-					case eventChan <- struct{}{}:
 
-					}
+				VarDir: func(p string) (string, error) {
+					return path.Join(tmpdir, p), nil
 				},
 
 				// Watch listens on this for close/pause events.
-				Done:  doneChan,
 				Debug: debug,
 				Logf:  logf,
 
@@ -541,9 +573,9 @@ func TestResources1(t *testing.T) {
 				}
 			}()
 			closeFn := func() {
-				// run close (we don't ever expect an error on close!)
-				t.Logf("test #%d: running Close", index)
-				if err := res.Close(); err != nil {
+				// run cleanup (we don't ever expect an error on cleanup!)
+				t.Logf("test #%d: running Cleanup", index)
+				if err := res.Cleanup(); err != nil {
 					t.Errorf("test #%d: FAIL", index)
 					t.Errorf("test #%d: could not close Res: %+v", index, err)
 					//return
@@ -582,13 +614,16 @@ func TestResources1(t *testing.T) {
 			defer closeFn()
 
 			// run watch
+			doneCtx, doneCtxCancel := context.WithCancel(context.Background())
 			wg := &sync.WaitGroup{}
 			defer wg.Wait() // if we return early
+			defer close(changedChan)
+			defer doneCtxCancel()
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				t.Logf("test #%d: running Watch", index)
-				if err := res.Watch(); err != nil {
+				if err := res.Watch(doneCtx); err != nil && err != context.Canceled {
 					t.Errorf("test #%d: FAIL", index)
 					t.Errorf("test #%d: Watch failed: %s", index, err.Error())
 				}
@@ -597,7 +632,13 @@ func TestResources1(t *testing.T) {
 
 			// TODO: can we block here if the test fails early?
 			select {
-			case <-readyChan: // called by Running() in Watch
+			case <-readyChan: // called by Event() in Watch
+			case _, ok := <-eventChan:
+				if !ok {
+					t.Errorf("test #%d: FAIL", index)
+					t.Errorf("test #%d: Watch exited before startup", index)
+					return
+				}
 			}
 			wg.Add(1)
 			go func() { // run timeline
@@ -629,7 +670,7 @@ func TestResources1(t *testing.T) {
 					}
 				}
 				t.Logf("test #%d: shutting down Watch", index)
-				close(doneChan) // send Watch shutdown command
+				doneCtxCancel() // send Watch shutdown command
 			}()
 		Loop:
 			for {
@@ -642,7 +683,7 @@ func TestResources1(t *testing.T) {
 				}
 
 				t.Logf("test #%d: running CheckApply", index)
-				checkOK, err := res.CheckApply(true) // no noop!
+				checkOK, err := res.CheckApply(context.TODO(), true) // no noop!
 				if err != nil {
 					t.Errorf("test #%d: FAIL", index)
 					t.Errorf("test #%d: CheckApply failed: %s", index, err.Error())
@@ -734,6 +775,11 @@ func TestResources2(t *testing.T) {
 			Logf: logf,
 
 			// unused
+			Event: func(ctx context.Context) error {
+				return nil
+			},
+
+			// unused
 			Send: func(st interface{}) error {
 				return nil
 			},
@@ -745,7 +791,7 @@ func TestResources2(t *testing.T) {
 			FilteredGraph: func() (*pgraph.Graph, error) {
 				//graph, err := pgraph.NewGraph("filtered")
 				//if err != nil {
-				//	return nil, errwrap.Wrapf(err, "could not create graph")
+				//	return nil, err
 				//}
 				// Hack: We just add ourself as allowed since
 				// we're just a one-vertex test suite...
@@ -769,7 +815,7 @@ func TestResources2(t *testing.T) {
 	// the returned error.
 	resCheckApplyError := func(res engine.Res, expCheckOK bool, errOK func(e error) error) func() error {
 		return func() error {
-			checkOK, err := res.CheckApply(true) // no noop!
+			checkOK, err := res.CheckApply(context.TODO(), true) // no noop!
 			if e := errOK(err); e != nil {
 				return errwrap.Wrapf(e, "error from CheckApply did not match expected")
 			}
@@ -791,16 +837,16 @@ func TestResources2(t *testing.T) {
 		}
 		return resCheckApplyError(res, expCheckOK, errOK)
 	}
-	// resClose runs Close on the res.
-	resClose := func(res engine.Res) func() error {
-		// run Close
+	// resCleanup runs Cleanup on the res.
+	resCleanup := func(res engine.Res) func() error {
+		// run Cleanup
 		return func() error {
-			return res.Close()
+			return res.Cleanup()
 		}
 	}
 	// resReversal runs Reverse on the resource and stores the result in the
 	// rev variable. This should be called before the res CheckApply, and
-	// usually before Init, but after Validate.
+	// after Validate and after Init so that it can use the World API there.
 	resReversal := func(res engine.Res, rev *engine.Res) func() error {
 		return func() error {
 			r, ok := res.(engine.ReversibleRes)
@@ -817,7 +863,7 @@ func TestResources2(t *testing.T) {
 				//logf("triangle reversal") // warn!
 			}
 
-			reversed, err := r.Reversed()
+			reversed, err := r.Reversed(t.Context())
 			if err != nil {
 				return errwrap.Wrapf(err, "could not reverse: %s", r.String())
 			}
@@ -839,13 +885,13 @@ func TestResources2(t *testing.T) {
 	fileWrite := func(p, s string) func() error {
 		// write the file to path
 		return func() error {
-			return ioutil.WriteFile(p, []byte(s), 0666)
+			return os.WriteFile(p, []byte(s), 0600)
 		}
 	}
 	fileExpect := func(p, s string) func() error {
 		// check the contents at the path match the string we expect
 		return func() error {
-			content, err := ioutil.ReadFile(p)
+			content, err := os.ReadFile(p)
 			if err != nil {
 				return err
 			}
@@ -899,12 +945,13 @@ func TestResources2(t *testing.T) {
 		// mkdir at the path
 		return func() error {
 			if all {
-				return os.MkdirAll(p, 0777)
+				return os.MkdirAll(p, 0750)
 			}
-			return os.Mkdir(p, 0777)
+			return os.Mkdir(p, 0750)
 		}
 	}
 
+	tmpdir := t.TempDir()
 	testCases := []test{}
 	{
 		//file "/tmp/somefile" {
@@ -913,7 +960,7 @@ func TestResources2(t *testing.T) {
 		//}
 		r1 := makeRes("file", "r1")
 		res := r1.(*FileRes) // if this panics, the test will panic
-		p := "/tmp/somefile"
+		p := filepath.Join(tmpdir, "somefile")
 		res.Path = p
 		res.State = FileStateExists
 		content := "some new text\n"
@@ -926,7 +973,7 @@ func TestResources2(t *testing.T) {
 			resCheckApply(r1, false), // changed
 			fileExpect(p, content),
 			resCheckApply(r1, true), // it's already good
-			resClose(r1),
+			resCleanup(r1),
 			fileExpect(p, content), // ensure it exists
 		}
 
@@ -945,7 +992,7 @@ func TestResources2(t *testing.T) {
 		//}
 		r1 := makeRes("file", "r1")
 		res := r1.(*FileRes) // if this panics, the test will panic
-		p := "/tmp/somefile"
+		p := filepath.Join(tmpdir, "somefile")
 		res.Path = p
 		//res.State = FileStateExists // not specified!
 		content := "some new text\n"
@@ -958,7 +1005,7 @@ func TestResources2(t *testing.T) {
 			resCheckApply(r1, false), // changed
 			fileExpect(p, content),
 			resCheckApply(r1, true), // it's already good
-			resClose(r1),
+			resCleanup(r1),
 			fileExpect(p, content), // ensure it exists
 		}
 
@@ -978,7 +1025,7 @@ func TestResources2(t *testing.T) {
 		// and no existing file exists! (therefore we want an error!)
 		r1 := makeRes("file", "r1")
 		res := r1.(*FileRes) // if this panics, the test will panic
-		p := "/tmp/somefile"
+		p := filepath.Join(tmpdir, "somefile")
 		res.Path = p
 		//res.State = FileStateExists // not specified!
 		content := "some new text\n"
@@ -990,7 +1037,7 @@ func TestResources2(t *testing.T) {
 			resInit(r1),
 			resCheckApplyError(r1, false, ErrIsNotExistOK), // should error
 			resCheckApplyError(r1, false, ErrIsNotExistOK), // double check
-			resClose(r1),
+			resCleanup(r1),
 			fileAbsent(p), // ensure it's absent
 		}
 
@@ -1009,7 +1056,7 @@ func TestResources2(t *testing.T) {
 		// and no existing file exists!
 		r1 := makeRes("file", "r1")
 		res := r1.(*FileRes) // if this panics, the test will panic
-		p := "/tmp/somefile"
+		p := filepath.Join(tmpdir, "somefile")
 		res.Path = p
 		res.State = FileStateAbsent
 
@@ -1019,7 +1066,7 @@ func TestResources2(t *testing.T) {
 			resInit(r1),
 			resCheckApply(r1, true),
 			resCheckApply(r1, true),
-			resClose(r1),
+			resCleanup(r1),
 			fileAbsent(p), // ensure it's absent
 		}
 
@@ -1038,7 +1085,7 @@ func TestResources2(t *testing.T) {
 		// and a file already exists!
 		r1 := makeRes("file", "r1")
 		res := r1.(*FileRes) // if this panics, the test will panic
-		p := "/tmp/somefile"
+		p := filepath.Join(tmpdir, "somefile")
 		res.Path = p
 		res.State = FileStateAbsent
 
@@ -1048,7 +1095,7 @@ func TestResources2(t *testing.T) {
 			resInit(r1),
 			resCheckApply(r1, false),
 			resCheckApply(r1, true),
-			resClose(r1),
+			resCleanup(r1),
 			fileAbsent(p), // ensure it's absent
 		}
 
@@ -1069,7 +1116,7 @@ func TestResources2(t *testing.T) {
 		//}
 		r1 := makeRes("file", "r1")
 		res := r1.(*FileRes) // if this panics, the test will panic
-		p := "/tmp/somefile"
+		p := filepath.Join(tmpdir, "somefile")
 		res.Path = p
 		res.State = FileStateExists
 		content := "some new text\n"
@@ -1092,7 +1139,7 @@ func TestResources2(t *testing.T) {
 			resCheckApply(r1, false), // changed
 			fileExpect(p, content),
 			resCheckApply(r1, true), // it's already good
-			resClose(r1),
+			resCleanup(r1),
 			//resValidate(r2), // no!!!
 			func() error {
 				// wrap it b/c it is currently nil
@@ -1108,7 +1155,7 @@ func TestResources2(t *testing.T) {
 				return resCheckApply(r2, true)()
 			},
 			func() error {
-				return resClose(r2)()
+				return resCleanup(r2)()
 			},
 			fileAbsent(p), // ensure it's absent
 		}
@@ -1130,7 +1177,7 @@ func TestResources2(t *testing.T) {
 		//# and there's an existing file at this path...
 		r1 := makeRes("file", "r1")
 		res := r1.(*FileRes) // if this panics, the test will panic
-		p := "/tmp/somefile"
+		p := filepath.Join(tmpdir, "somefile")
 		res.Path = p
 		//res.State = FileStateExists // unspecified
 		content := "some new text\n"
@@ -1154,7 +1201,7 @@ func TestResources2(t *testing.T) {
 			resCheckApply(r1, false), // changed
 			fileExpect(p, content),
 			resCheckApply(r1, true), // it's already good
-			resClose(r1),
+			resCleanup(r1),
 			//resValidate(r2),
 			func() error {
 				// wrap it b/c it is currently nil
@@ -1170,7 +1217,7 @@ func TestResources2(t *testing.T) {
 				return resCheckApply(r2, true)()
 			},
 			func() error {
-				return resClose(r2)()
+				return resCleanup(r2)()
 			},
 			fileExpect(p, original), // we restored the contents!
 			fileRemove(p),           // cleanup
@@ -1195,7 +1242,7 @@ func TestResources2(t *testing.T) {
 		//# Now that we error in this scenario before reversal, it's ok!
 		r1 := makeRes("file", "r1")
 		res := r1.(*FileRes) // if this panics, the test will panic
-		p := "/tmp/somefile"
+		p := filepath.Join(tmpdir, "somefile")
 		res.Path = p
 		//res.State = FileStateExists // unspecified
 		content := "some new text\n"
@@ -1218,7 +1265,7 @@ func TestResources2(t *testing.T) {
 			resCheckApplyError(r1, false, ErrIsNotExistOK), // changed
 			//fileExpect(p, content),
 			//resCheckApply(r1, true), // it's already good
-			resClose(r1),
+			resCleanup(r1),
 			//func() error {
 			//	// wrap it b/c it is currently nil
 			//	return r2.Validate()
@@ -1230,7 +1277,7 @@ func TestResources2(t *testing.T) {
 			//	return resCheckApply(r2, true)()
 			//},
 			//func() error {
-			//	return resClose(r2)()
+			//	return resCleanup(r2)()
 			//},
 			//fileExpect(p, content), // we never changed it back...
 			//fileRemove(p),          // cleanup
@@ -1252,7 +1299,7 @@ func TestResources2(t *testing.T) {
 		//}
 		r1 := makeRes("file", "r1")
 		res := r1.(*FileRes) // if this panics, the test will panic
-		p := "/tmp/somefile"
+		p := filepath.Join(tmpdir, "somefile")
 		res.Path = p
 		res.State = FileStateAbsent
 		original := "this is the original state\n" // original state
@@ -1273,7 +1320,7 @@ func TestResources2(t *testing.T) {
 			resCheckApply(r1, false), // changed
 			fileAbsent(p),            // ensure it got removed
 			resCheckApply(r1, true),  // it's already good
-			resClose(r1),
+			resCleanup(r1),
 			//resValidate(r2), // no!!!
 			func() error {
 				// wrap it b/c it is currently nil
@@ -1289,7 +1336,7 @@ func TestResources2(t *testing.T) {
 				return resCheckApply(r2, true)()
 			},
 			func() error {
-				return resClose(r2)()
+				return resCleanup(r2)()
 			},
 			fileExpect(p, original), // ensure it's back to original
 		}
@@ -1315,15 +1362,20 @@ func TestResources2(t *testing.T) {
 		//}
 		r1 := makeRes("file", "r1")
 		res := r1.(*FileRes) // if this panics, the test will panic
-		p := "/tmp/somefile"
+		p := filepath.Join(tmpdir, "somefile")
 		res.Path = p
 		res.State = FileStateExists
+		frag1Path := filepath.Join(tmpdir, "frag1")
+		fragDir1 := filepath.Join(tmpdir, "fragdir1")
+		frag2Path := filepath.Join(tmpdir, "frag2")
+		fragDir2 := filepath.Join(tmpdir, "fragdir2")
+		frag3Path := filepath.Join(tmpdir, "frag3")
 		res.Fragments = []string{
-			"/tmp/frag1",
-			"/tmp/fragdir1/",
-			"/tmp/frag2",
-			"/tmp/fragdir2/",
-			"/tmp/frag3",
+			frag1Path,
+			fragDir1 + "/",
+			frag2Path,
+			fragDir2 + "/",
+			frag3Path,
 		}
 
 		frag1 := "frag1\n"
@@ -1338,24 +1390,24 @@ func TestResources2(t *testing.T) {
 		content := frag1 + f1 + f2 + f3 + frag2 + f1d2 + f2d2 + f3d2 + frag3
 
 		timeline := []func() error{
-			fileWrite("/tmp/frag1", frag1),
-			fileWrite("/tmp/frag2", frag2),
-			fileWrite("/tmp/frag3", frag3),
-			fileMkdir("/tmp/fragdir1/", true),
-			fileWrite("/tmp/fragdir1/f1", f1),
-			fileWrite("/tmp/fragdir1/f2", f2),
-			fileWrite("/tmp/fragdir1/f3", f3),
-			fileMkdir("/tmp/fragdir2/", true),
-			fileWrite("/tmp/fragdir2/f1", f1d2),
-			fileWrite("/tmp/fragdir2/f2", f2d2),
-			fileWrite("/tmp/fragdir2/f3", f3d2),
+			fileWrite(frag1Path, frag1),
+			fileWrite(frag2Path, frag2),
+			fileWrite(frag3Path, frag3),
+			fileMkdir(fragDir1, true),
+			fileWrite(filepath.Join(fragDir1, "f1"), f1),
+			fileWrite(filepath.Join(fragDir1, "f2"), f2),
+			fileWrite(filepath.Join(fragDir1, "f3"), f3),
+			fileMkdir(fragDir2, true),
+			fileWrite(filepath.Join(fragDir2, "f1"), f1d2),
+			fileWrite(filepath.Join(fragDir2, "f2"), f2d2),
+			fileWrite(filepath.Join(fragDir2, "f3"), f3d2),
 			fileWrite(p, "whatever"),
 			resValidate(r1),
 			resInit(r1),
 			resCheckApply(r1, false), // changed
 			fileExpect(p, content),
 			resCheckApply(r1, true), // it's already good
-			resClose(r1),
+			resCleanup(r1),
 			fileExpect(p, content), // ensure it exists
 		}
 
@@ -1374,8 +1426,8 @@ func TestResources2(t *testing.T) {
 		//}
 		r1 := makeRes("file", "r1")
 		res := r1.(*FileRes) // if this panics, the test will panic
-		p := "/tmp/somefile"
-		p2 := "/tmp/somefiletocopy"
+		p := filepath.Join(tmpdir, "somefile")
+		p2 := filepath.Join(tmpdir, "somefiletocopy")
 		content := "hello this is some file to copy\n"
 		res.Path = p
 		res.State = FileStateExists
@@ -1392,7 +1444,7 @@ func TestResources2(t *testing.T) {
 			resCheckApply(r1, true),  // it's already good
 			fileExpect(p, content),   // should already be like this
 			fileExpect(p2, content),  // should not change either
-			resClose(r1),
+			resCleanup(r1),
 		}
 
 		testCases = append(testCases, test{
@@ -1409,7 +1461,7 @@ func TestResources2(t *testing.T) {
 		//}
 		r1 := makeRes("file", "r1")
 		res := r1.(*FileRes) // if this panics, the test will panic
-		p := "/tmp/somedir/"
+		p := filepath.Join(tmpdir, "somedir") + "/"
 		res.Path = p
 		res.State = FileStateExists
 
@@ -1421,7 +1473,7 @@ func TestResources2(t *testing.T) {
 			fileExists(p, true),      // ensure it's a dir
 			resCheckApply(r1, true),  // it's already good
 			fileExists(p, true),      // ensure it's a dir
-			resClose(r1),
+			resCleanup(r1),
 		}
 
 		testCases = append(testCases, test{
@@ -1440,8 +1492,8 @@ func TestResources2(t *testing.T) {
 		//}
 		r1 := makeRes("file", "r1")
 		res := r1.(*FileRes) // if this panics, the test will panic
-		p := "/tmp/somedir/"
-		p2 := "/tmp/somedirtocopy/"
+		p := filepath.Join(tmpdir, "somedir") + "/"
+		p2 := filepath.Join(tmpdir, "somedirtocopy") + "/"
 		res.Path = p
 		res.State = FileStateExists
 		res.Source = p2
@@ -1492,7 +1544,7 @@ func TestResources2(t *testing.T) {
 			fileExists(d2f2, false),
 			fileExists(d2f3, false),
 			resCheckApply(r1, true), // it's already good
-			resClose(r1),
+			resCleanup(r1),
 		}
 
 		testCases = append(testCases, test{
@@ -1511,7 +1563,7 @@ func TestResources2(t *testing.T) {
 		//}
 		r1 := makeRes("file", "r1")
 		res := r1.(*FileRes) // if this panics, the test will panic
-		p := "/tmp/somedir/"
+		p := filepath.Join(tmpdir, "somedir") + "/"
 		res.Path = p
 		res.State = FileStateExists
 		res.Recurse = true
@@ -1558,7 +1610,7 @@ func TestResources2(t *testing.T) {
 			fileAbsent(d2f2),
 			fileAbsent(d2f3),
 			resCheckApply(r1, true), // it's already good
-			resClose(r1),
+			resCleanup(r1),
 		}
 
 		testCases = append(testCases, test{
@@ -1584,7 +1636,7 @@ func TestResources2(t *testing.T) {
 		//}
 		r1 := makeRes("file", "r1")
 		res := r1.(*FileRes) // if this panics, the test will panic
-		p := "/tmp/somedir/"
+		p := filepath.Join(tmpdir, "somedir") + "/"
 		res.Path = p
 		res.State = FileStateExists
 		res.Recurse = true
@@ -1644,17 +1696,17 @@ func TestResources2(t *testing.T) {
 			resValidate(r2),
 			resInit(r2),
 			//resCheckApply(r2, false), // not really needed in test
-			resClose(r2),
+			resCleanup(r2),
 
 			resValidate(r3),
 			resInit(r3),
 			//resCheckApply(r3, false), // not really needed in test
-			resClose(r3),
+			resCleanup(r3),
 
 			resValidate(r4),
 			resInit(r4),
 			//resCheckApply(r4, false), // not really needed in test
-			resClose(r4),
+			resCleanup(r4),
 
 			resValidate(r1),
 			resInit(r1, addGraph(graph), addLogf(nil)), // show the full graph
@@ -1669,11 +1721,11 @@ func TestResources2(t *testing.T) {
 			fileAbsent(d2f1),
 			fileAbsent(d2f2),
 			fileAbsent(d2f3),
-			fileExists(p2, false), // ensure it's a file XXX !!!
+			fileExists(p2, false), // ensure it's a file
 			fileExists(p3, true),  // ensure it's a dir
 			fileExists(p4, false),
 			resCheckApply(r1, true), // it's already good
-			resClose(r1),
+			resCleanup(r1),
 		}
 
 		testCases = append(testCases, test{
@@ -1746,4 +1798,65 @@ func TestResources2(t *testing.T) {
 			// all done!
 		})
 	}
+}
+
+func TestResPtrUID1(t *testing.T) {
+	t1, err := engine.NewNamedResource("test", "test1")
+	if err != nil {
+		t.Errorf("could not build resource: %+v", err)
+		return
+	}
+	t2, err := engine.NewNamedResource("test", "test1")
+	if err != nil {
+		t.Errorf("could not build resource: %+v", err)
+		return
+	}
+
+	if uid1, uid2 := engine.PtrUID(t1), engine.PtrUID(t2); uid1 != uid2 {
+		t.Errorf("uid's don't match")
+	}
+}
+
+func TestResToB64(t *testing.T) {
+	res, err := engine.NewNamedResource("noop", "n1")
+	if err != nil {
+		t.Errorf("could not build resource: %+v", err)
+		return
+	}
+
+	s, err := engineUtil.ResToB64(res)
+	if err != nil {
+		t.Errorf("error trying to encode res: %s", err.Error())
+		return
+	}
+	t.Logf("out: %s", s)
+}
+
+func TestResToB64Meta(t *testing.T) {
+	hidden := true // must be true, since false is a default
+
+	res, err := engine.NewNamedResource("noop", "n1")
+	if err != nil {
+		t.Errorf("could not build resource: %+v", err)
+		return
+	}
+	res.MetaParams().Hidden = hidden
+
+	s, err := engineUtil.ResToB64(res)
+	if err != nil {
+		t.Errorf("error trying to encode res: %s", err.Error())
+		return
+	}
+	t.Logf("out: %s", s)
+
+	r, err := engineUtil.B64ToRes(s)
+	if err != nil {
+		t.Errorf("error trying to decode res: %s", err.Error())
+		return
+	}
+	if r.MetaParams().Hidden != hidden {
+		t.Errorf("metaparam did not get preserved")
+		return
+	}
+	t.Logf("meta: %v", r.MetaParams().Hidden)
 }

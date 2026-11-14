@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,11 +13,24 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 package resources
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strconv"
@@ -57,10 +70,13 @@ type NspawnRes struct {
 
 	init *engine.Init
 
-	State string `yaml:"state"`
+	// State specifies the desired state for this resource. This must be
+	// either `running` or `stopped`.
+	State string `lang:"state" yaml:"state"`
+
 	// We're using the svc resource to start and stop the machine because
-	// that's what machinectl does. We're not using svc.Watch because then we
-	// would have two watches potentially racing each other and producing
+	// that's what machinectl does. We're not using svc.Watch because then
+	// we would have two watches potentially racing each other and producing
 	// potentially unexpected results. We get everything we need to monitor
 	// the machine state changes from the org.freedesktop.machine1 object.
 	svc *SvcRes
@@ -131,16 +147,16 @@ func (obj *NspawnRes) Init(init *engine.Init) error {
 	return obj.svc.Init(init)
 }
 
-// Close is run by the engine to clean up after the resource is done.
-func (obj *NspawnRes) Close() error {
+// Cleanup is run by the engine to clean up after the resource is done.
+func (obj *NspawnRes) Cleanup() error {
 	if obj.svc != nil {
-		return obj.svc.Close()
+		return obj.svc.Cleanup()
 	}
 	return nil
 }
 
 // Watch for state changes and sends a message to the bus if there is a change.
-func (obj *NspawnRes) Watch() error {
+func (obj *NspawnRes) Watch(ctx context.Context) error {
 	// this resource depends on systemd to ensure that it's running
 	if !systemdUtil.IsRunningSystemd() {
 		return fmt.Errorf("systemd is not running")
@@ -165,33 +181,32 @@ func (obj *NspawnRes) Watch() error {
 	bus.Signal(busChan)
 	defer bus.RemoveSignal(busChan) // not needed here, but nice for symmetry
 
-	obj.init.Running() // when started, notify engine that we're running
+	if err := obj.init.Event(ctx); err != nil {
+		return err
+	}
 
-	var send = false // send event?
 	for {
 		select {
 		case event := <-busChan:
 			// process org.freedesktop.machine1 events for this resource's name
-			if event.Body[0] == obj.Name() {
-				obj.init.Logf("Event received: %v", event.Name)
-				if event.Name == machineNew {
-					obj.init.Logf("Machine started")
-				} else if event.Name == machineRemoved {
-					obj.init.Logf("Machine stopped")
-				} else {
-					return fmt.Errorf("unknown event: %s", event.Name)
-				}
-				send = true
+			if event.Body[0] != obj.Name() {
+				continue
+			}
+			obj.init.Logf("event received: %v", event.Name)
+			if event.Name == machineNew {
+				obj.init.Logf("machine started")
+			} else if event.Name == machineRemoved {
+				obj.init.Logf("machine stopped")
+			} else {
+				return fmt.Errorf("unknown event: %s", event.Name)
 			}
 
-		case <-obj.init.Done: // closed by the engine to signal shutdown
-			return nil
+		case <-ctx.Done(): // closed by the engine to signal shutdown
+			return ctx.Err()
 		}
 
-		// do all our event sending all together to avoid duplicate msgs
-		if send {
-			send = false
-			obj.init.Event() // notify engine of an event (this can block)
+		if err := obj.init.Event(ctx); err != nil {
+			return err
 		}
 	}
 }
@@ -199,7 +214,7 @@ func (obj *NspawnRes) Watch() error {
 // CheckApply is run to check the state and, if apply is true, to apply the
 // necessary changes to reach the desired state. This is run before Watch and
 // again if Watch finds a change occurring to the state.
-func (obj *NspawnRes) CheckApply(apply bool) (bool, error) {
+func (obj *NspawnRes) CheckApply(ctx context.Context, apply bool) (bool, error) {
 	// this resource depends on systemd to ensure that it's running
 	if !systemdUtil.IsRunningSystemd() {
 		return false, errors.New("systemd is not running")
@@ -237,7 +252,7 @@ func (obj *NspawnRes) CheckApply(apply bool) (bool, error) {
 	// be stopped or the state matches we're done
 	if !exists && obj.State == stopped || properties["State"] == obj.State {
 		if obj.init.Debug {
-			obj.init.Logf("CheckApply() in valid state")
+			obj.init.Logf("in valid state")
 		}
 		return true, nil
 	}
@@ -247,9 +262,9 @@ func (obj *NspawnRes) CheckApply(apply bool) (bool, error) {
 		return false, nil
 	}
 
-	obj.init.Logf("CheckApply() applying '%s' state", obj.State)
+	obj.init.Logf("applying '%s' state", obj.State)
 	// use the embedded svc to apply the correct state
-	if _, err := obj.svc.CheckApply(apply); err != nil {
+	if _, err := obj.svc.CheckApply(ctx, apply); err != nil {
 		return false, errwrap.Wrapf(err, "nested svc failed")
 	}
 
@@ -268,14 +283,18 @@ func (obj *NspawnRes) Cmp(r engine.Res) error {
 		return fmt.Errorf("the State differs")
 	}
 
-	// TODO: why is res.svc ever nil?
-	if (obj.svc == nil) != (res.svc == nil) { // xor
-		return fmt.Errorf("the svc differs")
+	// Compare the nested svc resources. We build them here, because the
+	// stored ones only exist after Init, and Cmp can be called before that.
+	svc1, err := obj.makeComposite()
+	if err != nil {
+		return errwrap.Wrapf(err, "makeComposite failed in cmp")
 	}
-	if obj.svc != nil && res.svc != nil {
-		if err := obj.svc.Cmp(res.svc); err != nil {
-			return errwrap.Wrapf(err, "the svc differs")
-		}
+	svc2, err := res.makeComposite()
+	if err != nil {
+		return errwrap.Wrapf(err, "makeComposite failed in cmp")
+	}
+	if err := svc1.Cmp(svc2); err != nil {
+		return errwrap.Wrapf(err, "the svc differs")
 	}
 
 	return nil
@@ -304,11 +323,17 @@ func (obj *NspawnUID) IFF(uid engine.ResUID) bool {
 // UIDs includes all params to make a unique identification of this object. Most
 // resources only return one although some resources can return multiple.
 func (obj *NspawnRes) UIDs() []engine.ResUID {
-	x := &NspawnUID{
-		BaseUID: engine.BaseUID{Name: obj.Name(), Kind: obj.Kind()},
-		name:    obj.Name(), // svc name
+	uids := []engine.ResUID{
+		&NspawnUID{
+			BaseUID: engine.BaseUID{Name: obj.Name(), Kind: obj.Kind()},
+			name:    obj.Name(), // svc name
+		},
 	}
-	return append([]engine.ResUID{x}, obj.svc.UIDs()...)
+	// The stored svc only exists after Init, but UIDs can be called before.
+	if svc, err := obj.makeComposite(); err == nil {
+		uids = append(uids, svc.UIDs()...) // add the svc uid if we can
+	}
+	return uids
 }
 
 // UnmarshalYAML is the custom unmarshal handler for this struct. It is

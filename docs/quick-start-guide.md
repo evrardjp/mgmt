@@ -37,7 +37,7 @@ You'll need some dependencies, including `golang`, and some associated tools.
 
 #### Installing golang
 
-* You need golang version 1.16 or greater installed.
+* You need a modern golang version installed.
 	* To install on rpm style systems: `sudo dnf install golang`
 	* To install on apt style systems: `sudo apt install golang`
 	* To install on macOS systems install [Homebrew](https://brew.sh)
@@ -94,6 +94,22 @@ At the moment we have:
 
 Please contribute more and help improve these! We'd especially like to see a
 Debian package!
+
+### Building from a container:
+
+This method avoids polluting your workstation with the dependencies for the
+build. Here is an example using Fedora, Podman and Buildah:
+
+```shell
+git clone --recursive https://github.com/purpleidea/mgmt/
+cd mgmt
+docker build -t mgmt -f docker/Dockerfile .
+docker run --rm --entrypoint cat mgmt mgmt > mgmt
+chmod +x mgmt
+./mgmt --version
+# you could now copy the mgmt binary somewhere into your $PATH
+# e.g., /usr/local/bin/ to make it accessible from anywhere
+```
 
 ## Running mgmt
 

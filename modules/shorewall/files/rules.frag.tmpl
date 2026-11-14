@@ -1,0 +1,12 @@
+{{/*
+##############################################################################################################################################################
+#ACTION		SOURCE		DEST		PROTO	DPORT	SPORT	ORIGDEST	RATE	USER	MARK	CONNLIMIT	TIME	HEADERS	SWITCH	HELPER
+*/ -}}
+{{ if .Comment -}}
+#
+#	{{ .Comment }}
+#
+{{ end -}}
+{{ if .Rule -}}
+{{ .Rule }}
+{{ end -}}

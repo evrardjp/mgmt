@@ -1,0 +1,29 @@
+-- main.mcl --
+# this can return changing functions, and could be optimized, too
+$funcgen = func() {
+	func($b) {
+		if $b {
+			func() {
+				"hello"
+			}
+		} else {
+			func() {
+				"world"
+			}
+		}
+	}
+}
+
+$fn = $funcgen()
+
+$out1 = $fn(true)
+$out2 = $fn(false)
+
+$name1 = $out1()
+$name2 = $out2()
+
+test "${name1}" {}
+test "${name2}" {}
+-- OUTPUT --
+Vertex: test[hello]
+Vertex: test[world]

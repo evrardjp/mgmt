@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,19 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
 // Package inputs contains the input parsing logic for how mcl module
 // entrypoints are handled for the language.
@@ -25,7 +37,7 @@ package inputs
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,11 +78,24 @@ var (
 // ParsedInput is the output struct which contains all the information we need.
 type ParsedInput struct {
 	//activated bool // if struct is not nil we're activated
-	Base     string   // base path (abs path with trailing slash)
-	Main     []byte   // contents of main entry mcl code
-	Files    []string // files and dirs to copy to fs (abs paths)
+	FS       engine.Fs // reference to the engine.Fs used to call the parse
+	Base     string    // base path (abs path with trailing slash)
+	Main     []byte    // contents of main entry mcl code
+	Files    []string  // files and dirs to copy to fs (abs paths)
 	Metadata *interfaces.Metadata
-	Workers  []func(engine.Fs) error // copy files here that aren't listed!
+	Workers  []func(engine.WriteableFS) error // copy files here that aren't listed!
+}
+
+// String adds a pretty-printing facility to make it easier to visualize these.
+func (obj *ParsedInput) String() string {
+	s := "&ParsedInput{\n"
+	s += "\tFS: " + obj.FS.URI() + "\n" // don't print directly
+	s += "\tBase: " + obj.Base + "\n"
+	//s += "\tMain: " + obj.Main + "\n" // messy
+	s += fmt.Sprintf("\tFiles: %+v\n", obj.Files)
+	s += fmt.Sprintf("\tMetadata: %+v\n", obj.Metadata)
+	s += fmt.Sprintf("\tWorkers: %d\n", len(obj.Workers))
+	return s + "}"
 }
 
 // ParseInput runs the list if input parsers to know how to run the lexer,
@@ -149,7 +174,7 @@ func inputStdin(s string, fs engine.Fs) (*ParsedInput, error) {
 	// TODO: yes, we could pass a reader directly, but we'd
 	// need to have a convention for it to get closed after
 	// and we need to save it to disk for deploys to use it
-	b, err := ioutil.ReadAll(os.Stdin) // doesn't need fs
+	b, err := io.ReadAll(os.Stdin) // doesn't need fs
 	if err != nil {
 		return nil, errwrap.Wrapf(err, "can't read in stdin")
 	}
@@ -189,8 +214,8 @@ func inputMetadata(s string, fs engine.Fs) (*ParsedInput, error) {
 	if err != nil {
 		return nil, errwrap.Wrapf(err, "can't read from file: `%s`", m)
 	}
-	defer fm.Close()             // we're done reading by the time this runs
-	b, err := ioutil.ReadAll(fm) // doesn't need fs
+	defer fm.Close()         // we're done reading by the time this runs
+	b, err := io.ReadAll(fm) // doesn't need fs
 	if err != nil {
 		return nil, errwrap.Wrapf(err, "can't read in file: `%s`", m)
 	}
@@ -214,6 +239,7 @@ func inputMetadata(s string, fs engine.Fs) (*ParsedInput, error) {
 		return nil, errwrap.Wrapf(err, "could not build metadata")
 	}
 	return &ParsedInput{
+		FS:       fs,
 		Base:     basePath,
 		Main:     b,
 		Files:    files,
@@ -237,8 +263,8 @@ func inputMcl(s string, fs engine.Fs) (*ParsedInput, error) {
 	if err != nil {
 		return nil, errwrap.Wrapf(err, "can't read from file: `%s`", s)
 	}
-	defer fm.Close()             // we're done reading by the time this runs
-	b, err := ioutil.ReadAll(fm) // doesn't need fs
+	defer fm.Close()         // we're done reading by the time this runs
+	b, err := io.ReadAll(fm) // doesn't need fs
 	if err != nil {
 		return nil, errwrap.Wrapf(err, "can't read in file: `%s`", s)
 	}
@@ -254,13 +280,14 @@ func inputMcl(s string, fs engine.Fs) (*ParsedInput, error) {
 		return nil, errwrap.Wrapf(err, "can't built metadata file")
 	}
 	dst := "/" + interfaces.MetadataFilename // eg: /metadata.yaml
-	workers := []func(engine.Fs) error{
-		func(fs engine.Fs) error {
+	workers := []func(engine.WriteableFS) error{
+		func(fs engine.WriteableFS) error {
 			err := gapi.CopyBytesToFs(fs, byt, dst)
 			return errwrap.Wrapf(err, "could not copy metadata file to fs")
 		},
 	}
 	return &ParsedInput{
+		FS:   fs,
 		Base: dirify(filepath.Dir(s)), // base path with trailing slash
 		Main: b,
 		Files: []string{
@@ -286,7 +313,7 @@ func inputDirectory(s string, fs engine.Fs) (*ParsedInput, error) {
 		return nil, errwrap.Wrapf(err, "dir: `%s` does not exist", s)
 	}
 	if !fi.IsDir() {
-		return nil, errwrap.Wrapf(err, "dir: `%s` is not a dir", s)
+		return nil, fmt.Errorf("dir: `%s` is not a dir", s)
 	}
 
 	// try looking for a metadata file in the root
@@ -351,18 +378,19 @@ func inputCode(s string, fs engine.Fs) (*ParsedInput, error) {
 	dst2 := "/" + metadata.Main               // eg: /main.mcl
 	b := []byte(s)                            // unfortunately we convert things back and forth :/
 
-	workers := []func(engine.Fs) error{
-		func(fs engine.Fs) error {
+	workers := []func(engine.WriteableFS) error{
+		func(fs engine.WriteableFS) error {
 			err := gapi.CopyBytesToFs(fs, byt, dst1)
 			return errwrap.Wrapf(err, "could not copy metadata file to fs")
 		},
-		func(fs engine.Fs) error {
+		func(fs engine.WriteableFS) error {
 			err := gapi.CopyBytesToFs(fs, b, dst2)
 			return errwrap.Wrapf(err, "could not copy main file to fs")
 		},
 	}
 
 	return &ParsedInput{
+		FS:       fs,
 		Base:     dirify(wd),
 		Main:     b,
 		Files:    []string{}, // they're already copied in

@@ -51,7 +51,7 @@ master_doc = 'index'
 
 # General information about the project.
 project = u'mgmt'
-copyright = u'2013-2021+ James Shubin and the project contributors'
+copyright = u'Copyright (C) James Shubin and the project contributors'
 author = u'James Shubin'
 
 # The version info for the project you're documenting, acts as replacement for
@@ -153,6 +153,6 @@ man_pages = [
 #  dir menu entry, description, category)
 texinfo_documents = [
     (master_doc, 'mgmt', u'mgmt Documentation',
-     author, 'mgmt', 'A next generation config management prototype!',
+     author, 'mgmt', 'Next generation distributed, event-driven, parallel config management!',
      'Miscellaneous'),
 ]

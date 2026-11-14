@@ -1,0 +1,699 @@
+# Mgmt
+# Copyright (C) James Shubin and the project contributors
+# Written by James Shubin <james@shubin.ca> and the project contributors
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# Additional permission under GNU GPL version 3 section 7
+#
+# If you modify this program, or any covered work, by linking or combining it
+# with embedded mcl code and modules (and that the embedded mcl code and
+# modules which link with this program, contain a copy of their source code in
+# the authoritative form) containing parts covered by the terms of any other
+# license, the licensors of this program grant you additional permission to
+# convey the resulting work. Furthermore, the licensors of this program grant
+# the original author, James Shubin, additional permission to update this
+# additional permission if he deems it necessary to achieve the goals of this
+# additional permission.
+
+import "deploy"
+import "fmt"
+import "golang"
+import "golang/strings" as golang_strings
+import "iter"
+import "list"
+import "local"
+import "net"
+import "os"
+import "strings"
+import "sys"
+import "world/collect"
+
+# ssh_keygen creates an ssh key pair in the user's home directory if the private
+# key doesn't exist.
+# TODO: add more parameters such as key size and type in the future
+class ssh_keygen($user) {
+	include ssh_keygen_type($user, "ed25519")
+}
+
+# $type is rsa or ed25519
+class ssh_keygen_type($user, $type) {
+	panic($user == "", "misc:ssh_keygen_type $user is empty") # panic if $user is empty
+	panic($type == "", "misc:ssh_keygen_type $type is empty") # panic if $type is empty
+	panic($type != "rsa" and $type != "ed25519", "misc:ssh_keygen_type $type is not rsa or ed25519") # panic if $type is invalid
+	$p = os.expand_home("~${user}/") # eg: ~james/
+	exec "ssh-keygen-${user}" {
+		cmd => "/usr/bin/ssh-keygen",
+		args => [
+			"-t",
+			"${type}", # type
+			"-f",
+			"${p}.ssh/id_${type}", # private key file
+			"-N",
+			"", # empty password
+		],
+		creates => "${p}.ssh/id_${type}",
+		user => $user,
+
+		Before => File["${p}.ssh/id_${type}"],
+	}
+	# This also serves as a "handle" so that other resources can depend on
+	# this file getting created before they run.
+	file "${p}.ssh/" {
+		state => "exists",
+		mode => "u=rwx,go=",
+		owner => $user,
+
+		Depend => File["${p}"], # ensure the dir exists
+	}
+	file "${p}.ssh/id_${type}" {
+		mode => "u=rw,go=",
+		owner => $user,
+
+		Depend => File["${p}.ssh/"],
+	}
+
+	line "${user}@${hostname}" {
+		#file => "", # specified on collect
+		#state => "exists", # specified on collect
+		content => os.readfile("${p}.ssh/id_${type}.pub") <|> "",
+
+		Meta:hidden => true,
+		Meta:export => ["*"],
+	}
+}
+
+# ssh_authorized_keys pulls down an export key for a $user, from a user@host.
+class ssh_authorized_keys($user, $from) {
+	panic($user == "", "misc:ssh_authorized_keys $user is empty") # panic if $user is empty
+	$p = os.expand_home("~${user}/") # eg: ~james/
+
+	$all = collect.res("line") # []struct{name str; host str}
+	$fn = func($st) {
+		$st->name == "${from}" and $st->host != "${hostname}"
+	}
+	$filtered = iter.filter($all, $fn)
+
+	collect line $filtered { # pull down everyone's public keys
+		file => "${p}.ssh/authorized_keys",
+		state => $const.res.file.state.exists,
+
+		Meta:hidden => false,
+	}
+}
+
+# network_rename takes the device with the $mac address and renames it to $dev.
+class network_rename($mac, $dev) {
+	#panic(not net.is_mac("${mac}"), "misc:network_rename $mac is invalid")
+
+	file "/etc/systemd/network/70-rename-${dev}.link" {
+		state => "exists",
+		content => "
+# Pick the device name based on the mac address.
+[Match]
+MACAddress=${mac}
+
+[Link]
+Name=${dev}
+",
+		mode => "u=rw,go=r",
+		owner => "root",
+		group => "root",
+
+		Notify => Exec["udevadm trigger"],
+	}
+
+	# TODO: we only want to run this once, but it's harmless for now
+	exec "udevadm trigger" {
+		cmd => "/usr/sbin/udevadm trigger --type=all --action=add --prioritized-subsystem=net --settle",
+	}
+}
+
+# networkd_dhcp sets up a dhcp client with systemd-networkd.
+class networkd_dhcp($dev, $st) {
+	$dns = $st->dns <|> ["8.8.8.8"]
+	$metric = $st->metric <|> 100
+
+	$tmpl = "
+[Match]
+Name=${dev}
+
+[Network]
+DHCP=yes
+{{ range .Dns -}}
+DNS={{ . }}
+{{ end -}}
+#UseGateway=false
+
+[DHCP]
+UseDNS=false
+
+{{ if .Metric -}}
+[DHCPv4]
+RouteMetric={{ .Metric }}
+
+[IPv6AcceptRA]
+RouteMetric={{ .Metric }}
+{{ end -}}
+"
+
+	$args = struct{
+		#dev => $dev,
+		dns => $dns,
+		metric => $metric,
+	}
+
+	file "/etc/systemd/network/${dev}-dhcp.network" {
+		state => "exists",
+		content => golang.template($tmpl, $args),
+		mode => "u=rw,go=r",
+		owner => "root",
+		group => "root",
+
+		Notify => Svc["systemd-networkd"],
+	}
+
+	svc "systemd-networkd" {
+		state => "running",
+		startup => "enabled",
+	}
+}
+
+# networkd_static sets up a static ip address with systemd-networkd for local
+# or public networks.
+class networkd_static($dev, $st) {
+	$cidr = $st->cidr # cidr # the ip address in cidr format
+	$gateway = $st->gateway <|> ""
+	$dns []str = $st->dns <|> [] # we usually use this with the gateway interface
+	#$vips []str = $st->vips <|> [] # []cidr
+
+	#$metric = $st->metric <|> 50
+
+	$tmpl = "
+[Match]
+Name=${dev}
+
+[Network]
+Address=${cidr}
+{{ if .Gateway -}}
+Gateway=${gateway}
+{{ end -}}
+{{ range .Dns -}}
+DNS={{ . }}
+{{ end -}}
+#UseGateway=false
+
+[Address]
+RouteMetric=101
+
+[Route]
+Metric=1001
+#Gateway=
+#Destination=0.0.0.0/0
+"
+
+	$args = struct{
+		#dev => $dev,
+		gateway => $gateway,
+		dns => $dns,
+	}
+
+	file "/etc/systemd/network/${dev}-static.network" {
+		state => "exists",
+		content => golang.template($tmpl, $args),
+		mode => "u=rw,go=r",
+		owner => "root",
+		group => "root",
+
+		Notify => Svc["systemd-networkd"],
+	}
+
+	svc "systemd-networkd" {
+		state => "running",
+		startup => "enabled",
+	}
+}
+
+# network_manager_dhcp sets up a dhcp client with network manager.
+# NOTE: To see what it's using run: `nmcli -f name,uuid,filename connection`.
+class network_manager_dhcp($st) {
+	$uuid = $st->uuid <|> "" # 01234567-89ab-cdef-0123-456789abcdef
+	$mac = $st->mac <|> ""
+	$dev = $st->dev <|> "meth0"
+
+	$dns = $st->dns <|> ["8.8.8.8"]
+	$dns_str = golang_strings.join($dns, ";") # the line also ends with a semicolon
+	$tmpl = "
+[connection]
+id=${dev}
+{{ if .Uuid -}}
+uuid={{ .Uuid }}
+{{ end -}}
+type=ethernet
+interface-name=${dev}
+autoconnect=true
+
+[ipv4]
+{{ if .Dns -}}
+dns=${dns_str};
+{{ end -}}
+dns-search=
+may-fail=false
+method=auto
+
+[ethernet]
+{{ if .Mac -}}
+mac-address={{ .Mac }}
+{{ end -}}
+"
+
+	$args = struct{
+		uuid => $uuid,
+		mac => $mac,
+		dns => $dns,
+	}
+
+	file "/etc/NetworkManager/system-connections/${dev}.nmconnection" {
+		state => "exists",
+		content => golang.template($tmpl, $args),
+		mode => "u=rw,go=",
+		owner => "root",
+
+		Notify => Svc["NetworkManager"],
+	}
+
+	svc "NetworkManager" {}
+}
+
+# network_manager_static sets up a static ip address with network manager.
+# NOTE: To see what it's using run: `nmcli -f name,uuid,filename connection`.
+class network_manager_static($st) {
+	$uuid = $st->uuid <|> "" # 01234567-89ab-cdef-0123-456789abcdef
+	$mac = $st->mac <|> ""
+	$dev = $st->dev <|> "meth0"
+	$cidr = $st->cidr # cidr
+	$ip = net.cidr_to_ip($cidr)
+	$prefix = net.cidr_to_prefix($cidr)
+	$router = $st->router <|> ""
+	$dns = $st->dns <|> ["8.8.8.8"]
+	$vips []str = $st->vips <|> [] # []cidr
+
+	$dns_str = golang_strings.join($dns, ";") # the line also ends with a semicolon
+	$tmpl = "
+[connection]
+id=${dev}
+{{ if .Uuid -}}
+uuid={{ .Uuid }}
+{{ end -}}
+type=ethernet
+interface-name=${dev}
+autoconnect=true
+
+[ipv4]
+{{ if .Router -}}
+address1=${ip}/${prefix},{{ .Router }}
+{{ else -}}
+address1=${ip}/${prefix}
+{{ end -}}
+{{ if .Vips -}}
+{{ range $index, $ip := .Vips }}
+{{ $ix := len (printf \"xx%*s\" $index \"\") -}}
+address{{ $ix }}={{ $ip }}
+{{ end -}}
+{{ end -}}
+{{ if .Dns -}}
+dns=${dns_str};
+{{ end -}}
+dns-search=
+may-fail=false
+method=manual
+
+[ethernet]
+{{ if .Mac -}}
+mac-address={{ .Mac }}
+{{ end -}}
+"
+
+	$args = struct{
+		uuid => $uuid,
+		mac => $mac,
+		router => $router,
+		dns => $dns,
+		vips => $vips,
+	}
+
+	file "/etc/NetworkManager/system-connections/${dev}.nmconnection" {
+		state => "exists",
+		content => golang.template($tmpl, $args),
+		mode => "u=rw,go=",
+		owner => "root",
+
+		Notify => Svc["NetworkManager"],
+	}
+
+	svc "NetworkManager" {}
+}
+
+# setup wifi
+# XXX: needs proper password handling to avoid storing secrets here!
+class network_manager_wifi($st) {
+	$name = $st->name
+	$ssid = $st->ssid <|> "${name}"
+	$uuid = $st->uuid <|> "" # 01234567-89ab-cdef-0123-456789abcdef
+	$dev = $st->dev <|> "*" # any
+	$psk = $st->password <|> "" # XXX: secret!
+
+	$tmpl = "
+[connection]
+id=${name}
+{{ if .Uuid -}}
+uuid={{ .Uuid }}
+{{ end -}}
+type=wifi
+#interface-name=wlp0s20f3
+#interface-name=*
+#interface-name=${dev} # was blocking auto connect, idk why.
+autoconnect=true
+
+[wifi]
+cloned-mac-address=permanent
+#mac-address=00:11:22:33:44:55
+#mac-address-randomization=1
+mode=infrastructure
+ssid=${ssid}
+
+[wifi-security]
+key-mgmt=wpa-psk
+{{ if .Psk -}}
+psk={{ .Psk }}
+{{ end -}}
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto
+addr-gen-mode=stable-privacy
+
+[proxy]
+"
+
+	$args = struct{
+		name => $name,
+		uuid => $uuid,
+		ssid => $ssid,
+		dev => $dev,
+		psk => $psk,
+	}
+
+	file "/etc/NetworkManager/system-connections/${name}.nmconnection" {
+		state => "exists",
+		content => golang.template($tmpl, $args),
+		mode => "u=rw,go=",
+		owner => "root",
+
+		Notify => Svc["NetworkManager"],
+	}
+
+	svc "NetworkManager" {}
+}
+
+# systemd_daemon_reload creates an exec which runs a systemctl daemon-reload if
+# one is needed. The exec resource uses the input name, to make it easy to
+# attach an edge to it.
+# TODO: can we use: systemctl show foo.service --property=NeedDaemonReload
+class systemd_daemon_reload($name) {
+	$vardir = local.vardir("misc/")
+	$mtime_file = "${vardir}daemon-reload"
+
+	exec "${name}" {
+		cmd => "/usr/bin/systemctl",
+		args => [
+			"daemon-reload",
+		],
+
+		donecmd => "/usr/bin/date --utc > ${mtime_file}",
+		doneshell => "/usr/bin/bash",
+
+		watchfiles => [
+			"/lib/systemd/system/",
+			"/etc/systemd/system/",
+			"${mtime_file}",
+		],
+
+		# If we have any file that's newer than our mtime, the run.
+		# NOTE: We grep since find doesn't return a useful return code.
+		ifcmd => "/usr/bin/test ! -e '${mtime_file}' || /usr/bin/find /lib/systemd/system/ /etc/systemd/system/ -type f -name '*.service' -newer '${mtime_file}' | /usr/bin/grep -q .",
+		ifshell => "/usr/bin/bash",
+	}
+}
+
+# Instead of enabling a dnf repo manually, you can use this to accomplish it.
+class yum_repo($id, $st) {
+	panic(golang_strings.has_prefix($id, "_copr"), "misc:yum_repo $id starts with _copr") # can't begin this way
+
+	# baseurl may contain $releasever and $basearch literals (not mcl!)
+	$baseurl = $st->baseurl
+	$gpgkey = $st->gpgkey <|> ""
+
+	# `man 5 dnf.conf` for more details
+	$tmpl = "# generated by mgmt
+[${id}]
+name=${id}
+baseurl=${baseurl}
+#baseurl=http://download.example/pub/fedora/linux/updates/$releasever/Everything/$basearch/
+#metalink=https://mirrors.example.com/metalink?repo=${id}&distroversion=fedora-$releasever&arch=$basearch
+enabled=1
+{{ if .Gpgkey -}}
+repo_gpgcheck=0 # TODO: enable me
+gpgcheck=1
+gpgkey={{ .Gpgkey }}
+#gpgkey=file:///etc/mgmt/fedora-$releasever-$basearch
+{{ end -}}
+metadata_expire=6h
+skip_if_unavailable=False
+countme=0
+"
+
+	$args = struct{
+		id => $id,
+		gpgkey => $gpgkey,
+	}
+
+	$file_name = "/etc/yum.repos.d/${id}.repo"
+
+	file "${file_name}" {
+		state => "exists",
+		content => golang.template($tmpl, $args),
+		mode => "u=rw,go=",
+		owner => "root",
+	}
+}
+
+# keep these packages up to date. if $pkg is an empty string, we update
+# everything.
+class dnf_update($pkg) {
+
+	$exec_name = if $pkg == "" {
+		"dnf-update"
+	} else {
+		"dnf-update-${pkg}"
+	}
+
+	$a = [
+		"update",
+		"--comment",
+		"dnf update by mgmt",
+		"--assumeyes",
+		"--setopt=fastestmirror=True",
+		"--setopt=max_parallel_downloads=16",
+	]
+	$args = if $pkg == "" {
+		$a
+	} else {
+		list.concat($a, ["${pkg}"]) # limit to this package only
+	}
+
+	exec "${exec_name}" {
+		cmd => "/usr/bin/dnf",
+		args => $args,
+
+		# returns 100 when updates available, zero if nothing to do
+		nifcmd => "/usr/bin/dnf check-upgrade ${pkg}", # (same as check-update)
+		watchfiles => [
+			#"/var/cache/libdnf5/", # TODO: map pkg to repo here?
+			"/var/lib/dnf/history.sqlite", # kind of a hack for now
+		],
+
+		user => "root",
+	}
+}
+
+# Instead of running `dnf copr enable purpleidea/foo` you can use
+# `purpleidea/foo` as the $name here to accomplish the same thing.
+class copr_enable($name) {
+	# example: sudo dnf copr enable gsauthof/dracut-sshd
+	# /etc/yum.repos.d/_copr:copr.fedorainfracloud.org:gsauthof:dracut-sshd.repo
+	$sp = strings.split($name, "/")
+	$user = $sp[0]
+	$repo = $sp[1]
+	$p = fmt.printf("/etc/yum.repos.d/_copr:copr.fedorainfracloud.org:%s:%s.repo", $user, $repo)
+
+	# TODO: If we wanted to be more thorough, we could template the file
+	# instead or running this copr enable command.
+	exec "dnf-copr-enable-${name}" {
+		cmd => "/usr/bin/dnf",
+		args => [
+			"-y",
+			"copr",
+			"enable",
+			"${name}",
+		],
+		creates => $p,
+		user => "root",
+	}
+}
+
+# This removes any other flatpak remotes you have.
+# XXX: This should be a .d/ style thing. Replace with a "fragments" setup.
+# XXX: This doesn't work if the key isn't added. If we do the config file setup,
+# we get: "error: Unable to load summary from remote flathub" ... "Can't check
+# signature: public key not found"
+class flathub_enable() {
+	$remote = "flathub" # only one supported for now
+	$location = "https://dl.flathub.org/repo/flathub.flatpakrepo"
+	$p = "/var/lib/flatpak/repo/flathub.trustedkeys.gpg" # gets created
+
+	exec "flatpak-enable-flathub" {
+		cmd => "/usr/bin/flatpak",
+		args => [
+			"remote-add",
+			"--system", # the default
+			"--if-not-exists", # why not i guess
+			"${remote}",
+			"${location}",
+		],
+		creates => $p, # TODO: is there something better?
+		user => "root", # system wide flatpak
+	}
+	#file "/var/lib/flatpak/repo/config" {
+	#	state => "exists",
+	#	content => deploy.readfile("/files/flatpak/config"),
+	#	mode => "u=rw,go=r",
+	#	owner => "root",
+	#	group => "root",
+	#}
+}
+
+class flatpak_enable($name) {
+	$ref = $name # eg: im.riot.Riot
+
+	# flatpak list --columns application:full
+	$p = "/var/lib/flatpak/app/${ref}/current/active/metadata"
+
+	$remote = "flathub" # only one supported for now
+
+	exec "flatpak-install-flathub-${name}" {
+		cmd => "/usr/bin/flatpak",
+		args => [
+			"install",
+			"--system", # the default
+			"--assumeyes",
+			"--noninteractive",
+			"--or-update", # why not i guess
+			"${remote}",
+			"${ref}",
+		],
+		creates => $p, # TODO: is there something better?
+		user => "root", # system wide flatpak
+
+		Depend => Exec["flatpak-enable-flathub"],
+	}
+}
+
+# For some reason, newly provisioned Fedora machines, don't have their root
+# partitions consuming 100% of the available space. Fix that. Make sure that
+# this runs on firstboot and *before* we change any LUKS password, as this only
+# works with the empty password.
+class grow($mount) {
+	pkg "cloud-utils-growpart" {
+		state => "installed",
+	}
+
+	$done = "/root/.mgmt_grow" # must be absolute
+
+	# The xfs_growfs, resize2fs, cryptsetup, and findmnt tools should
+	# already be installed on any resonable Linux system by default.
+	exec "mgmt grow ${mount}" {
+		cmd => deploy.binary_path(), # this is mgmt
+		args => [
+			"tools", # tools is a subcommand of mgmt
+			"grow",
+			"--mount",
+			"${mount}", # typically root, eg: /
+			"--exec", # !noop
+			"--done",
+			"${done}",
+		],
+		creates => $done, # TODO: is there something better?
+		user => "root", # need root to be able to run normally
+		env => {"PATH" => sys.getenv("PATH")}, # so grow can find deps
+
+		Depend => Pkg["cloud-utils-growpart"],
+	}
+}
+
+class console($st) {
+	$dev = $st->dev <|> "ttyS0"
+	#$file = $st->file <|> "/etc/default/grub" # TODO: do we need a file param?
+
+	# This adds the console=${dev} inside the quotes if it's not present!
+	exec "console-${dev}" {
+		# sed -i '/^GRUB_CMDLINE_LINUX=/ {/console=ttyS0/! s/^\(GRUB_CMDLINE_LINUX="[^"]*\)"/\1 console=ttyS0"/}' /etc/default/grub # works!
+		cmd => "/usr/bin/sed",
+		args => [
+			"-i",
+			"/^GRUB_CMDLINE_LINUX=/ {/console=${dev}/! s/^\\(GRUB_CMDLINE_LINUX=\"[^\"]*\\)\"/\\1 console=${dev}\"/}", # works!
+			"/etc/default/grub",
+		],
+		# grep -Pq '^GRUB_CMDLINE_LINUX="(?![^"]*console=ttyS0)[^"]*"' /etc/default/grub # returns 0 if change is needed
+		ifcmd => "/usr/bin/grep -Pq ^GRUB_CMDLINE_LINUX=\"(?![^\"]*console=${dev})[^\"]*\" /etc/default/grub",
+	}
+
+	# XXX: do we need to run `stty -F /dev/ttyS0 speed 9600` ?
+
+	exec "grub2-mkconfig-${dev}" {
+		cmd => "/usr/sbin/grub2-mkconfig",
+		args => [
+			"-o",
+			"/boot/efi/EFI/fedora/grub.cfg", # formerly: /boot/grub2/grub.cfg
+		],
+		mtimes => [
+			"/etc/default/grub",
+		],
+		ifcmd => "/bin/false", # used with mtimes
+
+		# XXX: add a semaphore if we have another grub2-mkconfig somewhere?
+
+		Before => Svc["${svc}"],
+		Depend => Exec["console-${dev}"],
+	}
+
+	# XXX: historically on CentOS we would use "getty@" not "serial-getty@"
+	$svc = "serial-getty@${dev}" # .service
+	svc "${svc}" {
+		state => "running",
+		startup => "enabled",
+	}
+}

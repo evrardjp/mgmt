@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # setup a simple golang environment
 XPWD=`pwd`
 ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && cd .. && pwd )"	# dir!
@@ -17,7 +17,7 @@ BREW=`command -v brew 2>/dev/null`
 PACMAN=`command -v pacman 2>/dev/null`
 
 # set minimum golang version and installed golang version
-mingolangversion=16
+mingolangversion=20
 golangversion=0
 if [ -x "$GO" ]; then
 	# capture the minor version number
@@ -50,10 +50,15 @@ if [ -n "$YUM" ]; then
 	$sudo_command $YUM install -y augeas-devel
 	$sudo_command $YUM install -y ruby-devel rubygems
 	$sudo_command $YUM install -y time
-	$sudo_command $YUM install -y ragel
+	$sudo_command $YUM install -y gettext || true
+	if ! in_env; then
+		$sudo_command $YUM install -y ragel
+	fi
+
 	# dependencies for building packages with fpm
 	$sudo_command $YUM install -y gcc make rpm-build libffi-devel bsdtar mkosi || true
 	$sudo_command $YUM install -y graphviz || true # for debugging
+	$sudo_command $YUM install -y golangci-lint || true # for linting golang
 fi
 if [ -n "$APT" ]; then
 	$sudo_command $APT update -y
@@ -61,7 +66,11 @@ if [ -n "$APT" ]; then
 	$sudo_command $APT install -y libaugeas-dev || true
 	$sudo_command $APT install -y ruby ruby-dev || true
 	$sudo_command $APT install -y libpcap0.8-dev || true
-	$sudo_command $APT install -y ragel || true
+	$sudo_command $APT install -y gettext || true
+	if ! in_env; then
+		$sudo_command $APT install -y ragel || true
+	fi
+
 	# dependencies for building packages with fpm
 	$sudo_command $APT install -y build-essential rpm bsdtar || true
 	# `realpath` is a more universal alternative to `readlink -f` for absolute path resolution
@@ -84,7 +93,7 @@ if [ -n "$PACMAN" ]; then
 fi
 fold_end "Install dependencies"
 
-if ! in_ci; then
+if ! in_env; then
 	if [ -n "$YUM" ]; then
 		if [ -z "$GO" ]; then
 			$sudo_command $YUM install -y golang golang-googlecode-tools-stringer || $sudo_command $YUM install -y golang-bin # centos-7 epel
@@ -107,7 +116,8 @@ if ! in_ci; then
 	fi
 fi
 
-if in_ci; then
+if in_env; then
+	fold_start "Build ragel"
 	# TODO: consider bumping to new package manager version
 	RAGEL_VERSION='6.10'	# current stable version
 	RAGEL_TMP='/tmp/ragel/'
@@ -121,8 +131,9 @@ if in_ci; then
 	cd "$RAGEL_DIR"
 	./configure --prefix=/usr/local --disable-manual
 	make
-	sudo make install
+	$sudo_command make install
 	cd -
+	fold_end "Build ragel"
 fi
 
 # attempt to workaround old ubuntu
@@ -137,22 +148,20 @@ fi
 
 # if golang is too old, we don't want to fail with an obscure error later
 if [ "$golangversion" -lt "$mingolangversion" ]; then
-	echo "mgmt recommends go1.$mingolangversion or higher."
+	echo "mgmt recommends golang 1.$mingolangversion or higher. (got: 1.${golangversion})"
 	exit 1
 fi
 
 [ -e "$GOBIN/mgmt" ] && rm -f "$GOBIN/mgmt"	# the `go get` version has no -X
 
 fold_start "Install golang tools"
-# TODO: change this for golang 1.17
-go get github.com/blynn/nex				# for lexing
-go get golang.org/x/tools/cmd/goyacc			# formerly `go tool yacc`
-go get golang.org/x/tools/cmd/stringer			# for automatic stringer-ing
-go get golang.org/x/lint/golint				# for `golint`-ing
-go get golang.org/x/tools/cmd/goimports		# for fmt
-go get github.com/kevinburke/go-bindata/go-bindata	# for compiling in non golang files
-go get github.com/dvyukov/go-fuzz/go-fuzz		# for fuzzing the mcl lang bits
-if in_ci; then
+cd / && go install github.com/blynn/nex@latest			# for lexing
+cd / && go install golang.org/x/tools/cmd/goyacc@latest		# formerly `go tool yacc`
+cd / && go install golang.org/x/tools/cmd/stringer@latest	# for automatic stringer-ing
+cd / && go install golang.org/x/lint/golint@latest		# for `golint`-ing
+cd / && go install golang.org/x/tools/cmd/goimports@latest	# for fmt
+# go-fuzz removed: native Go fuzzing (go test -fuzz) is used instead
+if in_env; then
 	go get -u gopkg.in/alecthomas/gometalinter.v1 && \
 	mv "$(dirname $(command -v gometalinter.v1))/gometalinter.v1" "$(dirname $(command -v gometalinter.v1))/gometalinter" && \
 	gometalinter --install	# bonus
@@ -160,8 +169,28 @@ fi
 fold_end "Install golang tools"
 
 fold_start "Install miscellaneous tools"
-command -v mdl &>/dev/null || gem install mdl --no-document || true	# for linting markdown files
+# XXX: mdl versions after 0.15.0 break the standard markdown parsing rules, see:
+# https://github.com/markdownlint/markdownlint/issues/576 and:
+# https://github.com/markdownlint/markdownlint/issues/573
+command -v mdl &>/dev/null || gem install mdl -v 0.15.0 --no-document || true	# for linting markdown files
 command -v fpm &>/dev/null || gem install fpm --no-document || true	# for cross distro packaging
+# for checking links
+LYCHEE=$(command -v lychee 2>/dev/null) || true
+if [ -z "$LYCHEE" ]; then
+	LYCHEE_VERSION='v0.15.1'	# current stable version
+	LYCHEE_TMP='/tmp/'
+	LYCHEE_FILE="${LYCHEE_TMP}lychee-${LYCHEE_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+	wget "https://github.com/lycheeverse/lychee/releases/download/${LYCHEE_VERSION}/lychee-${LYCHEE_VERSION}-x86_64-unknown-linux-gnu.tar.gz" -O "$LYCHEE_FILE"
+	$sudo_command tar -C /usr/local/bin -xzvf "$LYCHEE_FILE"
+fi
+# For linting golang in CI we need to add this since it's not in apt ubuntu/CI.
+# The dnf version above works fine though.
+if in_env && ! command -v golangci-lint >/dev/null 2>&1; then
+	GOLANGCILINT_VERSION='v2.12.2'	# any v2.x works; pinned for reproducible lints
+	GOLANGCILINT_BIN=$(go env GOBIN)
+	[ -z "$GOLANGCILINT_BIN" ] && GOLANGCILINT_BIN="$(go env GOPATH)/bin"
+	wget -O- -nv https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b "$GOLANGCILINT_BIN" "$GOLANGCILINT_VERSION"
+fi
 fold_end "Install miscellaneous tools"
 
 cd "$XPWD" >/dev/null

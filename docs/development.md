@@ -16,7 +16,7 @@ be working properly.
 
 ## Using Docker
 
-Alternatively, you can check out the [docker-guide](docker-guide.md) in order to
+Alternatively, you can check out the [docker folder](../docker/) in order to
 develop or deploy using docker. This method is not endorsed or supported, so use
 at your own risk, as it might not be working properly.
 
@@ -28,8 +28,9 @@ required for running the _test_ suite.
 
 ### Build
 
-* `golang` 1.16 or higher (required, available in some distros and distributed
-as a binary officially by [golang.org](https://golang.org/dl/))
+* A modern `golang` version. The version available in the current Fedora
+releases is usually supported. This is also distributed as a binary officially
+by [golang.org](https://golang.org/dl/).
 
 ### Runtime
 
@@ -42,12 +43,14 @@ listed below:
 | Resource | Dependency        | Version                     | Check version with                                        |
 |----------|-------------------|-----------------------------|-----------------------------------------------------------|
 | augeas   | augeas-devel      | `augeas 1.6` or greater     | `dnf info augeas-devel` or `apt-cache show libaugeas-dev` |
+| augeas   | augeas-libs       | `augeas 1.6` or greater     | `dnf info augeas-libs` or `apt-cache show libaugeas0`     |
 | file     | inotify           | `Linux 2.6.27` or greater   | `uname -a`                                                |
 | hostname | systemd-hostnamed | `systemd 25` or greater     | `systemctl --version`                                     |
 | nspawn   | systemd-nspawn    | `systemd ???` or greater    | `systemctl --version`                                     |
 | pkg      | packagekitd       | `packagekit 1.x` or greater | `pkcon --version`                                         |
 | svc      | systemd           | `systemd ???` or greater    | `systemctl --version`                                     |
 | virt     | libvirt-devel     | `libvirt 1.2.0` or greater  | `dnf info libvirt-devel` or `apt-cache show libvirt-dev`  |
+| virt     | libvirt-libs      | `libvirt 1.2.0` or greater  | `dnf info libvirt-libs` or `apt-cache show libvirt0`      |
 | virt     | libvirtd          | `libvirt 1.2.0` or greater  | `libvirtd --version`                                      |
 
 For building a visual representation of the graph, `graphviz` is required.
@@ -63,6 +66,47 @@ To build `mgmt` without docker support please run:
 
 To build `mgmt` without augeas, libvirt or docker support please run:
 `GOTAGS='noaugeas novirt nodocker' make build`
+
+### Linking against augeas or libvirt
+
+By default, mgmt loads augeas and libvirt at runtime, only when a resource needs
+them, instead of linking against them. This lets the binary run on machines with
+older versions of them, or none at all, and lets you build it without their
+development headers. If you wish to link against them instead, you can use the
+following commands:
+
+```
+MGMT_NOAUGEASDLOPEN=true make build
+MGMT_NOLIBVIRTDLOPEN=true make build
+```
+
+## Goroutine leak profiling
+
+With golang 1.26, enable the goroutine leak profile at build time:
+
+```bash
+GOEXPERIMENT=goroutineleakprofile make -B build
+```
+
+The `-B` flag forces a rebuild, including when an existing binary was built
+without the experiment. The GOEXPERIMENT field won't be needed in golang 1.27+.
+Start the pprof server with:
+
+```bash
+./mgmt run --pprof=127.0.0.1:6060 --tmp-prefix lang examples/lang/hello0.mcl
+```
+
+Fetch the profile using the usual pprof tools:
+
+```bash
+go tool pprof http://127.0.0.1:6060/debug/pprof/goroutineleak
+```
+
+For a text report, request
+`http://127.0.0.1:6060/debug/pprof/goroutineleak?debug=1`. Fetching the profile
+runs garbage collection with leak detection. Builds without the experiment
+continues to support the other profiles, but the goroutine leak endpoint returns
+HTTP 404.
 
 ## OSX/macOS/Darwin development
 
@@ -138,7 +182,7 @@ easy as copying one of the files in [`test/shell/`](/test/shell) and adapting
 it.
 
 This test suite won't run by default (unless when on CI server) and needs to be
-called explictly using:
+called explicitly using:
 
 ```
 make test-shell

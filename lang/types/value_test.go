@@ -1,5 +1,5 @@
 // Mgmt
-// Copyright (C) 2013-2021+ James Shubin and the project contributors
+// Copyright (C) James Shubin and the project contributors
 // Written by James Shubin <james@shubin.ca> and the project contributors
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,9 +13,21 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Additional permission under GNU GPL version 3 section 7
+//
+// If you modify this program, or any covered work, by linking or combining it
+// with embedded mcl code and modules (and that the embedded mcl code and
+// modules which link with this program, contain a copy of their source code in
+// the authoritative form) containing parts covered by the terms of any other
+// license, the licensors of this program grant you additional permission to
+// convey the resulting work. Furthermore, the licensors of this program grant
+// the original author, James Shubin, additional permission to update this
+// additional permission if he deems it necessary to achieve the goals of this
+// additional permission.
 
-// +build !root
+//go:build !root
 
 package types
 
@@ -88,12 +100,18 @@ func TestPrint1(t *testing.T) {
 	testCases[d0] = `{}`
 
 	d1 := NewMap(NewType("map{str: int}"))
-	d1.Add(&StrValue{V: "answer"}, &IntValue{V: 42})
+	if err := d1.Set(&StrValue{V: "answer"}, &IntValue{V: 42}); err != nil {
+		t.Fatalf("func Set: %v", err)
+	}
 	testCases[d1] = `{"answer": 42}`
 
 	d2 := NewMap(NewType("map{str: int}"))
-	d2.Add(&StrValue{V: "answer"}, &IntValue{V: 42})
-	d2.Add(&StrValue{V: "hello"}, &IntValue{V: 13})
+	if err := d2.Set(&StrValue{V: "answer"}, &IntValue{V: 42}); err != nil {
+		t.Fatalf("func Set: %v", err)
+	}
+	if err := d2.Set(&StrValue{V: "hello"}, &IntValue{V: 13}); err != nil {
+		t.Fatalf("func Set: %v", err)
+	}
 	testCases[d2] = `{"answer": 42, "hello": 13}`
 
 	s0 := NewStruct(NewType("struct{}"))
@@ -203,7 +221,9 @@ func TestReflectValue1(t *testing.T) {
 	testCases[d0] = `map[]`
 
 	d1 := NewMap(NewType("map{str: int}"))
-	d1.Add(&StrValue{V: "answer"}, &IntValue{V: 42})
+	if err := d1.Set(&StrValue{V: "answer"}, &IntValue{V: 42}); err != nil {
+		t.Fatalf("func Set: %v", err)
+	}
 	testCases[d1] = `map[answer:42]`
 
 	// multiple key maps are tested below since they have multiple outputs
@@ -468,8 +488,12 @@ func TestSort1(t *testing.T) {
 
 func TestMapReflectValue1(t *testing.T) {
 	d := NewMap(NewType("map{str: int}"))
-	d.Add(&StrValue{V: "answer"}, &IntValue{V: 42})
-	d.Add(&StrValue{V: "hello"}, &IntValue{V: 13})
+	if err := d.Set(&StrValue{V: "answer"}, &IntValue{V: 42}); err != nil {
+		t.Fatalf("func Set: %v", err)
+	}
+	if err := d.Set(&StrValue{V: "hello"}, &IntValue{V: 13}); err != nil {
+		t.Fatalf("func Set: %v", err)
+	}
 	// both are valid, since map's aren't sorted
 	// imo, golang should at least sort these on display!
 	// TODO: https://github.com/golang/go/issues/21095
@@ -484,7 +508,9 @@ func TestMapReflectValue1(t *testing.T) {
 	}
 
 	d2 := NewMap(NewType("map{str: str}"))
-	d2.Add(&StrValue{V: "answer"}, &StrValue{V: "42 hello:13"})
+	if err := d2.Set(&StrValue{V: "answer"}, &StrValue{V: "42 hello:13"}); err != nil {
+		t.Fatalf("func Set: %v", err)
+	}
 	val2 := d2.Value()
 
 	if v1, v2 := fmt.Sprintf("%+v", val), fmt.Sprintf("%+v", val2); v1 == v2 {
@@ -518,7 +544,7 @@ func TestMapLookup1(t *testing.T) {
 	d := NewMap(NewType("map{str: int}"))
 	k := &StrValue{V: "answer"}
 	v := &IntValue{V: 42}
-	if err := d.Add(k, v); err != nil {
+	if err := d.Set(k, v); err != nil {
 		t.Errorf("map could not add key %s, val: %s", k, v)
 	}
 
@@ -531,6 +557,154 @@ func TestMapLookup1(t *testing.T) {
 
 	if err := value.Cmp(&IntValue{V: 42}); err != nil {
 		t.Errorf("value did not match our map key")
+	}
+}
+
+func TestMapCopyLookup(t *testing.T) {
+	d := NewMap(NewType("map{str: int}"))
+	for i, k := range []string{"a", "b", "c"} {
+		if err := d.Set(&StrValue{V: k}, &IntValue{V: int64(i)}); err != nil {
+			t.Fatalf("func Set: %v", err)
+		}
+	}
+	cp := d.Copy().(*MapValue)
+	if err := d.Cmp(cp); err != nil {
+		t.Errorf("copy did not cmp: %v", err)
+	}
+	if _, exists := cp.Lookup(&StrValue{V: "a"}); !exists {
+		t.Errorf("copy did not contain our key")
+	}
+
+	// overwrite, delete and add keys in the copy
+	if err := cp.Set(&StrValue{V: "a"}, &IntValue{V: 42}); err != nil {
+		t.Fatalf("func Set: %v", err)
+	}
+	if !cp.Delete(&StrValue{V: "b"}) {
+		t.Errorf("copy could not delete our key")
+	}
+	if err := cp.Set(&StrValue{V: "d"}, &IntValue{V: 3}); err != nil {
+		t.Fatalf("func Set: %v", err)
+	}
+	if s := cp.String(); s != `{"a": 42, "c": 2, "d": 3}` {
+		t.Errorf("got copy %s", s)
+	}
+	if s := d.String(); s != `{"a": 0, "b": 1, "c": 2}` {
+		t.Errorf("got original %s", s)
+	}
+}
+
+// collidingStr is a str value which always has the same hash, so that we can
+// test what a map does when two different keys collide.
+type collidingStr struct {
+	*StrValue
+}
+
+func (obj *collidingStr) Hash(Seed) Hash { return 42 }
+
+func (obj *collidingStr) Cmp(val Value) error {
+	return obj.StrValue.Cmp(val.(*collidingStr).StrValue)
+}
+
+func TestMapCollision(t *testing.T) {
+	d := NewMap(NewType("map{str: int}"))
+	a, b := &collidingStr{&StrValue{V: "a"}}, &collidingStr{&StrValue{V: "b"}}
+	if err := d.Set(a, &IntValue{V: 1}); err != nil {
+		t.Fatalf("func Set: %v", err)
+	}
+	if err := d.Set(b, &IntValue{V: 2}); err != nil {
+		t.Fatalf("func Set: %v", err)
+	}
+	for k, want := range map[*collidingStr]int64{a: 1, b: 2} {
+		value, exists := d.Lookup(k)
+		if !exists {
+			t.Fatalf("map did not contain key %s", k)
+		}
+		if err := value.Cmp(&IntValue{V: want}); err != nil {
+			t.Errorf("key %s: %v", k, err)
+		}
+	}
+	if !d.Delete(a) {
+		t.Errorf("map could not delete key %s", a)
+	}
+	if _, exists := d.Lookup(b); !exists {
+		t.Errorf("map lost key %s", b)
+	}
+}
+
+func TestMapDeleteSet(t *testing.T) {
+	d := NewMap(NewType("map{str: int}"))
+	if err := d.Set(&StrValue{V: "a"}, &IntValue{V: 1}); err != nil {
+		t.Fatalf("func Set: %v", err)
+	}
+	if !d.Delete(&StrValue{V: "a"}) {
+		t.Fatalf("map could not delete our key")
+	}
+	if err := d.Set(&StrValue{V: "a"}, &IntValue{V: 2}); err != nil {
+		t.Fatalf("func Set: %v", err)
+	}
+	if s := d.String(); s != `{"a": 2}` {
+		t.Errorf("got %s", s)
+	}
+}
+
+func TestMapDeleteMemory(t *testing.T) {
+	d := NewMap(NewType("map{str: int}"))
+	a, b := &collidingStr{&StrValue{V: "a"}}, &collidingStr{&StrValue{V: "b"}}
+	c := &StrValue{V: "c"}
+	for _, k := range []Value{a, b, c} {
+		if err := d.Set(k, &IntValue{V: 1}); err != nil {
+			t.Fatalf("func Set: %v", err)
+		}
+	}
+
+	// a and b share a hash, so after deleting b, nothing should keep it
+	if !d.Delete(b) {
+		t.Fatalf("map could not delete key %s", b)
+	}
+	entries := d.m[a.Hash(d.s)]
+	for _, x := range entries[len(entries):cap(entries)] {
+		if x != nil {
+			t.Errorf("deleted key %s is still referenced", x)
+		}
+	}
+
+	// once every key with a hash is deleted, so is the entry for it
+	for _, k := range []Value{a, c} {
+		if !d.Delete(k) {
+			t.Fatalf("map could not delete key %s", k)
+		}
+	}
+	if n := len(d.m); n != 0 {
+		t.Errorf("got %d entries for deleted keys", n)
+	}
+}
+
+func TestMapStructKeys(t *testing.T) {
+	d := NewMap(NewType("map{struct{a str; b str}: int}"))
+	key := func(a, b string) Value {
+		v := NewStruct(d.T.Key)
+		v.V["a"] = &StrValue{V: a}
+		v.V["b"] = &StrValue{V: b}
+		return v
+	}
+	// these keys only differ by which field holds the "foo"
+	for i, k := range []Value{key("foo", ""), key("", "foo"), key("foo", "")} {
+		if err := d.Set(k, &IntValue{V: int64(i)}); err != nil {
+			t.Fatalf("func Set: %v", err)
+		}
+	}
+	if s := d.String(); s != `{struct{a: ""; b: "foo"}: 1, struct{a: "foo"; b: ""}: 2}` {
+		t.Errorf("got %s", s)
+	}
+	if _, exists := d.Lookup(key("", "foo")); !exists {
+		t.Errorf("map did not contain our key")
+	}
+
+	// equal values must hash the same
+	nested := NewType("struct{x struct{y int; z float}; s str}")
+	seed := MakeSeed()
+	if NewStruct(nested).Hash(seed) != NewStruct(nested).Hash(seed) {
+		t.Errorf("equal structs hashed differently")
 	}
 }
 
@@ -589,6 +763,40 @@ func TestStruct2(t *testing.T) {
 		//t.Errorf("golang structs are broken ?")
 		//t.Errorf("val1: %s", val1)
 		//t.Errorf("val2: %s", val2)
+	}
+}
+
+func TestStruct3(t *testing.T) {
+	// Lowercase field names get exported (capitalized) by Reflect, with
+	// the original name kept in the `lang` struct tag, so a struct value
+	// can round trip through a golang interface{} and back via ValueOf.
+	st := NewStruct(NewType("struct{answer int; nested struct{truth bool}}"))
+	if err := st.Set("answer", &IntValue{V: 42}); err != nil {
+		t.Errorf("struct could not set key, error: %v", err)
+		return
+	}
+	inner := NewStruct(NewType("struct{truth bool}"))
+	if err := inner.Set("truth", &BoolValue{V: true}); err != nil {
+		t.Errorf("struct could not set key, error: %v", err)
+		return
+	}
+	if err := st.Set("nested", inner); err != nil {
+		t.Errorf("struct could not set key, error: %v", err)
+		return
+	}
+
+	v := st.Value() // this used to panic on the unexported field names
+	if typ := fmt.Sprintf("%T", v); typ != `struct { Answer int64 "lang:\"answer\""; Nested struct { Truth bool "lang:\"truth\"" } "lang:\"nested\"" }` {
+		t.Errorf("struct displayed type value: %s", typ)
+	}
+
+	out, err := ValueOfGolang(v)
+	if err != nil {
+		t.Errorf("could not get value of golang struct, error: %v", err)
+		return
+	}
+	if err := st.Cmp(out); err != nil {
+		t.Errorf("struct value did not round trip, error: %v", err)
 	}
 }
 
@@ -747,6 +955,35 @@ func TestValueOf4(t *testing.T) {
 	}
 }
 
+func TestValueOfMapLookup(t *testing.T) {
+	val, err := ValueOf(reflect.ValueOf(map[string]int64{"a": 1, "b": 2}))
+	if err != nil {
+		t.Fatalf("func ValueOf: %v", err)
+	}
+	value, exists := val.(*MapValue).Lookup(&StrValue{V: "a"})
+	if !exists {
+		t.Fatalf("map did not contain our key")
+	}
+	if err := value.Cmp(&IntValue{V: 1}); err != nil {
+		t.Errorf("value did not match our map key")
+	}
+
+	d := NewMap(NewType("map{str: int}"))
+	for i, k := range []string{"a", "b"} {
+		if err := d.Set(&StrValue{V: k}, &IntValue{V: int64(i + 1)}); err != nil {
+			t.Fatalf("func Set: %v", err)
+		}
+	}
+	if err := d.Cmp(val); err != nil {
+		t.Errorf("map did not cmp: %v", err)
+	}
+
+	// a golang array can be a map key, but it's an unhashable list for us
+	if val, err := ValueOf(reflect.ValueOf(map[[1]int]int{{1}: 1})); err == nil {
+		t.Errorf("expected an unhashable map key error, got %s", val)
+	}
+}
+
 func TestValueInto0(t *testing.T) {
 	// converts a Go variable to a types.Value, or panics if any error
 	mustValue := func(v interface{}) Value {
@@ -827,10 +1064,15 @@ func TestValueInto0(t *testing.T) {
 			value:     mustValue(int64(-12345)),
 			compare:   int64(-12345),
 		},
-		{
+		{ // MaxInt64 is the largest value representable by an mcl int
 			container: &u,
-			value:     mustValue(uint64(math.MaxUint64)),
-			compare:   uint64(math.MaxUint64),
+			value:     mustValue(uint64(math.MaxInt64)),
+			compare:   uint64(math.MaxInt64),
+		},
+		{ // a negative mcl int can't be stored in an unsigned field
+			container: &u,
+			value:     &IntValue{V: -1},
+			shouldErr: true,
 		},
 		{ // ensure -1 from an int64 fits into an int8
 			container: &i8,
@@ -972,7 +1214,6 @@ func TestValueInto0(t *testing.T) {
 	for index, tc := range testCases {
 		name := fmt.Sprintf("test Into() %s #%d", reflect.TypeOf(tc.container).Elem(), index)
 		// https://github.com/purpleidea/mgmt/pull/629/files#r568305689
-		tc := tc
 		t.Run(name, func(t *testing.T) {
 			rvo := reflect.ValueOf(tc.container)
 
@@ -1052,7 +1293,6 @@ func TestValueInto1(t *testing.T) {
 	for index, tc := range testCases {
 		name := fmt.Sprintf("test Into() %s #%d", reflect.TypeOf(tc.container).Elem(), index)
 
-		tc := tc
 		t.Run(name, func(t *testing.T) {
 			ctrVal := reflect.ValueOf(tc.container)
 
@@ -1069,6 +1309,16 @@ func TestValueInto1(t *testing.T) {
 				return
 			}
 		})
+	}
+}
+
+// TestValueOfMaxUint64 is the old uint64(MaxUint64) Into() case. It used to
+// "round-trip" into a uint64 container, but mcl ints are int64, so MaxUint64
+// isn't even representable: it now fails to convert instead of bit-preserving
+// to -1 and silently wrapping back. (The failure is at ValueOf(), not Into().)
+func TestValueOfMaxUint64(t *testing.T) {
+	if _, err := ValueOfGolang(uint64(math.MaxUint64)); err == nil {
+		t.Errorf("function ValueOf() didn't return an error but one was expected")
 	}
 }
 
@@ -1092,5 +1342,86 @@ func TestValueIntoStructNameMapping(t *testing.T) {
 
 	if compare.Word != "zing" || compare.Magic != 0x5F3759DF {
 		t.Errorf("struct field value is missing or incorrect")
+	}
+}
+
+// BenchmarkValues measures building, copying and printing some larger values.
+func BenchmarkValues(b *testing.B) {
+	list := NewList(NewType("[]int"))
+	m := NewMap(NewType("map{str: int}"))
+	for i := 0; i < 100; i++ {
+		list.V = append(list.V, &IntValue{V: int64(i)})
+		if err := m.Set(&StrValue{V: fmt.Sprintf("k%d", i)}, &IntValue{V: int64(i)}); err != nil {
+			b.Fatalf("func Set: %v", err)
+		}
+	}
+	st := &Type{Kind: KindStruct, Map: map[string]*Type{}, Ord: []string{}}
+	for i := 0; i < 20; i++ {
+		name := fmt.Sprintf("f%d", i)
+		st.Map[name] = TypeInt
+		st.Ord = append(st.Ord, name)
+	}
+	sv := NewStruct(st)
+	sm := NewMap(NewType("map{struct{a int; b str}: int}"))
+	for i := 0; i < 100; i++ {
+		k := NewStruct(sm.T.Key)
+		k.V["a"] = &IntValue{V: int64(i)}
+		if err := sm.Set(k, &IntValue{V: int64(i)}); err != nil {
+			b.Fatalf("func Set: %v", err)
+		}
+	}
+	ints := make([]int64, 100)
+	intMap := make(map[string]int64, 100)
+	for i := range ints {
+		intMap[fmt.Sprintf("k%d", i)] = int64(i)
+	}
+	type file struct {
+		Name string   `lang:"name"`
+		Size int64    `lang:"size"`
+		Tags []string `lang:"tags"`
+		Ok   bool     `lang:"ok"`
+	}
+	files := []file{{Name: "a"}}
+	strs := make([]string, 100)
+	list2, m2 := list.Copy(), m.Copy()
+	one, two := &IntValue{V: 1}, &IntValue{V: 1}
+
+	for _, bc := range []struct {
+		name string
+		fn   func()
+	}{
+		{"int/Cmp", func() { _ = one.Cmp(two) }},
+		{"list100/Cmp", func() { _ = list.Cmp(list2) }},
+		{"list100/Copy", func() { _ = list.Copy() }},
+		{"list100/String", func() { _ = list.String() }},
+		{"map100/Cmp", func() { _ = m.Cmp(m2) }},
+		{"map100/Copy", func() { _ = m.Copy() }},
+		{"map100/Set", func() {
+			d := NewMap(m.T)
+			for k, v := range m.V {
+				_ = d.Set(k, v)
+			}
+		}},
+		{"map100/String", func() { _ = m.String() }},
+		{"struct20/Copy", func() { _ = sv.Copy() }},
+		{"struct20/String", func() { _ = sv.String() }},
+		{"struct20/NewStruct", func() { _ = NewStruct(st) }},
+		{"structmap100/Set", func() {
+			d := NewMap(sm.T)
+			for k, v := range sm.V {
+				_ = d.Set(k, v)
+			}
+		}},
+		{"ValueOf/list100", func() { _, _ = ValueOf(reflect.ValueOf(ints)) }},
+		{"ValueOf/map100", func() { _, _ = ValueOf(reflect.ValueOf(intMap)) }},
+		{"ValueOf/structs1", func() { _, _ = ValueOf(reflect.ValueOf(files)) }},
+		{"ListStrToValue/100", func() { _ = ListStrToValue(strs) }},
+	} {
+		b.Run(bc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				bc.fn()
+			}
+		})
 	}
 }
